@@ -405,25 +405,81 @@ def wait_for_command(
         time.sleep(0.05)
 
 
-def terminate_child(process: subprocess.Popen[bytes], name: str) -> ChildShutdown:
-    return_code = process.poll()
-    if return_code is not None:
-        return ChildShutdown(name, process.pid, return_code, False, False, True)
+def terminate_children(
+    children: Sequence[tuple[subprocess.Popen[bytes], str]],
+) -> list[ChildShutdown]:
+    """TERM all live exact PIDs, then KILL only survivors, and reap each."""
 
-    process.terminate()
-    sent_kill = False
-    try:
-        return_code = process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        sent_kill = True
-        try:
-            return_code = process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired as error:
-            raise HarnessFailure(
-                f"{name} PID {process.pid} did not exit after bounded TERM/KILL"
-            ) from error
-    return ChildShutdown(name, process.pid, return_code, True, sent_kill, True)
+    return_codes: dict[int, int] = {}
+    sent_term: set[int] = set()
+    sent_kill: set[int] = set()
+
+    for process, _name in children:
+        return_code = process.poll()
+        if return_code is None:
+            process.terminate()
+            sent_term.add(process.pid)
+        else:
+            return_codes[process.pid] = return_code
+
+    term_deadline = time.monotonic() + SHUTDOWN_TIMEOUT_SECONDS
+    while len(return_codes) < len(children) and time.monotonic() < term_deadline:
+        for process, _name in children:
+            if process.pid in return_codes:
+                continue
+            return_code = process.poll()
+            if return_code is not None:
+                return_codes[process.pid] = return_code
+        if len(return_codes) < len(children):
+            time.sleep(0.02)
+
+    for process, _name in children:
+        if process.pid not in return_codes:
+            process.kill()
+            sent_kill.add(process.pid)
+
+    kill_deadline = time.monotonic() + SHUTDOWN_TIMEOUT_SECONDS
+    while len(return_codes) < len(children) and time.monotonic() < kill_deadline:
+        for process, _name in children:
+            if process.pid in return_codes:
+                continue
+            return_code = process.poll()
+            if return_code is not None:
+                return_codes[process.pid] = return_code
+        if len(return_codes) < len(children):
+            time.sleep(0.02)
+
+    unreaped = [
+        f"{name} PID {process.pid}"
+        for process, name in children
+        if process.pid not in return_codes
+    ]
+    if unreaped:
+        raise HarnessFailure(
+            "children did not exit after bounded TERM/KILL: " + ", ".join(unreaped)
+        )
+
+    return [
+        ChildShutdown(
+            name=name,
+            pid=process.pid,
+            return_code=return_codes[process.pid],
+            sent_term=process.pid in sent_term,
+            sent_kill=process.pid in sent_kill,
+            reaped=True,
+        )
+        for process, name in children
+    ]
+
+
+def validate_daemon_shutdown(result: ChildShutdown) -> None:
+    expected = {0, -signal.SIGTERM}
+    if result.sent_kill:
+        expected.add(-signal.SIGKILL)
+    if result.return_code not in expected:
+        raise HarnessFailure(
+            f"daemon PID {result.pid} exited abnormally with status {result.return_code}"
+        )
 
 
 def normalize_command_exit(return_code: int) -> int:
@@ -580,14 +636,20 @@ def run_command(
             except BaseException as error:
                 cleanup_failure = error
 
-        for process, name in ((command, "command"), (daemon, "daemon")):
-            if process is None:
-                continue
-            try:
-                shutdown.append(terminate_child(process, name))
-            except BaseException as error:
-                if cleanup_failure is None:
-                    cleanup_failure = error
+        owned_children = [
+            (process, name)
+            for process, name in ((command, "command"), (daemon, "daemon"))
+            if process is not None
+        ]
+        try:
+            shutdown.extend(terminate_children(owned_children))
+            daemon_shutdown = next(
+                (child for child in shutdown if child.name == "daemon"), None
+            )
+            if daemon_shutdown is not None:
+                validate_daemon_shutdown(daemon_shutdown)
+        except BaseException as error:
+            cleanup_failure = error
 
         if stdout_stream is not None:
             stdout_stream.close()
