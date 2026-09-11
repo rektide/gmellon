@@ -113,6 +113,15 @@ class RunResult:
     retained: bool
 
 
+@dataclass(frozen=True)
+class ReadyDaemon:
+    """One daemon generation after the complete readiness gate."""
+
+    process: subprocess.Popen[bytes]
+    reported_environment: dict[str, str]
+    control_metadata: os.stat_result
+
+
 class SignalLatch:
     """Record the first handled signal without throwing from a handler.
 
@@ -390,6 +399,45 @@ def wait_for_control_socket(
         return metadata
 
 
+def start_ready_daemon(
+    executable: str,
+    sandbox: Sandbox,
+    stdout_stream: BinaryIO,
+    stderr_stream: BinaryIO,
+    signals: SignalLatch,
+) -> ReadyDaemon:
+    """Launch one daemon generation and prove the full readiness contract.
+
+    This is an internal implementation seam shared by the lifecycle and the
+    co-located behavior characterization. The supported public interface
+    remains the executable lifecycle contract.
+    """
+
+    process = launch_daemon(executable, sandbox, stderr_stream)
+    startup_deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    startup_output = wait_for_initialization_stdout_eof(
+        process, stdout_stream, signals, startup_deadline
+    )
+    if process.stdout is not None:
+        process.stdout.close()
+    reported = parse_reported_environment(startup_output)
+    if reported.get("GNOME_KEYRING_CONTROL") != str(sandbox.control):
+        raise HarnessFailure("daemon did not report the selected control directory")
+    validate_reported_paths(reported, sandbox.root)
+    control_metadata = wait_for_control_socket(
+        process, sandbox.control / "control", signals, startup_deadline
+    )
+    return ReadyDaemon(process, reported, control_metadata)
+
+
+def stop_owned_daemon(process: subprocess.Popen[bytes]) -> ChildShutdown:
+    """Intentionally stop and validate one exact supervisor-owned daemon."""
+
+    result = terminate_children(((process, "daemon"),))[0]
+    validate_daemon_shutdown(result)
+    return result
+
+
 def wait_for_command(
     command: subprocess.Popen[bytes], daemon: subprocess.Popen[bytes], signals: SignalLatch
 ) -> int:
@@ -607,28 +655,18 @@ def run_command(
         signals.raise_if_pending()
         stdout_stream = sandbox.stdout_log.open("wb")
         stderr_stream = sandbox.stderr_log.open("wb")
-        daemon = launch_daemon(executable, sandbox, stderr_stream)
-        startup_deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
-        startup_output = wait_for_initialization_stdout_eof(
-            daemon, stdout_stream, signals, startup_deadline
+        ready_daemon = start_ready_daemon(
+            executable, sandbox, stdout_stream, stderr_stream, signals
         )
-        if daemon.stdout is not None:
-            daemon.stdout.close()
-        reported = parse_reported_environment(startup_output)
-        if reported.get("GNOME_KEYRING_CONTROL") != str(sandbox.control):
-            raise HarnessFailure("daemon did not report the selected control directory")
-        validate_reported_paths(reported, sandbox.root)
-        control_metadata = wait_for_control_socket(
-            daemon, sandbox.control / "control", signals, startup_deadline
-        )
+        daemon = ready_daemon.process
         if read_sentinel(sentinel_path) != sentinel_before:
             raise HarnessFailure("external isolation sentinel changed before command launch")
         write_evidence(
             sandbox,
             executable,
             daemon,
-            reported,
-            control_metadata,
+            ready_daemon.reported_environment,
+            ready_daemon.control_metadata,
             pass_environment,
         )
 
