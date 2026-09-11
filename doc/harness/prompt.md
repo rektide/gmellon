@@ -1,7 +1,7 @@
-# Sol handoff: isolated GNOME Keyring harness
+# Isolated GNOME Keyring harness
 
-Use this document as the working prompt for a fresh Sol session in the
-`gmellon` repository.
+This document records the design, evidence, and implementation guidance for
+the `gmell-harness` Beads epic in the `gmellon` repository.
 
 ## Total mission
 
@@ -12,8 +12,9 @@ must be tested without touching the user's real keyring, session bus, or
 socket-activated daemon. Read [`/README.md`](/README.md) for the provisional
 product spec and inspect the Beads graph before acting.
 
-Your track owns the reusable integration-test harness, not the Rust product
-implementation. The required baseline is a hermetic process group containing:
+This epic owns the reusable integration-test harness, not the Rust product
+implementation. The required baseline is a configuration- and
+session-isolated process topology containing:
 
 1. one manually launched `gnome-keyring-daemon`,
 2. a private mode-0700 home/runtime/data tree,
@@ -29,18 +30,18 @@ prerequisite for direct control-socket tests. Do not start
 
 ## How to run this work
 
-You know the total mission, but **work one reviewed slice at a time**. At each
+Work the frontier of the Beads graph **one reviewed ticket at a time**. At each
 consequential checkpoint:
 
 - summarize what became possible or impossible;
 - explain the process topology and isolation boundary actually observed;
 - cite source paths and commands that support the conclusion;
 - identify unresolved risks or choices;
-- propose exactly one next coherent slice; and
+- propose exactly one next coherent ticket; and
 - stop for the human to review before continuing.
 
-Do not accept a request to "do the harness" as permission to run every slice
-unattended. Small investigation edits within the current slice are fine.
+Do not accept a request to "do the harness" as permission to run every ticket
+unattended. Small investigation edits within the current ticket are fine.
 Commit each coherent, useful stage with `jj commit -m "..." <paths...>` before
 asking for review. Preserve failed spikes in `.test-agent/harness/` when their
 evidence is useful; do not overwrite unrelated or provisional work.
@@ -49,9 +50,10 @@ evidence is useful; do not overwrite unrelated or provisional work.
 
 - Stage 0 is complete: Cargo, a clap command skeleton, and three nextest tests
   exist. The harness should not need to restructure that code.
-- The current `gmell-harness` ticket is provisional and too broad. It assumes
-  a redirected daemon but does not fully specify bus isolation, activation,
-  readiness, process ownership, or teardown.
+- `gmell-harness` is the umbrella epic. Its core chain is smoke, lifecycle,
+  behavior, durable integration, and documentation. Optional broker parity
+  branches after lifecycle and does not block the core chain or product
+  unlock work.
 - Installed tools presently include `dbus-broker-launch` 37,
   `systemd-socket-activate`, `dbus-run-session`, `dbus-daemon`,
   `gnome-keyring-daemon` 48.0, `gdbus`, and `secret-tool`.
@@ -139,9 +141,11 @@ Treat these as acceptance criteria, not aspirations:
   `XDG_SESSION_ID` before startup.
 - The private bus config must not load standard or host service directories.
   Only the harness launches `gnome-keyring-daemon`.
-- The test daemon's control socket and all keyring files must resolve beneath
-  the scratch root. Record the daemon environment and selected paths as
-  evidence.
+- The test daemon's control socket, keyring files, and other known writable
+  paths must resolve beneath the scratch root. Record the daemon environment
+  and selected paths as evidence. This verifies the configured storage
+  boundary; without filesystem confinement it does not prove that arbitrary
+  writes outside scratch are impossible.
 - Establish readiness with bounded waits and positive checks. For the
   baseline, require initialization stdout EOF, child liveness, and the
   expected socket type and owner. For broker parity, additionally prove that
@@ -157,45 +161,45 @@ Treat these as acceptance criteria, not aspirations:
 - Include an isolation regression check that fails if a sentinel outside the
   scratch root changes or if the daemon reports paths outside that root.
 
-## Proposed slices
+## Ticket map
 
-### Slice 0 — control-only sandbox and smoke test
+The required core follows one linear chain. Broker parity is an optional
+branch and must not gate the control-protocol harness:
 
-This is the only slice authorized at kickoff.
+```mermaid
+flowchart LR
+    smoke["gmell-harness-smoke"] --> lifecycle["gmell-harness-lifecycle"]
+    lifecycle --> behavior["gmell-harness-behavior"]
+    behavior --> integration["gmell-harness-integration"]
+    integration --> docs["gmell-harness-docs"]
+    lifecycle --> broker["gmell-harness-broker (optional)"]
+```
 
-1. Read the README, current source, Beads issues, recent `jj` history, upstream
-   files listed above, and installed manuals.
-2. Search for duplicate tickets, then make `gmell-harness` a clear umbrella
-   with namespaced children for the control smoke test, lifecycle, behavior,
-   durable integration, and optional broker parity. Preserve dependency
-   direction and commit the exported Beads state separately.
-3. Implement only a per-test scratch sandbox and one real-daemon smoke test.
-   Spawn `gnome-keyring-daemon --foreground --components=secrets` with an
-   explicit scratch control directory and poisoned session/system bus
-   addresses.
-4. Wait for initialization stdout EOF, then verify child liveness plus control
-   socket type and ownership.
-5. Send the credential NUL and one UNLOCK request. Observe first unlock OK and
-   a subsequent wrong password DENIED without logging either password.
-6. Verify `login.keyring` and every writable artifact remain under scratch.
-   Terminate and reap the exact child with a bounded cleanup sequence.
-7. Commit evidence and implementation, report, and stop. Do not add a broker,
-   CLI commands, or the broader behavior matrix in this slice.
+### `gmell-harness-smoke` — prove the isolated control-socket path
 
-### Slice 1 — lifecycle interface
+Implement only a per-test scratch sandbox and one real-daemon smoke test.
+Spawn `gnome-keyring-daemon --foreground --components=secrets` with an explicit
+scratch control directory and poisoned session/system bus addresses. Wait for
+initialization stdout EOF, then verify child liveness plus control socket type
+and ownership. Use a narrowly scoped disposable probe to send the credential
+NUL and one UNLOCK request; observe first unlock OK and a subsequent wrong
+password DENIED without logging either password. Verify known writable paths
+remain under scratch and an external sentinel is unchanged. Terminate and reap
+only owned children with a bounded cleanup sequence. Report and stop.
 
-Turn the successful smoke-test spike into a composable "run this command
-inside the harness" interface. Prefer a domain-grouped location such as
-`dev/harness/` over scattered root scripts. Define exported environment
-variables and exit semantics, implement signal-safe teardown and failure
-artifact retention, and test nesting/parallel execution where practical.
-Report and stop.
+### `gmell-harness-lifecycle` — provide a reusable harness lifecycle
 
-### Slice 2 — broader behavioral probes
+Turn the successful smoke proof into a composable "run this command inside the
+harness" interface. Prefer a domain-grouped location such as `dev/harness/`
+over scattered root scripts. Define exported environment variables and exit
+semantics, implement signal-safe teardown and failure-artifact retention, and
+test parallel execution. Either support nesting and test it or reject it
+explicitly. Report and stop.
 
-Use a minimal disposable probe (Python, shell plus a purpose-built helper, or
-the reviewed Rust transport if it exists by then) to send the credential byte
-and protocol frames. Establish and record at least:
+### `gmell-harness-behavior` — record the control-protocol behavior matrix
+
+Use a minimal disposable probe, or the reviewed Rust transport if it exists by
+then, to establish and record at least:
 
 1. missing login keyring + UNLOCK creates it;
 2. subsequent correct UNLOCK succeeds;
@@ -205,37 +209,42 @@ and protocol frames. Establish and record at least:
 6. empty-password behavior where relevant; and
 7. stopped/unresponsive daemon behavior needed by product tests.
 
-Use Secret Service calls only for observation that does not invoke a GUI
-prompt. Keep passwords out of logs. Update factual behavior documentation
-only after collecting evidence. Report and stop.
+This ticket makes no Secret Service calls. Keep passwords out of logs and
+update factual behavior documentation only after collecting evidence. Report
+and stop.
 
-### Slice 3 — private broker parity
+### `gmell-harness-integration` — integrate real-daemon tests durably
 
-Make a broker-only experiment under `.test-agent/harness/`, reproducing the
-known `systemd-socket-activate` composition before extending it. Demonstrate a
-private socket, a minimal no-activation config, a successful bus method call,
-bounded readiness, and clean shutdown. Then launch the daemon manually on the
-private bus and prove ownership of `org.gnome.keyring` and
-`org.freedesktop.secrets`. Document host systemd/journal dependencies and
-exact process/FD ownership. Compare with `dbus-daemon` only as a diagnostic
-baseline; do not silently replace the requested broker. Report and stop.
+Promote only the useful pieces from the spike. Give maintained integration
+tests a clear opt-in and tool-availability contract: an explicitly requested
+real-daemon run must fail when prerequisites are absent, while ordinary test
+output must make omitted integration coverage visible. Keep pure codec and
+fake-socket transport tests independent of this external-binary harness. Run
+the relevant format, clippy, nextest, shell/static, and harness checks. Report
+and stop before closing tickets. Completion of this ticket unblocks
+`gmell-unlock`.
 
-### Slice 4 — durable test integration
-
-Promote only the useful pieces from the spike. Give Rust integration tests a
-clear opt-in/tool-availability contract so a missing system daemon is a
-visible skip or explicit prerequisite, not a false pass. Keep pure codec and
-fake-socket transport tests independent of this external-binary harness.
-Run the relevant format, clippy, nextest, shell/static checks, and harness
-tests. Report and stop before closing tickets.
-
-### Slice 5 — documentation and closure
+### `gmell-harness-docs` — document and close the core harness
 
 Reconcile [`/README.md`](/README.md), harness documentation, and Beads
-acceptance criteria with observed behavior. Include troubleshooting and a
-process diagram if it clarifies ownership. Close only tickets whose acceptance
-criteria are demonstrated. Commit the documentation/ticket checkpoint and
-report remaining work back to the product track.
+acceptance criteria with observed behavior. Document the isolation boundary,
+troubleshooting, and process ownership; include a process diagram when useful.
+Close only tickets whose acceptance criteria are demonstrated and report any
+remaining optional broker work separately.
+
+### `gmell-harness-broker` — assess optional private-broker parity
+
+After lifecycle support exists, make a broker-only experiment under
+`.test-agent/harness/`, reproducing the known `systemd-socket-activate`
+composition before extending it. Demonstrate a private socket, a minimal
+no-activation config, a successful bus method call, bounded readiness, and
+clean shutdown. Then launch the daemon manually on the private bus and prove
+ownership of `org.gnome.keyring` and `org.freedesktop.secrets`. Document host
+systemd/journal dependencies and exact process/FD ownership. Compare with
+`dbus-daemon` only as a diagnostic baseline; do not silently replace the
+requested broker. A well-supported finding that the required isolation cannot
+be achieved is an acceptable result. This is the only ticket that may make
+non-prompting Secret Service observations. Report and stop.
 
 ## Deliberate non-goals
 
@@ -247,4 +256,4 @@ report remaining work back to the product track.
 - Do not make raw protocol hexdumps containing secrets.
 - Do not turn broker-specific mechanics into Rust product dependencies.
 
-Begin with Slice 0 only.
+Begin with `gmell-harness-smoke` only.
