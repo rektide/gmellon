@@ -261,8 +261,8 @@ class OwnedDaemon:
         if process.poll() is not None:
             raise BehaviorFailure("daemon exited before the owned fault transition")
         os.kill(process.pid, signal.SIGSTOP)
-        wait_for_process_state(process.pid, stopped=True)
         self.suspended = True
+        wait_for_process_state(process.pid, stopped=True)
 
     def resume(self) -> None:
         process = self.process
@@ -271,6 +271,7 @@ class OwnedDaemon:
         self.suspended = False
 
     def probe(self, sensitive: SensitiveValues) -> ControlProbe:
+        self.signals.raise_if_pending()
         process = self.process
         if process.poll() is not None:
             raise BehaviorFailure("daemon exited outside an owned transition")
