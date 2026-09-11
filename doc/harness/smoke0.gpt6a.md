@@ -6,6 +6,8 @@ resource: /doc/harness/smoke0.gpt6a.md
 tags: [gmellon, harness, gnome-keyring, integration-test]
 status: draft
 generated: { by: model:openai/gpt-6-astra, at: 2026-09-11T17:13:31-04:00 }
+verified: { by: model:openai/gpt-6-astra, at: 2026-09-11T17:23:56-04:00 }
+stale_after: 2027-03-11
 sources:
   - id: harness-contract
     resource: /doc/harness/prompt.md
@@ -39,8 +41,11 @@ and served the private control socket after those failures.
 The first credential-prelude plus UNLOCK exchange created both
 `data/keyrings/login.keyring` and `data/keyrings/user.keystore` beneath the
 scratch root. A second connection using a different password returned DENIED.
-No password or request frame was emitted to stdout, stderr, or the evidence
-record.
+The probe enumerated all observed scratch artifacts, resolved each path
+beneath the scratch root, and validated every path-valued variable reported by
+the daemon. It scanned stdout, stderr, evidence, and cleanup records for both
+generated values and their complete request frames before declaring that no
+password or frame had been retained.
 
 One development rerun initially returned FAILED because the disposable probe
 generated arbitrary bytes and occasionally included NUL, which is invalid in
@@ -48,17 +53,26 @@ the protocol's C-string representation. The probe now maps randomness into
 printable non-NUL bytes and checks this invariant before sending. This was a
 probe defect rather than nondeterministic daemon behavior.
 
-After TERM, the launched daemon PID was absent from `/proc`, demonstrating
-that the owned process was reaped. A normal run without `--keep-success` left
-no new `gmell-h-*` scratch root or `gmell-sentinel-*` file. An injected
-post-start probe failure also reaped its daemon and retained both paths for
-diagnosis:
+After TERM, `cleanup.json` recorded daemon status 0, no KILL fallback, and the
+absence of the complete process group; the launched PID was also absent from
+`/proc`. A normal run without `--keep-success` left no new `gmell-h-*` scratch
+root or `gmell-sentinel-*` file. The committed `--self-test-failure` mode
+reproduced failure cleanup, retained both logs, and recorded the process group
+as gone:
 
 ```text
-retained scratch: /home/rektide/tmp-opencode/gmell-h-459la701
-retained sentinel: /home/rektide/tmp-opencode/gmell-sentinel-tqrkwqs4
-PASS: injected failure retained artifacts and reaped daemon PID 588794
+retained scratch: /home/rektide/tmp-opencode/gmell-h-f_52dlyp
+retained sentinel: /home/rektide/tmp-opencode/gmell-sentinel-lpzbpagm
+FAIL: injected post-readiness failure
+PASS: committed failure mode retained logs and reaped process group 715523
 ```
+
+A separate live test sent SIGTERM to the harness after its control socket
+appeared. The harness returned 143, retained both daemon logs, sent TERM to its
+owned process group, verified that group disappeared, and reaped daemon PID
+718184. Unexpected Python programming failures retain the same resources but
+are not converted into terse expected-failure output; their traceback remains
+visible.
 
 ## Isolation boundary
 
@@ -85,17 +99,19 @@ the production XDG path selection needed by later `--allow-create` tests.
 python3 -m py_compile dev/harness/smoke.py
 dev/harness/smoke.py --keep-success
 dev/harness/smoke.py
+dev/harness/smoke.py --self-test-failure
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run
 ```
 
-The Python syntax check, a retained smoke invocation, a normal cleanup
-invocation, and five final consecutive smoke invocations passed. After
-concurrent control-transport work settled, formatting and Clippy passed and
-nextest ran 25 tests successfully with no skips. The earlier transient Clippy
-compilation failure was unrelated to the harness files and was not reproduced
-at the ticket checkpoint.
+The Python syntax check, retained and normal-cleanup invocations, five
+consecutive smoke invocations, deterministic failure injection, and live
+SIGTERM injection passed their expected outcomes. After concurrent
+control-transport work settled, formatting and Clippy passed and nextest ran
+28 tests successfully with no skips. The earlier transient Clippy compilation
+failure was unrelated to the harness files and was not reproduced at the
+ticket checkpoint.
 
 ## Cross-references
 

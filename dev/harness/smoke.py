@@ -43,6 +43,14 @@ class SmokeFailure(RuntimeError):
     """A failed smoke-test invariant."""
 
 
+class HarnessSignal(Exception):
+    """A termination signal received while the harness owns a child."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"received signal {signal.Signals(signum).name}")
+        self.signum = signum
+
+
 @dataclass(frozen=True)
 class Sandbox:
     root: Path
@@ -59,6 +67,7 @@ class Sandbox:
     stdout_log: Path
     stderr_log: Path
     evidence: Path
+    cleanup_log: Path
 
 
 @dataclass(frozen=True)
@@ -71,12 +80,25 @@ class SentinelState:
     modified_ns: int
 
 
+@dataclass(frozen=True)
+class ShutdownResult:
+    return_code: int
+    sent_term: bool
+    sent_kill: bool
+    process_group_gone: bool
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--keep-success",
         action="store_true",
         help="retain the scratch directory after a successful run",
+    )
+    parser.add_argument(
+        "--self-test-failure",
+        action="store_true",
+        help="fail after readiness to demonstrate cleanup and retained diagnostics",
     )
     return parser.parse_args()
 
@@ -112,6 +134,7 @@ def create_sandbox() -> Sandbox:
         stdout_log=root / "daemon.stdout.log",
         stderr_log=root / "daemon.stderr.log",
         evidence=root / "evidence.json",
+        cleanup_log=root / "cleanup.json",
     )
 
 
@@ -187,7 +210,28 @@ def launch_daemon(
     )
 
 
-def wait_for_initialization_stdout_eof(process: subprocess.Popen[bytes]) -> bytes:
+def install_signal_handlers() -> dict[signal.Signals, signal.Handlers]:
+    previous: dict[signal.Signals, signal.Handlers] = {}
+
+    def interrupt(signum: int, _frame: object) -> None:
+        # Ignore repeats while the first signal unwinds through owned cleanup.
+        signal.signal(signum, signal.SIG_IGN)
+        raise HarnessSignal(signum)
+
+    for signum in (signal.SIGHUP, signal.SIGTERM):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, interrupt)
+    return previous
+
+
+def restore_signal_handlers(previous: dict[signal.Signals, signal.Handlers]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
+def wait_for_initialization_stdout_eof(
+    process: subprocess.Popen[bytes], log: BinaryIO
+) -> bytes:
     if process.stdout is None:
         raise SmokeFailure("daemon stdout was not captured")
 
@@ -210,6 +254,8 @@ def wait_for_initialization_stdout_eof(process: subprocess.Popen[bytes]) -> byte
         chunk = os.read(descriptor, 4096)
         if not chunk:
             break
+        log.write(chunk)
+        log.flush()
         output.extend(chunk)
         if len(output) > MAX_STARTUP_OUTPUT_BYTES:
             raise SmokeFailure("daemon initialization output exceeded the safety limit")
@@ -267,7 +313,34 @@ def require_beneath(path: Path, root: Path) -> None:
         raise SmokeFailure(f"path escaped scratch root: {path}") from error
 
 
-def encode_unlock(password: bytearray) -> bytes:
+def validate_reported_paths(reported: dict[str, str], root: Path) -> None:
+    path_names = {"GNOME_KEYRING_CONTROL", "SSH_AUTH_SOCK"}
+    for name, value in reported.items():
+        candidate: str | None = None
+        if name in path_names:
+            candidate = value
+        elif name == "GPG_AGENT_INFO":
+            candidate = value.split(":", 1)[0]
+        elif value.startswith("unix:path="):
+            candidate = value.removeprefix("unix:path=").split(",", 1)[0]
+        elif value.startswith("/"):
+            candidate = value
+
+        if candidate is not None:
+            if not candidate.startswith("/"):
+                raise SmokeFailure(f"daemon reported a non-absolute path in {name}")
+            require_beneath(Path(candidate), root)
+
+
+def inspect_artifacts(root: Path) -> list[str]:
+    artifacts: list[str] = []
+    for path in sorted(root.rglob("*")):
+        require_beneath(path, root)
+        artifacts.append(str(path.relative_to(root)))
+    return artifacts
+
+
+def encode_unlock(password: bytes) -> bytes:
     if 0 in password:
         raise SmokeFailure("probe generated an invalid password containing NUL")
     payload_length = 4 + len(password)
@@ -285,7 +358,7 @@ def receive_exact(connection: socket.socket, length: int) -> bytes:
     return bytes(received)
 
 
-def unlock(control_socket: Path, daemon_pid: int, password: bytearray) -> int:
+def unlock(control_socket: Path, daemon_pid: int, password: bytes) -> tuple[int, bytes]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(IO_TIMEOUT_SECONDS)
         connection.connect(str(control_socket))
@@ -302,39 +375,88 @@ def unlock(control_socket: Path, daemon_pid: int, password: bytearray) -> int:
 
         # The credential byte is a transport prelude, not part of the frame.
         connection.sendall(b"\0")
-        connection.sendall(encode_unlock(password))
+        frame = encode_unlock(password)
+        connection.sendall(frame)
         response = receive_exact(connection, 8)
 
     total_length, result = struct.unpack("!II", response)
     if total_length != 8:
         raise SmokeFailure(f"unexpected control response length: {total_length}")
-    return result
+    return result, frame
 
 
-def overwrite(secret: bytearray) -> None:
-    secret[:] = b"\0" * len(secret)
-
-
-def random_probe_password() -> bytearray:
+def random_probe_password() -> bytes:
     # Protocol strings cannot contain NUL. Keep the probe values opaque while
     # mapping random bytes into printable ASCII without creating argv strings.
-    return bytearray((value % 94) + 33 for value in os.urandom(32))
+    return bytes((value % 94) + 33 for value in os.urandom(32))
 
 
-def terminate_process_group(process: subprocess.Popen[bytes]) -> int:
-    if process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            return process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-    return process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+def require_redacted(paths: tuple[Path, ...], sensitive_values: tuple[bytes, ...]) -> None:
+    for path in paths:
+        if not path.exists():
+            continue
+        contents = path.read_bytes()
+        if any(value and value in contents for value in sensitive_values):
+            raise SmokeFailure(f"sensitive probe bytes appeared in retained output: {path}")
+
+
+def process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def signal_process_group(process_group: int, signum: signal.Signals) -> bool:
+    try:
+        os.killpg(process_group, signum)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def wait_for_process_group_exit(process_group: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while process_group_exists(process_group):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> ShutdownResult:
+    process_group = process.pid
+    sent_term = signal_process_group(process_group, signal.SIGTERM)
+    sent_kill = False
+
+    try:
+        return_code = process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        sent_kill = signal_process_group(process_group, signal.SIGKILL)
+        return_code = process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+
+    if not wait_for_process_group_exit(process_group, SHUTDOWN_TIMEOUT_SECONDS):
+        sent_kill = signal_process_group(process_group, signal.SIGKILL) or sent_kill
+        if not wait_for_process_group_exit(process_group, SHUTDOWN_TIMEOUT_SECONDS):
+            raise SmokeFailure(f"owned process group {process_group} survived SIGKILL")
+
+    if not sent_term:
+        raise SmokeFailure(
+            f"daemon exited before owned teardown with status {return_code}"
+        )
+    expected_statuses = {0, -signal.SIGTERM}
+    if sent_kill:
+        expected_statuses.add(-signal.SIGKILL)
+    if return_code not in expected_statuses:
+        raise SmokeFailure(f"daemon teardown returned abnormal status {return_code}")
+
+    return ShutdownResult(
+        return_code=return_code,
+        sent_term=sent_term,
+        sent_kill=sent_kill,
+        process_group_gone=True,
+    )
 
 
 def write_evidence(
@@ -343,6 +465,7 @@ def write_evidence(
     process: subprocess.Popen[bytes],
     reported_environment: dict[str, str],
     control_metadata: os.stat_result,
+    artifacts: list[str],
 ) -> None:
     safe_environment = daemon_environment(sandbox)
     document = {
@@ -357,6 +480,7 @@ def write_evidence(
             "control_directory": str(sandbox.control),
             "control_socket": str(sandbox.control / "control"),
             "login_keyring": str(sandbox.data / "keyrings" / "login.keyring"),
+            "observed_artifacts": artifacts,
         },
         "checks": {
             "initialization_stdout_eof": True,
@@ -370,13 +494,29 @@ def write_evidence(
     sandbox.evidence.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
-def run(keep_success: bool) -> None:
+def write_cleanup_result(
+    sandbox: Sandbox, process: subprocess.Popen[bytes], result: ShutdownResult
+) -> None:
+    document = {
+        "daemon_pid": process.pid,
+        "return_code": result.return_code,
+        "sent_term": result.sent_term,
+        "sent_kill": result.sent_kill,
+        "process_group_gone": result.process_group_gone,
+    }
+    sandbox.cleanup_log.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
+def run(keep_success: bool, self_test_failure: bool) -> None:
     old_umask = os.umask(0o077)
+    previous_signal_handlers = install_signal_handlers()
     sandbox: Sandbox | None = None
     sentinel_path: Path | None = None
     sentinel_before: SentinelState | None = None
     process: subprocess.Popen[bytes] | None = None
+    stdout_stream: BinaryIO | None = None
     stderr_stream: BinaryIO | None = None
+    sensitive_values: tuple[bytes, ...] = ()
     success = False
     failure: BaseException | None = None
     cleanup_failure: BaseException | None = None
@@ -388,19 +528,20 @@ def run(keep_success: bool) -> None:
 
         sandbox = create_sandbox()
         sentinel_path, sentinel_before = create_sentinel()
+        stdout_stream = sandbox.stdout_log.open("wb")
         stderr_stream = sandbox.stderr_log.open("wb")
         process = launch_daemon(executable, sandbox, stderr_stream)
 
-        startup_output = wait_for_initialization_stdout_eof(process)
+        startup_output = wait_for_initialization_stdout_eof(process, stdout_stream)
         if process.stdout is not None:
             process.stdout.close()
-        sandbox.stdout_log.write_bytes(startup_output)
         reported_environment = parse_reported_environment(startup_output)
         reported_control = reported_environment.get("GNOME_KEYRING_CONTROL")
         if reported_control != str(sandbox.control):
             raise SmokeFailure(
                 "daemon did not report the explicitly selected control directory"
             )
+        validate_reported_paths(reported_environment, sandbox.root)
 
         control_socket = sandbox.control / "control"
         control_metadata = wait_for_control_socket(process, control_socket)
@@ -417,43 +558,48 @@ def run(keep_success: bool) -> None:
         ):
             require_beneath(path, sandbox.root)
 
-        password = bytearray()
-        wrong_password = bytearray()
-        try:
-            password.extend(random_probe_password())
-            while not wrong_password or wrong_password == password:
-                wrong_password[:] = random_probe_password()
-            first_result = unlock(control_socket, process.pid, password)
-            if first_result != OK:
-                raise SmokeFailure(
-                    f"fresh-store UNLOCK returned result {first_result}, expected OK"
-                )
+        if self_test_failure:
+            raise SmokeFailure("injected post-readiness failure")
 
-            login_keyring = sandbox.data / "keyrings" / "login.keyring"
-            if not login_keyring.is_file():
-                raise SmokeFailure("fresh-store UNLOCK did not create login.keyring")
-            require_beneath(login_keyring, sandbox.root)
+        password = random_probe_password()
+        wrong_password = random_probe_password()
+        while wrong_password == password:
+            wrong_password = random_probe_password()
 
-            wrong_result = unlock(control_socket, process.pid, wrong_password)
-            if wrong_result != DENIED:
-                raise SmokeFailure(
-                    f"wrong-password UNLOCK returned result {wrong_result}, expected DENIED"
-                )
-        finally:
-            overwrite(password)
-            overwrite(wrong_password)
+        first_result, first_frame = unlock(control_socket, process.pid, password)
+        sensitive_values = (password, wrong_password, first_frame)
+        if first_result != OK:
+            raise SmokeFailure(
+                f"fresh-store UNLOCK returned result {first_result}, expected OK"
+            )
+
+        login_keyring = sandbox.data / "keyrings" / "login.keyring"
+        user_keystore = sandbox.data / "keyrings" / "user.keystore"
+        for expected_file in (login_keyring, user_keystore):
+            if not expected_file.is_file():
+                raise SmokeFailure(f"fresh-store UNLOCK did not create {expected_file.name}")
+            require_beneath(expected_file, sandbox.root)
+
+        wrong_result, wrong_frame = unlock(control_socket, process.pid, wrong_password)
+        sensitive_values = (*sensitive_values, wrong_frame)
+        if wrong_result != DENIED:
+            raise SmokeFailure(
+                f"wrong-password UNLOCK returned result {wrong_result}, expected DENIED"
+            )
 
         if process.poll() is not None:
             raise SmokeFailure("daemon exited before smoke checks completed")
         if read_sentinel(sentinel_path) != sentinel_before:
             raise SmokeFailure("external isolation sentinel changed during the smoke run")
 
+        artifacts = inspect_artifacts(sandbox.root)
         write_evidence(
             sandbox,
             executable,
             process,
             reported_environment,
             control_metadata,
+            artifacts,
         )
         success = True
     except BaseException as error:
@@ -461,11 +607,16 @@ def run(keep_success: bool) -> None:
     finally:
         if process is not None:
             try:
-                terminate_process_group(process)
+                shutdown_result = terminate_process_group(process)
+                if sandbox is not None:
+                    write_cleanup_result(sandbox, process, shutdown_result)
             except BaseException as error:
                 cleanup_failure = error
+        if stdout_stream is not None:
+            stdout_stream.close()
         if stderr_stream is not None:
             stderr_stream.close()
+        restore_signal_handlers(previous_signal_handlers)
         os.umask(old_umask)
 
         if sentinel_path is not None and sentinel_before is not None:
@@ -474,6 +625,24 @@ def run(keep_success: bool) -> None:
                     raise SmokeFailure(
                         "external isolation sentinel changed during daemon teardown"
                     )
+            except BaseException as error:
+                success = False
+                if failure is None:
+                    failure = error
+                elif cleanup_failure is None:
+                    cleanup_failure = error
+
+        if sandbox is not None and sensitive_values:
+            try:
+                require_redacted(
+                    (
+                        sandbox.stdout_log,
+                        sandbox.stderr_log,
+                        sandbox.evidence,
+                        sandbox.cleanup_log,
+                    ),
+                    sensitive_values,
+                )
             except BaseException as error:
                 success = False
                 if failure is None:
@@ -513,16 +682,15 @@ def run(keep_success: bool) -> None:
 def main() -> int:
     arguments = parse_args()
     try:
-        run(arguments.keep_success)
-    except BaseException as error:
-        if isinstance(error, KeyboardInterrupt):
-            message = "interrupted"
-        else:
-            message = str(error)
-        print(f"FAIL: {message}", file=sys.stderr)
-        # A failed run intentionally retains its scratch root. The path is
-        # included in any exception that needs investigation, and the unique
-        # gmell-h-* prefix makes retained artifacts discoverable.
+        run(arguments.keep_success, arguments.self_test_failure)
+    except HarnessSignal as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        return 128 + error.signum
+    except KeyboardInterrupt:
+        print("FAIL: interrupted", file=sys.stderr)
+        return 128 + signal.SIGINT
+    except SmokeFailure as error:
+        print(f"FAIL: {error}", file=sys.stderr)
         return 1
     return 0
 
