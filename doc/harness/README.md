@@ -18,10 +18,15 @@ The harness currently provides four executable entry points:
 - [`dev/harness/check`](/dev/harness/check) is the maintained explicit check
   entry point for Rust real-daemon tests and the broader Python checks.
 
-The control-only lifecycle and installed behavior characterization are
-reviewed. Durable Rust-test integration is implemented and remains in review.
-Private `dbus-broker` parity is optional and does not block control-socket
-tests.
+The control-only core chain is complete: the smoke proof, reusable lifecycle,
+installed behavior matrix, and durable Rust-test integration are all
+implemented, reviewed, and closed with version-scoped evidence under
+[Contract, implementation, and evidence](#contract-implementation-and-evidence).
+Private `dbus-broker` coverage was originally optional parity and has been
+promoted to required infrastructure for the approved zbus Secret Service
+product backend (Beads `gmell-harness-broker`, in progress); it remains a
+sibling topology that does not block these control-socket tests or the closure
+of the control-only harness. See [Broker parity](#broker-parity).
 
 ## Guide map
 
@@ -37,7 +42,7 @@ for how that authority divides:
 | Change lifecycle mechanics | [Lifecycle state model](#lifecycle-state-model), then [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) and its [focused tests](/dev/harness/tests/test_lifecycle.py) |
 | Run or inspect daemon behavior coverage | [Quick start](#quick-start), [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md), and [Evolution guidance](#evolution-guidance) |
 | Integrate with Rust or CI | [Durable test integration](#durable-test-integration) and [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md) |
-| Investigate Secret Service parity | [Optional broker parity](#optional-broker-parity) |
+| Investigate Secret Service parity | [Broker parity](#broker-parity) |
 
 The supported reusable surface is the executable command interface and the
 exported environment documented below. Importable Python names in
@@ -576,7 +581,7 @@ one kind of truth:
 | [`lifecycle0.gpt6a.md`](/doc/harness/lifecycle0.gpt6a.md) | Version-scoped lifecycle, signal-race, environment, retention, and test evidence; evidence, not timeless daemon promises |
 | [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md) | Version-scoped UNLOCK, CHANGE, restart, empty-password, stopped, and unresponsive observations; evidence, not timeless daemon promises |
 | [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md) | Version-scoped durable entry-point, skip/fail, Rust transport, parallel-isolation, and retained-artifact evidence |
-| [`prompt.md`](/doc/harness/prompt.md) | Epic safety invariants, upstream facts, ticket boundaries, and the work graph; planned acceptance, not completion evidence |
+| [`prompt.md`](/doc/harness/prompt.md) | Epic safety invariants, upstream facts, ticket boundaries, and the original work graph, plus a completion-status section; planned acceptance, not completion evidence |
 | Product [`README.md`](/README.md) | Product contract, private wire protocol, and the unlock-or-create hazard that motivates real-daemon testing; not the harness lifecycle contract |
 | Beads graph | Review and work status; not runtime behavior |
 
@@ -590,16 +595,16 @@ belong in evidence only after observation against the installed daemon.
 
 ## Evolution guidance
 
-The smoke proof, reusable lifecycle, and control-protocol behavior matrix are
-complete. Durable test integration is implemented pending review; after
-acceptance, the remaining core ticket is documentation closure. The harness
-deliberately does not implement
+The control-only core chain — smoke proof, reusable lifecycle, control-protocol
+behavior matrix, durable test integration, and documentation reconciliation —
+is complete and reviewed. The harness deliberately does not implement
 `gmellon unlock` or `change`, use the real session bus temporarily, launch a
 GUI prompter, rename real keyrings, clean unrelated processes or data, or
-make broker mechanics Rust product dependencies. Optional broker parity
-branches independently after lifecycle — it must not gate `gmellon unlock`
-or any direct control-protocol test, and only that branch may make
-non-prompting Secret Service observations.
+make broker mechanics Rust product dependencies. Broker parity branched
+independently after lifecycle and has been promoted to required work for the
+zbus Secret Service product backend; it still must not gate any direct
+control-protocol test, and only that branch may make non-prompting Secret
+Service observations.
 
 The current deep interface is deliberately small: launch a fresh isolated
 daemon, prove readiness, run one command under a strict environment
@@ -646,13 +651,18 @@ generalized into timeless upstream guarantees.
   buffers and scanning retained regular artifacts without printing values or
   password-bearing frames.
 
-### Optional broker parity
+### Broker parity
 
 Broker parity is a sibling topology profile, not an upgrade that should make
-the baseline depend on D-Bus. It may add a supervisor-owned listener, broker,
-and manually launched daemon, but it must preserve unique scratch state,
-empty-based child environments, bounded readiness, exact ownership, retained
-failure evidence, and no activation of host services.
+the baseline depend on D-Bus. It was planned as optional parity and has been
+promoted to required, in-progress work (`gmell-harness-broker`, P1) because the
+approved product architecture now targets Secret Service collections through
+zbus and GNOME's private internal interface; that promotion does not change
+the control-only contract in this guide or block direct control-socket tests.
+It may add a supervisor-owned listener, broker, and manually launched daemon,
+but it must preserve unique scratch state, empty-based child environments,
+bounded readiness, exact ownership, retained failure evidence, and no
+activation of host services.
 
 Any broker interface should identify its capability explicitly rather than
 changing the meaning of the control-only variables. Broker readiness must
