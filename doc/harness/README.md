@@ -6,7 +6,7 @@ manually launched `gnome-keyring-daemon` while redirecting normal keyring,
 bus, and activation discovery away from the user's desktop session. This is
 a cooperative test boundary, not access control against the command itself.
 
-The harness currently provides three executable entry points:
+The harness currently provides four executable entry points:
 
 - [`dev/harness/smoke.py`](/dev/harness/smoke.py) proves one isolated
   fresh-UNLOCK and wrong-password-DENIED path.
@@ -15,10 +15,11 @@ The harness currently provides three executable entry points:
 - [`dev/harness/behavior.py`](/dev/harness/behavior.py) characterizes UNLOCK,
   CHANGE, restart persistence, empty passwords, and explicit transport faults
   against the installed daemon without making Secret Service calls.
+- [`dev/harness/check`](/dev/harness/check) is the maintained explicit check
+  entry point for Rust real-daemon tests and the broader Python checks.
 
-The control-only lifecycle is reviewed, and installed behavior
-characterization is implemented pending architectural review; durable
-Rust-test integration remains active work.
+The control-only lifecycle and installed behavior characterization are
+reviewed. Durable Rust-test integration is implemented and remains in review.
 Private `dbus-broker` parity is optional and does not block control-socket
 tests.
 
@@ -35,7 +36,7 @@ for how that authority divides:
 | Understand the security boundary | [Boundary and invariants](#boundary-and-invariants) and [Process topology](#process-topology) |
 | Change lifecycle mechanics | [Lifecycle state model](#lifecycle-state-model), then [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) and its [focused tests](/dev/harness/tests/test_lifecycle.py) |
 | Run or inspect daemon behavior coverage | [Quick start](#quick-start), [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md), and [Evolution guidance](#evolution-guidance) |
-| Integrate with Rust or CI | [Durable test integration](#durable-test-integration) |
+| Integrate with Rust or CI | [Durable test integration](#durable-test-integration) and [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md) |
 | Investigate Secret Service parity | [Optional broker parity](#optional-broker-parity) |
 
 The supported reusable surface is the executable command interface and the
@@ -70,6 +71,21 @@ See the complete executable contract without allocating a sandbox:
 
 ```sh
 dev/harness/lifecycle.py --help
+```
+
+Run the maintained Rust transport against two independent real daemons using
+nextest:
+
+```sh
+dev/harness/check rust-nextest
+```
+
+Use `dev/harness/check rust-cargo` for normal Cargo test conventions. Run all
+external-tool harness checks, including the Python lifecycle suite, installed
+behavior matrix, and smoke proof, with:
+
+```sh
+dev/harness/check all
 ```
 
 Inspect the selected private control socket from a command:
@@ -113,12 +129,14 @@ coverage.
 
 ### Host assumptions
 
-The current developer harness assumes POSIX process and signal semantics,
-Unix sockets, a writable `/home/rektide/tmp-opencode`, and
-`gnome-keyring-daemon` discoverable in `/usr/bin:/bin`. It is intentionally
-host-specific today: portable or packaged integration must make these
-prerequisites explicit rather than silently weakening isolation or searching
-a caller-controlled path.
+The current developer harness assumes Linux/POSIX process and signal semantics,
+Unix sockets and peer credentials, readable `/dev/urandom`, a writable
+`/home/rektide/tmp-opencode`, Python 3 on `PATH`, and
+`gnome-keyring-daemon` discoverable in `/usr/bin:/bin`. Rust entry points also
+require Cargo, and the nextest modes require `cargo-nextest`. It is
+intentionally host-specific today: portable or packaged integration must make
+these prerequisites explicit rather than silently weakening isolation or
+searching a caller-controlled daemon path.
 
 ## Command environment
 
@@ -387,7 +405,90 @@ are co-located implementation seams, not a public import contract.
 
 ## Running harness checks
 
+### Ordinary Rust workflow
+
+The real-daemon tests are normal Rust integration tests marked `#[ignore]`.
+Ordinary workflows stay pure and make the omission visible:
+
 ```sh
+cargo test
+cargo nextest run
+```
+
+Cargo reports two tests as `ignored`; nextest reports two as `skipped`. The
+pure codec unit tests and fake Unix-socket transport tests remain in the
+ordinary run and never invoke Python or a system daemon. Do not select only the
+ignored test binary without `--run-ignored`: nextest correctly returns its
+"no tests to run" status in that narrowed case.
+
+### Explicit real-daemon workflow
+
+Use either maintained wrapper mode from the repository root:
+
+```sh
+dev/harness/check rust-nextest
+dev/harness/check rust-cargo
+```
+
+The corresponding direct conventional commands are:
+
+```sh
+cargo nextest run --test real_daemon --run-ignored ignored-only
+cargo test --test real_daemon -- --ignored
+```
+
+Both tests first validate Linux support, an executable lifecycle, `python3`, a
+runnable system `gnome-keyring-daemon`, and readable `/dev/urandom`. The
+wrapper additionally validates Cargo and cargo-nextest where applicable. Any
+missing or unusable prerequisite is a hard failure with installation or repair
+guidance: wrapper preflight exits 125, while a direct Rust command fails its
+requested test. Neither path converts a requested integration run into an
+ignore or skip.
+
+Each outer Rust test invokes the executable
+[`lifecycle.py`](/dev/harness/lifecycle.py) command and re-runs only its own
+test binary as the lifecycle command. It does not import Python or reconstruct
+the daemon environment. The inner test consumes `GMELL_HARNESS_*` and uses the
+public `gmellon::control::SyncClient` to cover:
+
+- fresh UNLOCK, login-file creation, repeated correct UNLOCK, and wrong
+  password DENIED; and
+- fixture UNLOCK, CHANGE A-to-B, B accepted, and former A denied.
+
+These are transport/product-relevant paths available before the unlock/change
+CLI exists. Restart persistence and explicit stopped/unresponsive transitions
+remain in `behavior.py`, whose supervisor coherently owns those transitions.
+
+Instances need no test-runner serialization: each ignored test gets a unique
+lifecycle root, daemon, control socket, store, and sentinel. Add
+`--keep-success` to the wrapper before the mode to retain successful Rust
+artifacts, or set `GMELL_HARNESS_KEEP_SUCCESS=1` for a direct Cargo/nextest
+command. The retained `rust-integration.txt` contains operation-path labels,
+the Rust transport name, secret count, and a post-scan marker only; generated
+passwords are zeroized on drop and scanned against every regular file in the
+root before success.
+
+### Broader Python workflow
+
+The maintained explicit command is:
+
+```sh
+dev/harness/check python
+```
+
+It compiles all harness Python, runs the focused lifecycle/behavior tests, then
+runs the installed behavior matrix and smoke proof. `dev/harness/check all`
+runs the nextest real-daemon path followed by those checks. The wrapper
+preflights external tools before calling existing executables; it does not
+duplicate lifecycle orchestration. The focused Python tests retain their
+convenient unittest skip annotations for direct development invocation, but an
+explicit `dev/harness/check` mode fails before unittest if the daemon is
+missing. A skip from direct unittest is not evidence of real-daemon coverage.
+
+### Complete static and Rust checks
+
+```sh
+sh -n dev/harness/check
 python3 -m py_compile \
   dev/harness/smoke.py \
   dev/harness/behavior.py \
@@ -406,10 +507,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run
 ```
 
-The focused lifecycle suite requires `gnome-keyring-daemon` and skips when it
-is unavailable. Defining the durable opt-in and missing-tool policy for
-normal Rust/CI workflows belongs to `gmell-harness-integration`; do not
-interpret an unavailable-tool skip as real-daemon coverage.
+There is currently no tracked CI configuration in this repository. Operator
+policy is therefore explicit rather than presented as an existing CI job:
+
+1. ordinary development runs full `cargo nextest run`, whose summary must show
+   the two omitted real-daemon tests as skipped;
+2. a provisioned Linux integration environment runs `dev/harness/check all`;
+3. missing prerequisites in that explicitly provisioned run are setup
+   failures, never allowed skips; and
+4. future CI should preserve these as distinct jobs/capabilities rather than
+   installing or launching GNOME Keyring in every pure-test job.
 
 ## Troubleshooting
 
@@ -458,11 +565,14 @@ one kind of truth:
 | --- | --- |
 | This guide and `lifecycle.py --help` | Current operator-facing lifecycle contract |
 | [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) | Executable mechanics; the final authority on what the current revision actually does |
+| [`dev/harness/check`](/dev/harness/check) | Maintained explicit prerequisite and check composition; delegates lifecycle/process orchestration |
+| [`tests/harness/real_daemon.rs`](/tests/harness/real_daemon.rs) | Ignored Rust integration boundary and real `SyncClient` assertions |
 | [`dev/harness/tests/test_lifecycle.py`](/dev/harness/tests/test_lifecycle.py) | Executable acceptance coverage for lifecycle invariants and races |
 | [`dev/harness/behavior.py`](/dev/harness/behavior.py) and its [black-box test](/dev/harness/tests/test_behavior.py) | Reproducible installed-daemon control matrix plus explicit behavior-owned restart/fault transitions |
 | [`smoke0.gpt6a.md`](/doc/harness/smoke0.gpt6a.md) | Version-scoped installed-daemon evidence for the first UNLOCK/denial path and exact-PID cleanup; evidence, not timeless daemon promises |
 | [`lifecycle0.gpt6a.md`](/doc/harness/lifecycle0.gpt6a.md) | Version-scoped lifecycle, signal-race, environment, retention, and test evidence; evidence, not timeless daemon promises |
 | [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md) | Version-scoped UNLOCK, CHANGE, restart, empty-password, stopped, and unresponsive observations; evidence, not timeless daemon promises |
+| [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md) | Version-scoped durable entry-point, skip/fail, Rust transport, parallel-isolation, and retained-artifact evidence |
 | [`prompt.md`](/doc/harness/prompt.md) | Epic safety invariants, upstream facts, ticket boundaries, and the work graph; planned acceptance, not completion evidence |
 | Product [`README.md`](/README.md) | Product contract, private wire protocol, and the unlock-or-create hazard that motivates real-daemon testing; not the harness lifecycle contract |
 | Beads graph | Review and work status; not runtime behavior |
@@ -477,10 +587,10 @@ belong in evidence only after observation against the installed daemon.
 
 ## Evolution guidance
 
-The smoke proof and reusable lifecycle are complete, and the control-protocol
-behavior matrix is implemented pending architectural review. After acceptance,
-the core chain adds durable test integration, then documentation closure. The
-harness deliberately does not implement
+The smoke proof, reusable lifecycle, and control-protocol behavior matrix are
+complete. Durable test integration is implemented pending review; after
+acceptance, the remaining core ticket is documentation closure. The harness
+deliberately does not implement
 `gmellon unlock` or `change`, use the real session bus temporarily, launch a
 GUI prompter, rename real keyrings, clean unrelated processes or data, or
 make broker mechanics Rust product dependencies. Optional broker parity
@@ -517,22 +627,21 @@ generalized into timeless upstream guarantees.
 
 ### Durable test integration
 
-- Invoke the executable lifecycle and consume `GMELL_HARNESS_*`; do not
-  import its Python internals or duplicate environment construction in Rust
-  tests.
-- Keep pure codec and fake-socket transport tests independent of the
-  installed daemon; real-daemon tests are a distinct integration capability.
-- Define an explicit opt-in and prerequisite policy: a requested real-daemon
-  run must fail when the daemon is unavailable, while ordinary workflows
-  must make omitted coverage visible rather than implying it ran.
-- Preserve per-invocation roots so integration cases remain parallel-safe;
-  add serialization only for a demonstrated external shared resource.
-- Keep secrets generated and consumed within the narrowest test scope.
-  Harness artifacts should contain operations, paths, statuses, and lengths
-  at most — never password-bearing frames.
-
-The current Python suite's missing-tool skip is focused lifecycle test
-policy, not yet the durable Rust/CI integration policy.
+- Keep the ignored Rust tests as thin lifecycle-command clients: consume
+  `GMELL_HARNESS_*`, use public product transport, and leave daemon mechanics
+  behind the executable Python contract.
+- Add future product cases to [`tests/harness/real_daemon.rs`](/tests/harness/real_daemon.rs)
+  when one fresh daemon is coherent. Put explicit restarts and fault injection
+  behind a supervisor-owned executable rather than killing lifecycle children
+  from Rust.
+- Preserve the ordinary ignored/skipped signal and explicit hard-failure
+  prerequisite contract. Never add tool-detection that returns early from an
+  explicitly selected test.
+- Preserve one unique lifecycle per test. Serialize only after demonstrating
+  a genuinely shared external resource.
+- Keep generated secrets inside the inner Rust process, zeroizing their owned
+  buffers and scanning retained regular artifacts without printing values or
+  password-bearing frames.
 
 ### Optional broker parity
 
