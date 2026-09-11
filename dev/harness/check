@@ -78,8 +78,13 @@ run_python() {
 	python3 -m unittest -v \
 		dev/harness/tests/test_behavior.py \
 		dev/harness/tests/test_lifecycle.py
-	dev/harness/behavior.py
-	dev/harness/smoke.py
+	if [ -n "$KEEP_SUCCESS" ]; then
+		dev/harness/behavior.py --keep-success
+		dev/harness/smoke.py --keep-success
+	else
+		dev/harness/behavior.py
+		dev/harness/smoke.py
+	fi
 }
 
 KEEP_SUCCESS=

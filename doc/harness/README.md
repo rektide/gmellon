@@ -466,7 +466,10 @@ artifacts, or set `GMELL_HARNESS_KEEP_SUCCESS=1` for a direct Cargo/nextest
 command. The retained `rust-integration.txt` contains operation-path labels,
 the Rust transport name, secret count, and a post-scan marker only; generated
 passwords are zeroized on drop and scanned against every regular file in the
-root before success.
+root before success. The same scan runs before an operation assertion panic is
+re-thrown, so lifecycle-retained failure artifacts are checked while the
+generated values remain available. `--keep-success` also retains the behavior
+and smoke roots when used with `python` or `all`.
 
 ### Broader Python workflow
 

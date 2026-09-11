@@ -9,6 +9,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::Read;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -30,22 +31,24 @@ fn real_daemon_unlock_uses_the_reviewed_transport() {
         {
             let password = random_password();
             let wrong_password = distinct_password(&[&password]);
-            let client = isolated_client();
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                let client = isolated_client();
 
-            require_result(client.unlock(&password), DaemonResult::Ok, "fresh UNLOCK");
-            require_login_files();
-            require_result(
-                client.unlock(&password),
-                DaemonResult::Ok,
-                "subsequent correct UNLOCK",
-            );
-            require_result(
-                client.unlock(&wrong_password),
-                DaemonResult::Denied,
-                "wrong UNLOCK",
-            );
+                require_result(client.unlock(&password), DaemonResult::Ok, "fresh UNLOCK");
+                require_login_files();
+                require_result(
+                    client.unlock(&password),
+                    DaemonResult::Ok,
+                    "subsequent correct UNLOCK",
+                );
+                require_result(
+                    client.unlock(&wrong_password),
+                    DaemonResult::Denied,
+                    "wrong UNLOCK",
+                );
+            }));
 
-            record_and_scan("unlock", &[&password, &wrong_password]);
+            finish_case("unlock", &[&password, &wrong_password], outcome);
         }
     });
 }
@@ -58,27 +61,29 @@ fn real_daemon_change_uses_the_reviewed_transport() {
         {
             let original_password = random_password();
             let new_password = distinct_password(&[&original_password]);
-            let client = isolated_client();
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                let client = isolated_client();
 
-            require_result(
-                client.unlock(&original_password),
-                DaemonResult::Ok,
-                "fixture UNLOCK",
-            );
-            require_login_files();
-            require_result(
-                client.change(&original_password, &new_password),
-                DaemonResult::Ok,
-                "CHANGE A-to-B",
-            );
-            require_result(client.unlock(&new_password), DaemonResult::Ok, "UNLOCK B");
-            require_result(
-                client.unlock(&original_password),
-                DaemonResult::Denied,
-                "UNLOCK former A",
-            );
+                require_result(
+                    client.unlock(&original_password),
+                    DaemonResult::Ok,
+                    "fixture UNLOCK",
+                );
+                require_login_files();
+                require_result(
+                    client.change(&original_password, &new_password),
+                    DaemonResult::Ok,
+                    "CHANGE A-to-B",
+                );
+                require_result(client.unlock(&new_password), DaemonResult::Ok, "UNLOCK B");
+                require_result(
+                    client.unlock(&original_password),
+                    DaemonResult::Denied,
+                    "UNLOCK former A",
+                );
+            }));
 
-            record_and_scan("change", &[&original_password, &new_password]);
+            finish_case("change", &[&original_password, &new_password], outcome);
         }
     });
 }
@@ -98,7 +103,7 @@ fn run_isolated(test_name: &str, test: impl FnOnce()) {
         panic!("real-daemon test could not locate its test executable: {error}")
     });
     let mut command = Command::new(&lifecycle);
-    if env::var_os(KEEP_SUCCESS_MARKER).is_some() {
+    if env::var_os(KEEP_SUCCESS_MARKER).as_deref() == Some(OsStr::new("1")) {
         command.arg("--keep-success");
     }
     let output = command
@@ -338,6 +343,14 @@ fn record_and_scan(path_name: &str, secrets: &[&[u8]]) {
 }
 
 #[cfg(target_os = "linux")]
+fn finish_case(path_name: &str, secrets: &[&[u8]], outcome: std::thread::Result<()>) {
+    record_and_scan(path_name, secrets);
+    if let Err(payload) = outcome {
+        panic::resume_unwind(payload);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn scan_directory(directory: &Path, secrets: &[&[u8]]) {
     for entry in fs::read_dir(directory).expect("scan harness artifacts") {
         let entry = entry.expect("read harness artifact entry");
@@ -347,10 +360,9 @@ fn scan_directory(directory: &Path, secrets: &[&[u8]]) {
         } else if file_type.is_file() {
             let contents =
                 fs::read(entry.path()).expect("read harness artifact for redaction scan");
+            assert!(secrets.iter().all(|secret| !secret.is_empty()));
             assert!(
-                secrets
-                    .iter()
-                    .all(|secret| !secret.is_empty() && !contains(&contents, secret)),
+                secrets.iter().all(|secret| !contains(&contents, secret)),
                 "generated password appeared in retained harness artifact {}",
                 entry.path().display()
             );

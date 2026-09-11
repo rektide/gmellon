@@ -131,12 +131,13 @@ isolation=configuration-and-session
 children=[(command, reaped=true, status=0), (daemon, sent_term=true, sent_kill=false, reaped=true, status=0)]
 ```
 
-The scan occurs before marking it passed. Lifecycle cleanup is written after
-the inner process exits and contains process metadata only; lifecycle focused
-tests separately enforce that evidence/cleanup/log artifacts omit explicit
-passed values. As before, this is configuration/session isolation and
-best-effort memory clearing, not filesystem confinement or a memory-erasure
-proof.
+The scan occurs before marking it passed and also runs before re-throwing an
+operation assertion panic, while generated values remain available to check
+retained failure artifacts. Lifecycle cleanup is written after the inner
+process exits and contains process metadata only; lifecycle focused tests
+separately enforce that evidence/cleanup/log artifacts omit explicit passed
+values. As before, this is configuration/session isolation and best-effort
+memory clearing, not filesystem confinement or a memory-erasure proof.
 
 ## Commands and policy
 
