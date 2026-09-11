@@ -670,7 +670,30 @@ def run_command(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""command environment (assembled from an empty map):
+  HOME, TMPDIR, XDG_{RUNTIME,DATA,CONFIG,CACHE,STATE}_HOME
+  DBUS_{SESSION,SYSTEM}_BUS_ADDRESS (unreachable private paths)
+  GNOME_KEYRING_CONTROL (directory containing the control socket)
+  GMELL_HARNESS_ACTIVE=1
+  GMELL_HARNESS_ROOT, GMELL_HARNESS_CONTROL_DIR,
+  GMELL_HARNESS_CONTROL_SOCKET, GMELL_HARNESS_DAEMON_PID,
+  GMELL_HARNESS_DAEMON_{STDOUT,STDERR}, GMELL_HARNESS_EVIDENCE,
+  GMELL_HARNESS_CLEANUP
+
+exit semantics:
+  command status       propagated unchanged
+  command signal       128 + signal number
+  HUP/INT/TERM          owned teardown, then 128 + first signal number
+  harness failure      125 (usage errors remain argparse status 2)
+
+Nonzero command, signal, and harness failures retain the mode-0700 scratch
+root and print its path. A set GMELL_HARNESS_ACTIVE rejects nesting before
+allocating a scratch root. Command stdout/stderr remain caller-owned streams.
+""",
+    )
     parser.add_argument(
         "--keep-success",
         action="store_true",
