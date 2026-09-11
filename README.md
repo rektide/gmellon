@@ -148,7 +148,7 @@ the transport and frame transcription against a real daemon without touching
 the real store. Everything after depends on this.
 
 The harness track's isolation requirements and reviewed work slices are in
-[`doc/harness/prompt.md`](doc/harness/prompt.md).
+[`doc/harness/prompt.md`](/doc/harness/prompt.md).
 
 ### Stage 3 — `unlock`
 Socket and peer ownership checks, connect, credential-byte handshake, send
