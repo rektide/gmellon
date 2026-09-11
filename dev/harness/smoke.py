@@ -242,12 +242,14 @@ def wait_for_initialization_stdout_eof(
     output = bytearray()
     deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
     while True:
-        return_code = process.poll()
-        if return_code is not None:
-            raise SmokeFailure(f"daemon exited during initialization with status {return_code}")
-
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            return_code = process.poll()
+            if return_code is not None:
+                raise SmokeFailure(
+                    "timed out draining initialization stdout after daemon exited "
+                    f"with status {return_code}"
+                )
             raise SmokeFailure("timed out waiting for daemon initialization stdout EOF")
 
         readable, _, _ = select.select([descriptor], [], [], min(remaining, 0.1))
@@ -263,8 +265,11 @@ def wait_for_initialization_stdout_eof(
         if len(output) > MAX_STARTUP_OUTPUT_BYTES:
             raise SmokeFailure("daemon initialization output exceeded the safety limit")
 
-    if process.poll() is not None:
-        raise SmokeFailure("daemon exited immediately after initialization stdout EOF")
+    return_code = process.poll()
+    if return_code is not None:
+        raise SmokeFailure(
+            f"daemon exited during initialization with status {return_code}"
+        )
     return bytes(output)
 
 
