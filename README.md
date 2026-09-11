@@ -42,7 +42,8 @@ gmellon --control-dir ~/tmp-opencode/krtest unlock
 
 **Password policy:** passwords are accepted only from the TTY (default) or a
 single line on stdin (`--stdin`). They are never accepted as argv or flags —
-argv is world-readable in `ps`.
+argv is world-readable in `ps`. Password values and password-bearing request
+buffers are zeroized as soon as the exchange completes.
 
 ### Exit codes
 
@@ -172,6 +173,7 @@ for the zsh login hook; `env` (INITIALIZE) exposure.
 |---|---|
 | clap v4 (derive) + clap_complete | CLI + completions |
 | rpassword | no-echo TTY prompts |
+| zeroize | clear password and request buffers after use |
 | anyhow | errors |
 | tracing (optional, Stage 5) | redacted `-v` operation diagnostics |
 
