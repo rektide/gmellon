@@ -61,7 +61,11 @@ evidence is useful; do not overwrite unrelated or provisional work.
 - `dbus-broker-launch` uses systemd for D-Bus service activation. The harness
   must not expose host service directories or permit activation of the real
   `org.freedesktop.secrets` service. Prefer a minimal custom bus config and
-  manually launch the test daemon.
+  manually launch the test daemon. The launcher also opens a controller
+  connection to the selected host systemd instance; verify that the proposed
+  topology cannot create or manipulate host units. If "no host systemd
+  contact" is a hard boundary, surface that `dbus-broker-launch` may not meet
+  it rather than hiding the caveat or silently falling back.
 - Upstream GNOME Keyring tests use GLib's `GTestDBus` (normally a private
   `dbus-daemon`) plus scratch directories and a manually launched daemon.
   Those tests are useful prior art, but they do not prove the broker topology.
@@ -142,7 +146,8 @@ This is the only slice authorized at kickoff.
 1. Read the README, current source, Beads issues, recent `jj` history, upstream
    files listed above, and installed manuals.
 2. Verify the known facts, especially broker socket activation and how to
-   disable host D-Bus activation.
+   disable host D-Bus activation. Determine whether the launcher's systemd
+   controller connection is compatible with the requested isolation boundary.
 3. Propose the smallest useful harness interface and a dependency graph of
    human-readable Beads tickets. Search before creating duplicates.
 4. Decide whether `gmell-harness` should become an epic or remain an umbrella
