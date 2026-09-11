@@ -7,6 +7,6 @@
 mod protocol;
 
 pub use protocol::{
-    DaemonResult, DecodeError, EncodeError, Operation, Request, RequestFrame, decode_response,
-    encode_request,
+    DaemonResult, DecodeError, EncodeError, Operation, Request, RequestFrame, decode_request,
+    decode_response, encode_request,
 };

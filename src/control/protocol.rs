@@ -32,11 +32,11 @@ pub enum DaemonResult {
 /// This type deliberately does not implement [`Debug`].
 pub enum Request<'a> {
     Unlock {
-        password: &'a str,
+        password: &'a [u8],
     },
     Change {
-        original_password: &'a str,
-        new_password: &'a str,
+        original_password: &'a [u8],
+        new_password: &'a [u8],
     },
 }
 
@@ -84,6 +84,14 @@ impl Error for EncodeError {}
 /// A daemon response was not a valid result frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecodeError {
+    RequestTooShort { actual: usize },
+    RequestLengthMismatch { declared: u32, actual: usize },
+    UnsupportedOperation { value: u32 },
+    TruncatedStringLength,
+    InvalidStringLength { declared: u32 },
+    TruncatedString { declared: u32, remaining: usize },
+    InteriorNul,
+    TrailingRequestBytes { count: usize },
     UnexpectedResponseLength { actual: usize },
     InvalidDeclaredLength { declared: u32 },
     UnknownResult { value: u32 },
@@ -92,6 +100,36 @@ pub enum DecodeError {
 impl Display for DecodeError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RequestTooShort { actual } => {
+                write!(formatter, "control request is only {actual} bytes")
+            }
+            Self::RequestLengthMismatch { declared, actual } => write!(
+                formatter,
+                "control request declares length {declared}, received {actual} bytes"
+            ),
+            Self::UnsupportedOperation { value } => {
+                write!(formatter, "unsupported control operation {value}")
+            }
+            Self::TruncatedStringLength => {
+                formatter.write_str("control request ends before a string length")
+            }
+            Self::InvalidStringLength { declared } => {
+                write!(
+                    formatter,
+                    "control request contains invalid string length {declared}"
+                )
+            }
+            Self::TruncatedString {
+                declared,
+                remaining,
+            } => write!(
+                formatter,
+                "control string declares {declared} bytes, only {remaining} remain"
+            ),
+            Self::InteriorNul => formatter.write_str("a control string contains a NUL byte"),
+            Self::TrailingRequestBytes { count } => {
+                write!(formatter, "control request has {count} trailing bytes")
+            }
             Self::UnexpectedResponseLength { actual } => {
                 write!(
                     formatter,
@@ -122,6 +160,46 @@ pub fn encode_request(request: Request<'_>) -> Result<RequestFrame, EncodeError>
     }
 }
 
+/// Decode one complete UNLOCK or CHANGE request frame.
+///
+/// Returned password fields borrow the input frame. The credential NUL byte
+/// sent before the frame is a transport concern and must not be included.
+pub fn decode_request(frame: &[u8]) -> Result<Request<'_>, DecodeError> {
+    if frame.len() < HEADER_LENGTH {
+        return Err(DecodeError::RequestTooShort {
+            actual: frame.len(),
+        });
+    }
+
+    let declared = read_u32(&frame[..4]);
+    if declared as usize != frame.len() {
+        return Err(DecodeError::RequestLengthMismatch {
+            declared,
+            actual: frame.len(),
+        });
+    }
+
+    let mut offset = HEADER_LENGTH;
+    let request = match read_u32(&frame[4..8]) {
+        value if value == Operation::Unlock as u32 => Request::Unlock {
+            password: decode_string(frame, &mut offset)?,
+        },
+        value if value == Operation::Change as u32 => Request::Change {
+            original_password: decode_string(frame, &mut offset)?,
+            new_password: decode_string(frame, &mut offset)?,
+        },
+        value => return Err(DecodeError::UnsupportedOperation { value }),
+    };
+
+    if offset != frame.len() {
+        return Err(DecodeError::TrailingRequestBytes {
+            count: frame.len() - offset,
+        });
+    }
+
+    Ok(request)
+}
+
 /// Decode the exact eight-byte response used by UNLOCK and CHANGE.
 pub fn decode_response(response: &[u8]) -> Result<DaemonResult, DecodeError> {
     if response.len() != RESPONSE_LENGTH {
@@ -144,9 +222,9 @@ pub fn decode_response(response: &[u8]) -> Result<DaemonResult, DecodeError> {
     }
 }
 
-fn encode_fields(operation: Operation, fields: &[&str]) -> Result<RequestFrame, EncodeError> {
+fn encode_fields(operation: Operation, fields: &[&[u8]]) -> Result<RequestFrame, EncodeError> {
     for field in fields {
-        if field.as_bytes().contains(&0) {
+        if field.contains(&0) {
             return Err(EncodeError::InteriorNul);
         }
     }
@@ -159,12 +237,41 @@ fn encode_fields(operation: Operation, fields: &[&str]) -> Result<RequestFrame, 
     push_u32(&mut bytes, operation as u32);
     for field in fields {
         push_u32(&mut bytes, field.len() as u32);
-        bytes.extend_from_slice(field.as_bytes());
+        bytes.extend_from_slice(field);
     }
 
     Ok(RequestFrame {
         bytes: Zeroizing::new(bytes),
     })
+}
+
+fn decode_string<'a>(frame: &'a [u8], offset: &mut usize) -> Result<&'a [u8], DecodeError> {
+    if frame.len() - *offset < 4 {
+        return Err(DecodeError::TruncatedStringLength);
+    }
+
+    let declared = read_u32(&frame[*offset..*offset + 4]);
+    *offset += 4;
+    if declared as usize >= MAX_STRING_LENGTH {
+        return Err(DecodeError::InvalidStringLength { declared });
+    }
+
+    let remaining = frame.len() - *offset;
+    if declared as usize > remaining {
+        return Err(DecodeError::TruncatedString {
+            declared,
+            remaining,
+        });
+    }
+
+    let end = *offset + declared as usize;
+    let value = &frame[*offset..end];
+    if value.contains(&0) {
+        return Err(DecodeError::InteriorNul);
+    }
+    *offset = end;
+
+    Ok(value)
 }
 
 fn encoded_request_length(field_lengths: &[usize]) -> Result<u32, EncodeError> {
@@ -216,8 +323,10 @@ mod tests {
 
     #[test]
     fn unlock_mellon_matches_the_golden_frame() {
-        let frame = encode_request(Request::Unlock { password: "mellon" })
-            .expect("the golden request should encode");
+        let frame = encode_request(Request::Unlock {
+            password: b"mellon",
+        })
+        .expect("the golden request should encode");
 
         assert_eq!(
             frame.as_ref(),
@@ -233,8 +342,8 @@ mod tests {
     #[test]
     fn change_matches_a_golden_frame() {
         let frame = encode_request(Request::Change {
-            original_password: "old",
-            new_password: "new",
+            original_password: b"old",
+            new_password: b"new",
         })
         .expect("the change request should encode");
 
@@ -250,25 +359,49 @@ mod tests {
 
     #[test]
     fn encoded_requests_round_trip_through_the_wire_shape() {
-        let unlock = encode_request(Request::Unlock { password: "friend" }).unwrap();
+        let unlock = encode_request(Request::Unlock {
+            password: b"friend",
+        })
+        .unwrap();
         let change = encode_request(Request::Change {
-            original_password: "friend",
-            new_password: "mellon",
+            original_password: b"friend",
+            new_password: b"mellon",
         })
         .unwrap();
 
-        let (operation, fields) = decode_request_for_test(unlock.as_ref());
-        assert_eq!(operation, Operation::Unlock);
-        assert_eq!(fields, [b"friend".as_slice()]);
+        match decode_request(unlock.as_ref()).unwrap() {
+            Request::Unlock { password } => assert_eq!(password, b"friend"),
+            Request::Change { .. } => panic!("decoded unlock as change"),
+        }
+        match decode_request(change.as_ref()).unwrap() {
+            Request::Change {
+                original_password,
+                new_password,
+            } => {
+                assert_eq!(original_password, b"friend");
+                assert_eq!(new_password, b"mellon");
+            }
+            Request::Unlock { .. } => panic!("decoded change as unlock"),
+        }
+    }
 
-        let (operation, fields) = decode_request_for_test(change.as_ref());
-        assert_eq!(operation, Operation::Change);
-        assert_eq!(fields, [b"friend".as_slice(), b"mellon".as_slice()]);
+    #[test]
+    fn non_utf8_password_bytes_round_trip() {
+        let password = [0xff, 0xfe, 0xfd];
+        let frame = encode_request(Request::Unlock {
+            password: &password,
+        })
+        .unwrap();
+
+        match decode_request(frame.as_ref()).unwrap() {
+            Request::Unlock { password: decoded } => assert_eq!(decoded, password),
+            Request::Change { .. } => panic!("decoded unlock as change"),
+        }
     }
 
     #[test]
     fn empty_unlock_password_is_representable() {
-        let frame = encode_request(Request::Unlock { password: "" }).unwrap();
+        let frame = encode_request(Request::Unlock { password: b"" }).unwrap();
 
         assert_eq!(frame.as_ref().len(), 12);
         assert_eq!(&frame.as_ref()[8..], &[0, 0, 0, 0]);
@@ -277,7 +410,7 @@ mod tests {
     #[test]
     fn interior_nul_is_rejected() {
         let result = encode_request(Request::Unlock {
-            password: "not\0a-c-string",
+            password: b"not\0a-c-string",
         });
 
         assert!(matches!(result, Err(EncodeError::InteriorNul)));
@@ -350,31 +483,47 @@ mod tests {
         );
     }
 
-    fn decode_request_for_test(frame: &[u8]) -> (Operation, Vec<&[u8]>) {
-        assert!(frame.len() >= HEADER_LENGTH);
-        assert_eq!(read_u32(&frame[..4]) as usize, frame.len());
-
-        let operation = match read_u32(&frame[4..8]) {
-            1 => Operation::Unlock,
-            2 => Operation::Change,
-            value => panic!("unexpected operation {value}"),
-        };
-        let field_count = match operation {
-            Operation::Unlock => 1,
-            Operation::Change => 2,
-            Operation::Initialize | Operation::Quit => unreachable!(),
-        };
-        let mut fields = Vec::with_capacity(field_count);
-        let mut offset = HEADER_LENGTH;
-
-        for _ in 0..field_count {
-            let length = read_u32(&frame[offset..offset + 4]) as usize;
-            offset += 4;
-            fields.push(&frame[offset..offset + length]);
-            offset += length;
-        }
-
-        assert_eq!(offset, frame.len());
-        (operation, fields)
+    #[test]
+    fn malformed_requests_are_rejected() {
+        assert!(matches!(
+            decode_request(&[0; 7]),
+            Err(DecodeError::RequestTooShort { actual: 7 })
+        ));
+        assert!(matches!(
+            decode_request(&[0, 0, 0, 9, 0, 0, 0, 1]),
+            Err(DecodeError::RequestLengthMismatch {
+                declared: 9,
+                actual: 8
+            })
+        ));
+        assert!(matches!(
+            decode_request(&[0, 0, 0, 8, 0, 0, 0, 0]),
+            Err(DecodeError::UnsupportedOperation { value: 0 })
+        ));
+        assert!(matches!(
+            decode_request(&[0, 0, 0, 8, 0, 0, 0, 1]),
+            Err(DecodeError::TruncatedStringLength)
+        ));
+        assert!(matches!(
+            decode_request(&[0, 0, 0, 12, 0, 0, 0, 1, 0x7f, 0xff, 0xff, 0xff]),
+            Err(DecodeError::InvalidStringLength {
+                declared: 0x7fff_ffff
+            })
+        ));
+        assert!(matches!(
+            decode_request(&[0, 0, 0, 13, 0, 0, 0, 1, 0, 0, 0, 2, b'a']),
+            Err(DecodeError::TruncatedString {
+                declared: 2,
+                remaining: 1
+            })
+        ));
+        assert!(matches!(
+            decode_request(&[0, 0, 0, 13, 0, 0, 0, 1, 0, 0, 0, 1, 0]),
+            Err(DecodeError::InteriorNul)
+        ));
+        assert!(matches!(
+            decode_request(&[0, 0, 0, 14, 0, 0, 0, 1, 0, 0, 0, 1, b'a', b'b']),
+            Err(DecodeError::TrailingRequestBytes { count: 1 })
+        ));
     }
 }

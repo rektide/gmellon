@@ -67,8 +67,9 @@ frame length. A client should also verify that the socket and connected peer
 belong to its effective UID before sending a password.
 
 All integers are **u32 big-endian**. Strings are u32 BE length + raw bytes,
-no NUL terminator. The leading length field counts the whole frame,
-including itself.
+with no NUL terminator or interior NUL. GNOME's `EggBuffer` rejects string
+lengths greater than or equal to `0x7fffffff`. The leading length field counts
+the whole frame, including itself.
 
 ```
 request:  [u32 total_len][u32 op][payload...]
