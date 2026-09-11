@@ -11,3 +11,7 @@ zeroize = "1.9.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[[test]]
+name = "real_daemon"
+path = "tests/harness/real_daemon.rs"

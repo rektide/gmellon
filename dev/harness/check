@@ -1,0 +1,117 @@
+#!/bin/sh
+# Maintained explicit entry points for external-tool harness coverage.
+set -eu
+
+usage() {
+	cat <<'EOF'
+usage: dev/harness/check [--keep-success] MODE
+
+MODE:
+  rust-cargo    run ignored Rust real-daemon tests with cargo test
+  rust-nextest run ignored Rust real-daemon tests with cargo nextest
+  python        run Python lifecycle tests, behavior matrix, and smoke proof
+  all           run rust-nextest followed by all Python checks
+
+An explicit invocation fails before testing when a required external tool is
+missing. Ordinary `cargo test` and `cargo nextest run` visibly skip the ignored
+Rust real-daemon tests instead.
+EOF
+}
+
+fail() {
+	printf 'HARNESS PREREQUISITE FAILURE: %s\n' "$*" >&2
+	exit 125
+}
+
+need_path_tool() {
+	command -v "$1" >/dev/null 2>&1 || fail "$1 was not found on PATH; $2"
+}
+
+need_daemon() {
+	if [ -x /usr/bin/gnome-keyring-daemon ]; then
+		DAEMON=/usr/bin/gnome-keyring-daemon
+	elif [ -x /bin/gnome-keyring-daemon ]; then
+		DAEMON=/bin/gnome-keyring-daemon
+	else
+		fail 'gnome-keyring-daemon was not found in /usr/bin or /bin; install the system GNOME Keyring daemon package'
+	fi
+	"$DAEMON" --version >/dev/null 2>&1 || fail "$DAEMON is present but not runnable"
+}
+
+need_common() {
+	need_path_tool python3 'install Python 3 and make `python3` available'
+	need_daemon
+	[ -x dev/harness/lifecycle.py ] || fail 'dev/harness/lifecycle.py is missing or not executable'
+}
+
+run_rust_cargo() {
+	need_common
+	need_path_tool cargo 'install the Rust toolchain and make `cargo` available'
+	if [ -n "$KEEP_SUCCESS" ]; then
+		GMELL_HARNESS_KEEP_SUCCESS=1 cargo test --test real_daemon -- --ignored
+	else
+		cargo test --test real_daemon -- --ignored
+	fi
+}
+
+run_rust_nextest() {
+	need_common
+	need_path_tool cargo 'install the Rust toolchain and make `cargo` available'
+	cargo nextest --version >/dev/null 2>&1 || \
+		fail 'cargo-nextest is unavailable; install it or use MODE rust-cargo'
+	if [ -n "$KEEP_SUCCESS" ]; then
+		GMELL_HARNESS_KEEP_SUCCESS=1 \
+			cargo nextest run --test real_daemon --run-ignored ignored-only
+	else
+		cargo nextest run --test real_daemon --run-ignored ignored-only
+	fi
+}
+
+run_python() {
+	need_common
+	python3 -m py_compile \
+		dev/harness/smoke.py \
+		dev/harness/behavior.py \
+		dev/harness/lifecycle.py \
+		dev/harness/tests/test_behavior.py \
+		dev/harness/tests/test_lifecycle.py
+	python3 -m unittest -v \
+		dev/harness/tests/test_behavior.py \
+		dev/harness/tests/test_lifecycle.py
+	dev/harness/behavior.py
+	dev/harness/smoke.py
+}
+
+KEEP_SUCCESS=
+if [ "${1-}" = "--keep-success" ]; then
+	KEEP_SUCCESS=1
+	shift
+fi
+
+[ "$#" -eq 1 ] || {
+	usage >&2
+	exit 2
+}
+
+case "$1" in
+rust-cargo)
+	run_rust_cargo
+	;;
+rust-nextest)
+	run_rust_nextest
+	;;
+python)
+	run_python
+	;;
+all)
+	run_rust_nextest
+	run_python
+	;;
+-h | --help)
+	usage
+	;;
+*)
+	usage >&2
+	exit 2
+	;;
+esac
