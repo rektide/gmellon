@@ -6,15 +6,19 @@ manually launched `gnome-keyring-daemon` while redirecting normal keyring,
 bus, and activation discovery away from the user's desktop session. This is
 a cooperative test boundary, not access control against the command itself.
 
-The harness currently provides two executable entry points:
+The harness currently provides three executable entry points:
 
 - [`dev/harness/smoke.py`](/dev/harness/smoke.py) proves one isolated
   fresh-UNLOCK and wrong-password-DENIED path.
 - [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) runs an arbitrary
   command with a fresh isolated daemon and a documented environment contract.
+- [`dev/harness/behavior.py`](/dev/harness/behavior.py) characterizes UNLOCK,
+  CHANGE, restart persistence, empty passwords, and explicit transport faults
+  against the installed daemon without making Secret Service calls.
 
-The control-only lifecycle is implemented and reviewed; behavioral
-characterization and durable Rust-test integration remain active work.
+The control-only lifecycle is reviewed, and installed behavior
+characterization is implemented pending architectural review; durable
+Rust-test integration remains active work.
 Private `dbus-broker` parity is optional and does not block control-socket
 tests.
 
@@ -30,7 +34,7 @@ for how that authority divides:
 | Run or diagnose the current lifecycle | [Quick start](#quick-start), [Lifecycle interface](#lifecycle-interface), and [Troubleshooting](#troubleshooting) |
 | Understand the security boundary | [Boundary and invariants](#boundary-and-invariants) and [Process topology](#process-topology) |
 | Change lifecycle mechanics | [Lifecycle state model](#lifecycle-state-model), then [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) and its [focused tests](/dev/harness/tests/test_lifecycle.py) |
-| Add daemon behavior coverage | [Evolution guidance](#evolution-guidance) and the behavior scope in [`prompt.md`](/doc/harness/prompt.md) |
+| Run or inspect daemon behavior coverage | [Quick start](#quick-start), [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md), and [Evolution guidance](#evolution-guidance) |
 | Integrate with Rust or CI | [Durable test integration](#durable-test-integration) |
 | Investigate Secret Service parity | [Optional broker parity](#optional-broker-parity) |
 
@@ -46,6 +50,15 @@ Run the foundational smoke proof:
 ```sh
 dev/harness/smoke.py
 ```
+
+Run the complete installed-daemon behavior matrix:
+
+```sh
+dev/harness/behavior.py
+```
+
+Add `--keep-success` to retain its four scenario roots and their redacted
+`behavior.json` observations.
 
 Run a command inside the reusable lifecycle:
 
@@ -347,9 +360,9 @@ the caller. Arbitrary daemon diagnostics cannot be generically
 secret-classified, so test commands must never ask the daemon to log
 passwords or raw frames. The smoke probe uses generated disposable values
 and scans retained logs and JSON for both values and complete request frames
-before reporting success; eventual product tests must use `gmellon`'s
-zeroizing secret types, and the lifecycle itself remains unaware of password
-values.
+before reporting success. The behavior probe scans every regular file in each
+retained scenario root. Eventual product tests must use `gmellon`'s zeroizing
+secret types, and the lifecycle itself remains unaware of password values.
 
 ## Using the lifecycle in tests
 
@@ -364,24 +377,28 @@ A test command should:
 5. avoid GUI prompts and Secret Service calls in the control-only layer; and
 6. never emit passwords or password-bearing frames.
 
-The lifecycle currently starts one daemon per invocation. A restart-sensitive
-behavior test cannot safely simulate a restart by killing the daemon from the
-command: the supervisor correctly treats every pre-teardown daemon exit as a
-harness failure, and the current interface has no seed-before-start point.
-Preserve that invariant until restart is introduced as an explicit
-supervisor-owned operation (see [Evolution guidance](#evolution-guidance)).
-Likewise, stopped-daemon fault tests must not silently redefine unexpected
-daemon death as normal lifecycle behavior.
+The lifecycle command interface still starts one daemon per invocation. A
+command must not simulate a restart by killing it: every pre-teardown daemon
+exit remains a harness failure. Restart and fault characterization belongs to
+the sibling [`behavior.py`](/dev/harness/behavior.py) supervisor, which owns
+explicit stop/restart and SIGSTOP/SIGCONT transitions while reusing the
+lifecycle's internal readiness and exact-PID stop checks. Those Python names
+are co-located implementation seams, not a public import contract.
 
 ## Running harness checks
 
 ```sh
 python3 -m py_compile \
   dev/harness/smoke.py \
+  dev/harness/behavior.py \
   dev/harness/lifecycle.py \
+  dev/harness/tests/test_behavior.py \
   dev/harness/tests/test_lifecycle.py
 
-python3 -m unittest -v dev/harness/tests/test_lifecycle.py
+python3 -m unittest -v \
+  dev/harness/tests/test_behavior.py \
+  dev/harness/tests/test_lifecycle.py
+dev/harness/behavior.py
 dev/harness/smoke.py
 
 cargo fmt --all -- --check
@@ -422,8 +439,9 @@ test runner rather than from inside the first command.
 ### Command unexpectedly exits 125
 
 Look for `HARNESS FAILURE` versus `COMMAND FAILURE` and inspect
-`cleanup.json`. Intentional daemon termination is a harness failure by
-design; write any pre-termination observation beneath `GMELL_HARNESS_ROOT`.
+`cleanup.json`. Daemon termination initiated by a lifecycle command is a
+harness failure by design; explicit restart and fault transitions belong to
+`behavior.py`.
 
 ### Retained directories accumulate
 
@@ -441,8 +459,10 @@ one kind of truth:
 | This guide and `lifecycle.py --help` | Current operator-facing lifecycle contract |
 | [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) | Executable mechanics; the final authority on what the current revision actually does |
 | [`dev/harness/tests/test_lifecycle.py`](/dev/harness/tests/test_lifecycle.py) | Executable acceptance coverage for lifecycle invariants and races |
+| [`dev/harness/behavior.py`](/dev/harness/behavior.py) and its [black-box test](/dev/harness/tests/test_behavior.py) | Reproducible installed-daemon control matrix plus explicit behavior-owned restart/fault transitions |
 | [`smoke0.gpt6a.md`](/doc/harness/smoke0.gpt6a.md) | Version-scoped installed-daemon evidence for the first UNLOCK/denial path and exact-PID cleanup; evidence, not timeless daemon promises |
 | [`lifecycle0.gpt6a.md`](/doc/harness/lifecycle0.gpt6a.md) | Version-scoped lifecycle, signal-race, environment, retention, and test evidence; evidence, not timeless daemon promises |
+| [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md) | Version-scoped UNLOCK, CHANGE, restart, empty-password, stopped, and unresponsive observations; evidence, not timeless daemon promises |
 | [`prompt.md`](/doc/harness/prompt.md) | Epic safety invariants, upstream facts, ticket boundaries, and the work graph; planned acceptance, not completion evidence |
 | Product [`README.md`](/README.md) | Product contract, private wire protocol, and the unlock-or-create hazard that motivates real-daemon testing; not the harness lifecycle contract |
 | Beads graph | Review and work status; not runtime behavior |
@@ -457,9 +477,10 @@ belong in evidence only after observation against the installed daemon.
 
 ## Evolution guidance
 
-The smoke proof and reusable lifecycle are complete; the core chain next
-records the control-protocol behavior matrix, then durable test integration,
-then documentation closure. The harness deliberately does not implement
+The smoke proof and reusable lifecycle are complete, and the control-protocol
+behavior matrix is implemented pending architectural review. After acceptance,
+the core chain adds durable test integration, then documentation closure. The
+harness deliberately does not implement
 `gmellon unlock` or `change`, use the real session bus temporarily, launch a
 GUI prompter, rename real keyrings, clean unrelated processes or data, or
 make broker mechanics Rust product dependencies. Optional broker parity
@@ -481,19 +502,18 @@ scratch layout, broker activation, or harness JSON.
 - Record results as installed-daemon evidence, including version and
   platform. Do not turn one observation into an unqualified upstream
   guarantee.
-- Preserve the unexpected-daemon-exit invariant. Restart persistence needs a
-  first-class supervisor transition that stops and reaps the owned daemon,
-  preserves only the intended private store, starts a new owned daemon, and
-  repeats readiness before resuming assertions; an alternative
-  seed-before-startup interface would need an explicit, validated input
-  contract.
-- Model stopped or unresponsive daemon cases through a deliberate fault seam
-  or lower-level transport fixture. Do not make arbitrary daemon death a
-  successful lifecycle outcome merely to obtain product error coverage.
+- Preserve the unexpected-daemon-exit invariant. The implemented behavior
+  supervisor stops and reaps the exact owned daemon, preserves its private
+  store in place, starts a new generation, and repeats readiness. The general
+  lifecycle contract does not expose root reuse or seed copying.
+- Model stopped and unresponsive cases only through the implemented explicit
+  supervisor stop and SIGSTOP/SIGCONT fault transitions. Arbitrary daemon death
+  remains a lifecycle and behavior failure.
 - Keep control-only behavior free of Secret Service calls.
 
-These are extension constraints, not claims that restart, seeding, or fault
-injection exists today.
+Installed 48.0 results and limitations are recorded in
+[`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md); they must not be
+generalized into timeless upstream guarantees.
 
 ### Durable test integration
 

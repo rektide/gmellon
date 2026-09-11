@@ -122,9 +122,15 @@ recv: 00 00 00 08  00 00 00 00
   unlock` therefore checks for `~/.local/share/keyrings/login.keyring` first
   and refuses with an explanation unless `--allow-create` is passed
   (existence check is advisory; the daemon is the source of truth).
-- `CHANGE` re-keys the login keyring (old password → new). Exact behavior
-  when no login keyring exists is TBD — verify in the harness stage before
-  shipping.
+- **`CHANGE` also creates:** installed `gnome-keyring-daemon` 48.0 creates a
+  missing login keyring with a nonempty new password, regardless of the
+  supplied original password. An empty new password is denied and does not
+  create the missing store. This is version-scoped harness evidence, so the
+  product must treat CHANGE as create-capable rather than as a safe existence
+  check.
+- Empty-password behavior is asymmetric in the observed daemon: fresh
+  `UNLOCK(empty)` creates an empty-password login keyring, and
+  `CHANGE(empty, nonempty)` succeeds; `CHANGE(anything, empty)` is denied.
 - No rate limiting or lockout exists server-side; a wrong password just
   returns DENIED.
 - The socket lives in a 0700 runtime dir — any process of your uid may
@@ -172,6 +178,12 @@ touching the real store or buses. A private `dbus-broker` composition is a
 later parity layer for Secret Service observations, not a prerequisite for
 control-protocol tests.
 
+The reproducible behavior runner adds supervisor-owned restarts over the same
+private store and explicit stopped/SIGSTOP fault transitions. Against installed
+daemon 48.0 it proves missing/correct/wrong UNLOCK, persisted A→B CHANGE,
+missing-store CHANGE creation, empty-password cases, stopped `NO_DAEMON`, and
+bounded unresponsive behavior without logging generated passwords or frames.
+
 The durable harness guide, runnable interface, isolation boundary, and evidence
 map are in [`doc/harness/README.md`](/doc/harness/README.md). The underlying
 acceptance constraints and ticket graph remain in
@@ -198,9 +210,10 @@ UNLOCK, parse result, exit codes, TTY prompt (`rpassword`), `--stdin`, and the
 unlock → wrong-password → DENIED.
 
 ### Stage 4 — `change`
-Same frame machinery, two strings. Harness test: unlock with A, change
-A→B, unlock with B, unlock with A → DENIED. Nail down missing-keyring
-behavior here.
+Same frame machinery, two strings. Harness test: unlock with A, change A→B,
+restart the daemon over the same private store, unlock with B, unlock with A →
+DENIED. Guard missing-store CHANGE because the observed daemon creates with the
+new password when it is absent.
 
 ### Stage 5 — polish
 `status` (offline: socket stat, keyring dir inventory), redacted `-v`
