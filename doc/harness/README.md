@@ -1,9 +1,10 @@
 # GNOME Keyring integration harness
 
 The `gmellon` harness runs commands against a fresh, manually launched
-`gnome-keyring-daemon` without exposing the user's real keyring, desktop
-session bus, system bus, or socket-activated daemon. It exists to make the
-private control protocol testable from an ordinary headless development shell.
+`gnome-keyring-daemon` while redirecting normal keyring, bus, and activation
+discovery away from the user's desktop session. It exists to make the private
+control protocol testable from an ordinary headless development shell. This is
+a cooperative test boundary, not access control against the command itself.
 
 The harness currently provides two executable entry points:
 
@@ -15,6 +16,26 @@ The harness currently provides two executable entry points:
 The control-only lifecycle is implemented and reviewed. Behavioral
 characterization and durable Rust-test integration remain active work. Private
 `dbus-broker` parity is optional and does not block control-socket tests.
+
+## Guide map
+
+Use this document as the durable operational and architectural guide. More
+specialized sources have narrower authority:
+
+| Need | Start here |
+| --- | --- |
+| Run or diagnose the current lifecycle | [Quick start](#quick-start), [Lifecycle interface](#lifecycle-interface), and [Troubleshooting](#troubleshooting) |
+| Understand the security boundary | [Boundary and invariants](#boundary-and-invariants) and [Process topology](#process-topology) |
+| Change lifecycle mechanics | [Lifecycle state model](#lifecycle-state-model), then [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) and its [focused tests](/dev/harness/tests/test_lifecycle.py) |
+| Add daemon behavior coverage | [Evolution guidance](#evolution-guidance) and the behavior scope in [`prompt.md`](/doc/harness/prompt.md) |
+| Integrate with Rust or CI | [Durable test integration](#durable-test-integration) |
+| Investigate Secret Service parity | [Optional broker parity](#optional-broker-parity) |
+| Understand product motivation and protocol | The product [`README.md`](/README.md) |
+
+The supported reusable surface is the executable command interface and the
+exported environment documented below. Importable Python names in
+`lifecycle.py` are implementation details used by focused tests, not a stable
+library API.
 
 ## Quick start
 
@@ -28,6 +49,12 @@ Run a command inside the reusable lifecycle:
 
 ```sh
 dev/harness/lifecycle.py -- /usr/bin/env
+```
+
+See the complete executable contract without allocating a sandbox:
+
+```sh
+dev/harness/lifecycle.py --help
 ```
 
 Inspect the selected private control socket from a command:
@@ -48,7 +75,7 @@ dev/harness/lifecycle.py --keep-success -- /usr/bin/true
 Use absolute command paths where practical. The isolated command receives a
 fixed `PATH=/usr/bin:/bin`, not the caller's executable search path.
 
-## What this harness guarantees
+## Boundary and invariants
 
 Each invocation creates a short, unpredictable mode-0700 root beneath
 `/home/rektide/tmp-opencode`. It launches one foreground daemon manually and
@@ -58,23 +85,30 @@ root.
 
 The resulting boundary is **configuration and session isolation**:
 
-| Protected resource | Mechanism |
+| Invariant | Mechanism and enforcement |
 | --- | --- |
-| Login keyring and PKCS#11 store | Private `HOME` and `XDG_DATA_HOME` |
-| Runtime/control socket | Private `XDG_RUNTIME_DIR` and explicit `--control-directory` |
-| Configuration, cache, and state | Private XDG directories |
-| Temporary files | Private `TMPDIR` |
-| User session bus | Explicit unreachable private address |
-| System bus | Explicit unreachable private address |
-| Socket activation | Empty-based child environments omit inherited activation variables |
-| Process cleanup | Supervisor owns, signals, and reaps exact direct-child PIDs |
-| Accidental path regressions | Reported-path checks plus an external sentinel |
+| Login keyring and PKCS#11 state select private storage | Private `HOME` and `XDG_DATA_HOME`; reported absolute daemon paths must resolve beneath scratch |
+| Runtime and control endpoints are invocation-local | Private `XDG_RUNTIME_DIR`, unique control directory, and explicit `--control-directory` |
+| Configuration, cache, state, and temporary paths are private | Dedicated XDG directories and `TMPDIR` beneath the unique root |
+| Neither child can discover the user's buses through its environment | Both bus addresses name nonexistent scratch sockets; environments are built from empty maps |
+| Host socket activation is not inherited | Empty-based environments omit `LISTEN_*`, `NOTIFY_SOCKET`, and D-Bus starter state |
+| A command never starts against a merely present or stale path | One bounded readiness gate combines initialization EOF, daemon liveness, reported-path validation, socket type and ownership, and sentinel validation |
+| Process ownership stays narrow | The supervisor signals and reaps its exact daemon and command PIDs; no name-based or host-wide cleanup |
+| Failure remains inspectable | Nonzero command outcomes, handled signals, and harness failures retain allocated scratch state |
+| Concurrent invocations do not share mutable harness state | Every root, store, socket, log, sentinel, and child PID is invocation-specific |
+| Ownership is unambiguous | Nesting is rejected before allocation; detached descendants are outside the supported topology |
+| Harness artifacts do not intentionally carry protocol secrets | The lifecycle records no command argv, command streams, frames, or explicit pass-through values |
 
 The harness does **not** provide filesystem, network, syscall, user-namespace,
 PID-namespace, or cgroup confinement. The command runs with the caller's UID,
 capabilities, and working directory, so it can access anything the caller can.
 The external sentinel detects one regression target; it does not prove that
 arbitrary writes outside scratch are impossible.
+
+Nor is the evidence tamper-resistant against the command. The command has the
+caller's UID, knows its scratch root, and can modify files there. The sentinel
+and JSON are regression and diagnosis aids for cooperative tests, not a
+security boundary against hostile code.
 
 Do not describe this layer as fully hermetic. A stronger sandbox could be
 added deliberately later, but it is not implied by XDG and bus redirection.
@@ -87,17 +121,66 @@ flowchart TD
     supervisor -->|"empty-based env; exact PID"| daemon["gnome-keyring-daemon --foreground"]
     supervisor -->|"empty-based env; exact PID"| command["caller command / test"]
     daemon --> socket["scratch control/control socket"]
+    command -->|"test operations"| socket
     daemon --> store["scratch data/keyrings store"]
     supervisor --> logs["daemon logs + evidence.json + cleanup.json"]
+    supervisor --> sentinel["external regression sentinel"]
     daemon -. "no connection" .-> deadSession["nonexistent session-bus socket"]
     daemon -. "no connection" .-> deadSystem["nonexistent system-bus socket"]
+    command -. "no connection" .-> deadSession
+    command -. "no connection" .-> deadSystem
 ```
 
 The daemon and caller command are direct children of the supervisor. Each is
 started in a separate session, while cleanup targets its exact PID rather than
 using process names, `pkill`, or broad host process groups. The lifecycle does
 not claim ownership of a command's intentionally detached descendants;
-integration-test commands must not daemonize and escape supervision.
+integration-test commands must not daemonize and escape supervision. A new
+session separates terminal/process-group effects; it does not turn descendants
+into supervisor-owned processes. The command remains responsible for stopping
+and reaping any workers it creates.
+
+## Lifecycle state model
+
+The lifecycle is a narrow supervisor with one main transition sequence:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Validate
+    Validate --> Allocate
+    Allocate --> StartDaemon
+    StartDaemon --> ProveReady
+    ProveReady --> WriteEvidence
+    WriteEvidence --> RunCommand
+    RunCommand --> Teardown
+    Teardown --> ClassifyOutcome
+    ClassifyOutcome --> RemoveScratch: clean success
+    ClassifyOutcome --> RetainScratch: failure, signal, or keep-success
+    RemoveScratch --> [*]
+    RetainScratch --> [*]
+    Allocate --> Teardown: failure after allocation
+    StartDaemon --> Teardown: failure
+    ProveReady --> Teardown: failure or signal
+    WriteEvidence --> Teardown: failure or signal
+    RunCommand --> Teardown: exit, failure, or signal
+```
+
+This ordering is part of the architecture:
+
+- argument parsing rejects a missing command before scratch allocation, and
+  the nesting guard rejects an already active harness before allocation;
+- `evidence.json` is a **pre-command readiness snapshot**, written only after
+  the full readiness gate succeeds;
+- the command runs only while the original daemon remains live;
+- `cleanup.json` is attempted after the bounded termination and reaping
+  attempt, and is a teardown snapshot rather than a transactionally signed
+  final result; and
+- outcome classification happens only after cleanup, so cleanup failure can
+  turn an otherwise successful command into harness failure.
+
+A startup failure can therefore retain logs and `cleanup.json` without ever
+having produced `evidence.json`. A test must not assume every retained root has
+reached readiness.
 
 ## Readiness contract
 
@@ -120,6 +203,36 @@ The baseline deliberately tolerates the daemon's diagnostic that its session
 bus is unreachable. GNOME Keyring 48.0 initializes its control socket and
 internal store before that non-fatal bus setup failure. Secret Service itself
 is unavailable in this mode.
+
+## Lifecycle interface
+
+The executable accepts one command after `--`, optional repeated `--pass-env`
+names, and optional successful-run retention:
+
+```text
+dev/harness/lifecycle.py [--keep-success] [--pass-env NAME] -- COMMAND [ARG...]
+```
+
+The command inherits the caller's current working directory and standard
+streams. It does not inherit the caller's environment, has no harness-imposed
+runtime deadline, and must not detach descendants. The harness's responsibility
+is daemon readiness and owned-child lifecycle; the command's responsibility is
+its assertions, its own worker lifecycle, and any timeout its test semantics
+require.
+
+The exported variables and exit classifications are the composition contract.
+Console diagnostics and the current JSON fields are human/test evidence, not a
+versioned interchange schema; promote any field needed by another maintained
+tool explicitly, with documentation and acceptance coverage.
+
+### Host assumptions
+
+The current developer harness assumes POSIX process and signal semantics, Unix
+sockets, a writable `/home/rektide/tmp-opencode`, and
+`gnome-keyring-daemon` discoverable in `/usr/bin:/bin`. It is intentionally
+host-specific today. Portable or packaged integration must make these
+prerequisites explicit rather than silently weakening isolation or searching a
+caller-controlled path.
 
 ## Command environment
 
@@ -167,6 +280,11 @@ be overridden. Evidence records the passed variable's name but replaces its
 value with an omission marker. The command remains responsible for not
 printing sensitive values to its own stdout or stderr.
 
+Value omission protects retained harness JSON; it does not make environment
+variables a safe password channel. Generate disposable behavior-test secrets
+inside the command or provide product input through an explicitly reviewed
+stream. Never use argv or `--pass-env` for keyring passwords.
+
 ## Exit and retention semantics
 
 | Event | Harness exit | Scratch retention |
@@ -185,12 +303,21 @@ and retained JSON records the underlying child status.
 The first HUP/INT/TERM is latched without throwing asynchronously. The latch
 remains installed through teardown and evidence writing. Cleanup sends TERM to
 all live exact direct children, waits under one shared deadline, sends KILL
-only to survivors, waits again, and reaps every child. A daemon that exits
-before harness-initiated teardown is an error even when it exits zero.
+only to survivors, waits again, and requires every child to be reaped; failure
+to do so is a harness failure. A daemon that exits before harness-initiated
+teardown is an error even when it exits zero.
 
 Additional handled signals do not interrupt cleanup. SIGKILL remains
 uncatchable. A sufficiently late signal after all children are reaped may
 interrupt success-path scratch removal, but it cannot strand an owned child.
+If a signal arrives after `cleanup.json` was written but before the latch is
+restored, the process exit can reflect that signal while the earlier teardown
+snapshot does not; use the process status as the final outcome and JSON as
+evidence of the cleanup state at write time.
+
+Unexpected Python programming exceptions are deliberately re-raised after the
+same cleanup attempt so their traceback remains visible; they are not
+normalized into the expected `HARNESS FAILURE` status contract.
 
 ## Parallelism and nesting
 
@@ -206,13 +333,18 @@ instead.
 
 ## Artifacts and secret handling
 
-Retained roots contain:
+After readiness, a retained root normally contains:
 
 - `daemon.stdout.log` — startup environment output copied incrementally;
 - `daemon.stderr.log` — daemon diagnostics, including expected dead-bus errors;
-- `evidence.json` — selected paths, sanitized child environment, and readiness;
+- `evidence.json` — the pre-command selected paths, sanitized command
+  environment, and readiness snapshot;
 - `cleanup.json` — command status, handled signal, and per-child teardown;
-- private XDG directories and any keyring files created by the test command.
+- private XDG directories and any keyring files created during the run.
+
+Earlier failures may leave only the artifacts that had been opened or written
+by that lifecycle state. `cleanup.json` is attempted whenever a root was
+allocated, but a failure writing cleanup evidence is itself a harness failure.
 
 The lifecycle does not record command argv, command output, control frames, or
 explicitly passed environment values. Command streams remain attached to the
@@ -238,11 +370,12 @@ A test command should:
 6. never emit passwords or password-bearing frames.
 
 The lifecycle currently starts one daemon per invocation. A restart-sensitive
-behavior test can retain or copy private keyring data into a fresh invocation.
-Do not add root reuse until evidence shows that copying the store is
-insufficient. Likewise, a test that intentionally stops the daemon should
-write its observation beneath `GMELL_HARNESS_ROOT`; the supervisor will
-correctly convert the unexpected daemon exit into harness status 125.
+behavior test cannot safely simulate a restart by killing the daemon from the
+command: the supervisor correctly treats every pre-teardown daemon exit as a
+harness failure, and the current interface has no seed-before-start point.
+Preserve that invariant until restart is introduced as an explicit
+supervisor-owned operation. Likewise, stopped-daemon fault tests must not
+silently redefine unexpected daemon death as normal lifecycle behavior.
 
 ## Running harness checks
 
@@ -323,10 +456,95 @@ the real session bus temporarily, launch a GUI prompter, rename real keyrings,
 clean unrelated processes/data, or make broker mechanics Rust product
 dependencies.
 
+## Contract, implementation, and evidence
+
+These sources answer different questions and should not be flattened into one
+kind of truth:
+
+| Source | Role |
+| --- | --- |
+| This guide and `lifecycle.py --help` | Current operator-facing lifecycle contract |
+| [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) | Executable mechanics; the final authority on what the current revision actually does |
+| [`dev/harness/tests/test_lifecycle.py`](/dev/harness/tests/test_lifecycle.py) | Executable acceptance coverage for lifecycle invariants and races |
+| [`smoke0.gpt6a.md`](/doc/harness/smoke0.gpt6a.md) and [`lifecycle0.gpt6a.md`](/doc/harness/lifecycle0.gpt6a.md) | Version-scoped observations from completed runs; evidence, not timeless daemon promises |
+| [`prompt.md`](/doc/harness/prompt.md) | Epic constraints, ticket boundaries, upstream findings, and planned acceptance; not proof that future behavior exists |
+| Product [`README.md`](/README.md) | Product and wire-protocol specification; not the harness lifecycle contract |
+| Beads graph | Review and work status; not runtime behavior |
+
+When mechanics change, update implementation, focused tests, `--help`, and
+this guide together. Record new installed-daemon behavior in a new or clearly
+revised evidence document with the binary/platform context. A source reading
+can motivate a test but must not be promoted to an installed-binary behavior
+claim without observation.
+
+## Evolution guidance
+
+The current deep interface is deliberately small: launch a fresh isolated
+daemon, prove readiness, run one command under a strict environment contract,
+and classify the result after owned teardown. Extend orchestration behind that
+interface rather than teaching product code about daemon startup, scratch
+layout, broker activation, or harness JSON.
+
+### Behavior characterization
+
+- Keep wire operations and assertions in a disposable probe or reviewed Rust
+  client; keep process, path, readiness, and cleanup ownership in the harness.
+- Record results as installed-daemon evidence, including version and platform.
+  Do not turn one observation into an unqualified upstream guarantee.
+- Preserve the unexpected-daemon-exit invariant. Restart persistence needs a
+  first-class supervisor transition that stops and reaps the owned daemon,
+  preserves only the intended private store, starts a new owned daemon, and
+  repeats readiness before resuming assertions. An alternative seed-before-
+  startup interface would also need an explicit, validated input contract.
+- Model stopped or unresponsive daemon cases through a deliberate fault seam
+  or lower-level transport fixture. Do not make arbitrary daemon death a
+  successful lifecycle outcome merely to obtain product error coverage.
+- Keep control-only behavior free of Secret Service calls.
+
+These are extension constraints, not claims that restart, seeding, or fault
+injection exists today.
+
+### Durable test integration
+
+- Invoke the executable lifecycle and consume `GMELL_HARNESS_*`; do not import
+  its Python internals or duplicate environment construction in Rust tests.
+- Keep pure codec and fake-socket transport tests independent of the installed
+  daemon. Real-daemon tests are a distinct integration capability.
+- Define an explicit opt-in and prerequisite policy: a requested real-daemon
+  run must fail when the daemon is unavailable, while ordinary workflows must
+  make omitted coverage visible rather than implying it ran.
+- Preserve per-invocation roots so integration cases remain parallel-safe.
+  Add serialization only for a demonstrated external shared resource.
+- Keep secrets generated and consumed within the narrowest test scope; harness
+  artifacts should contain operations, paths, statuses, and lengths at most,
+  never password-bearing frames.
+
+The current Python suite's missing-tool skip is focused lifecycle test policy,
+not yet the durable Rust/CI integration policy.
+
+### Optional broker parity
+
+Broker parity is a sibling topology profile, not an upgrade that should make
+the baseline depend on D-Bus. It may add a supervisor-owned listener, broker,
+and manually launched daemon, but it must preserve unique scratch state,
+empty-based child environments, bounded readiness, exact ownership, retained
+failure evidence, and no activation of host services.
+
+Any broker interface should identify its capability explicitly rather than
+changing the meaning of the control-only variables. Broker readiness must add
+a responsive private bus and proof that the intended daemon owns the expected
+names; control-socket readiness remains independently meaningful. Keep the
+known `dbus-broker-launch` systemd/controller and journal dependencies visible:
+if they prevent the requested isolation on a host, report that limitation
+rather than silently using the real bus or substituting `dbus-daemon` as the
+delivered topology. Broker mechanics must remain outside Rust product
+dependencies and may not gate direct control-protocol tests.
+
 ## Source and evidence map
 
 - [`/doc/harness/prompt.md`](/doc/harness/prompt.md) — epic safety invariants,
-  upstream facts, ticket boundaries, and the work graph.
+  upstream facts, ticket boundaries, and the work graph; planned acceptance,
+  not completion evidence.
 - [`/doc/harness/smoke0.gpt6a.md`](/doc/harness/smoke0.gpt6a.md) — installed
   daemon evidence for the first UNLOCK/denial path and exact-PID cleanup.
 - [`/doc/harness/lifecycle0.gpt6a.md`](/doc/harness/lifecycle0.gpt6a.md) —
