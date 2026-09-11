@@ -399,21 +399,19 @@ def wait_for_control_socket(
         return metadata
 
 
-def start_ready_daemon(
-    executable: str,
+def prove_daemon_ready(
+    process: subprocess.Popen[bytes],
     sandbox: Sandbox,
     stdout_stream: BinaryIO,
-    stderr_stream: BinaryIO,
     signals: SignalLatch,
 ) -> ReadyDaemon:
-    """Launch one daemon generation and prove the full readiness contract.
+    """Prove the full readiness contract for an already-owned daemon.
 
     This is an internal implementation seam shared by the lifecycle and the
     co-located behavior characterization. The supported public interface
     remains the executable lifecycle contract.
     """
 
-    process = launch_daemon(executable, sandbox, stderr_stream)
     startup_deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
     startup_output = wait_for_initialization_stdout_eof(
         process, stdout_stream, signals, startup_deadline
@@ -655,10 +653,10 @@ def run_command(
         signals.raise_if_pending()
         stdout_stream = sandbox.stdout_log.open("wb")
         stderr_stream = sandbox.stderr_log.open("wb")
-        ready_daemon = start_ready_daemon(
-            executable, sandbox, stdout_stream, stderr_stream, signals
+        daemon = launch_daemon(executable, sandbox, stderr_stream)
+        ready_daemon = prove_daemon_ready(
+            daemon, sandbox, stdout_stream, signals
         )
-        daemon = ready_daemon.process
         if read_sentinel(sentinel_path) != sentinel_before:
             raise HarnessFailure("external isolation sentinel changed before command launch")
         write_evidence(
