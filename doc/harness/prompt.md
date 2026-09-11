@@ -73,7 +73,9 @@ evidence is useful; do not overwrite unrelated or provisional work.
   compile-time debug behavior and cannot be the only isolation mechanism.
   Redirect `HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
   `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, and preferably `TMPDIR` before spawning
-  any child.
+  any child. Do not set `GNOME_KEYRING_TEST_PATH` in the final `gmellon`
+  end-to-end tests: it bypasses the production XDG keyring path that
+  `--allow-create` must inspect.
 - A control connection begins with a separate NUL credential byte. The daemon
   consumes that byte, checks the peer UID, and only then reads the framed
   request. Any probe must model this transport prelude.
