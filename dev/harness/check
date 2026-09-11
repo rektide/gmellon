@@ -10,7 +10,8 @@ MODE:
   rust-cargo    run ignored Rust real-daemon tests with cargo test
   rust-nextest run ignored Rust real-daemon tests with cargo nextest
   python        run Python lifecycle tests, behavior matrix, and smoke proof
-  all           run rust-nextest followed by all Python checks
+  broker        run private dbus-broker lifecycle tests and interface proof
+  all           run rust-nextest, control-only Python, and broker checks
 
 An explicit invocation fails before testing when a required external tool is
 missing. Ordinary `cargo test` and `cargo nextest run` visibly skip the ignored
@@ -42,6 +43,29 @@ need_common() {
 	need_path_tool python3 'install Python 3 and make `python3` available'
 	need_daemon
 	[ -x dev/harness/lifecycle.py ] || fail 'dev/harness/lifecycle.py is missing or not executable'
+}
+
+need_fixed_tool() {
+	if [ -x "/usr/bin/$1" ]; then
+		return
+	fi
+	if [ -x "/bin/$1" ]; then
+		return
+	fi
+	fail "$1 was not found in /usr/bin or /bin; $2"
+}
+
+need_broker() {
+	need_common
+	need_fixed_tool systemd-socket-activate 'install the systemd test utilities'
+	need_fixed_tool dbus-broker-launch 'install dbus-broker'
+	need_fixed_tool gdbus 'install the GLib D-Bus command-line tools'
+	[ -S /run/systemd/journal/socket ] || \
+		fail 'host journal socket /run/systemd/journal/socket is unavailable; dbus-broker-launch cannot start in this topology'
+	[ -d /run/systemd/system ] || \
+		fail 'host systemd runtime /run/systemd/system is unavailable; --scope=system cannot be exercised'
+	[ -x dev/harness/broker.py ] || fail 'dev/harness/broker.py is missing or not executable'
+	[ -x dev/harness/private_bus_probe.py ] || fail 'dev/harness/private_bus_probe.py is missing or not executable'
 }
 
 run_rust_cargo() {
@@ -87,6 +111,20 @@ run_python() {
 	fi
 }
 
+run_broker() {
+	need_broker
+	python3 -m py_compile \
+		dev/harness/broker.py \
+		dev/harness/private_bus_probe.py \
+		dev/harness/tests/test_broker.py
+	python3 -m unittest -v dev/harness/tests/test_broker.py
+	if [ -n "$KEEP_SUCCESS" ]; then
+		dev/harness/broker.py --keep-success -- dev/harness/private_bus_probe.py
+	else
+		dev/harness/broker.py -- dev/harness/private_bus_probe.py
+	fi
+}
+
 KEEP_SUCCESS=
 if [ "${1-}" = "--keep-success" ]; then
 	KEEP_SUCCESS=1
@@ -108,9 +146,13 @@ rust-nextest)
 python)
 	run_python
 	;;
+broker)
+	run_broker
+	;;
 all)
 	run_rust_nextest
 	run_python
+	run_broker
 	;;
 -h | --help)
 	usage
