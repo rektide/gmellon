@@ -172,11 +172,10 @@ touching the real store or buses. A private `dbus-broker` composition is a
 later parity layer for Secret Service observations, not a prerequisite for
 control-protocol tests.
 
-The harness track's isolation requirements and reviewed work slices are in
-[`doc/harness/prompt.md`](/doc/harness/prompt.md). The implemented composable
-entry point is [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py), with
-focused lifecycle and isolation evidence in
-[`doc/harness/lifecycle0.gpt6a.md`](/doc/harness/lifecycle0.gpt6a.md).
+The durable harness guide, runnable interface, isolation boundary, and evidence
+map are in [`doc/harness/README.md`](/doc/harness/README.md). The underlying
+acceptance constraints and ticket graph remain in
+[`doc/harness/prompt.md`](/doc/harness/prompt.md).
 
 ### Stage 2.5 — secret input
 `secret_input`: `Secret` owns a zeroized-on-drop UTF-8 string and exposes
