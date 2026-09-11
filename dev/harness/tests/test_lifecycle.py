@@ -257,6 +257,20 @@ time.sleep(30)
         self.assertFalse(daemon_cleanup["sent_kill"])
         self.assertTrue(daemon_cleanup["reaped"])
 
+    def test_daemon_exit_before_owned_teardown_is_a_failure(self) -> None:
+        result = lifecycle.ChildShutdown(
+            name="daemon",
+            pid=1234,
+            return_code=0,
+            sent_term=False,
+            sent_kill=False,
+            reaped=True,
+        )
+        with self.assertRaisesRegex(
+            lifecycle.HarnessFailure, "exited before harness-initiated teardown"
+        ):
+            lifecycle.validate_daemon_shutdown(result)
+
     def test_passed_environment_value_is_omitted_from_evidence(self) -> None:
         environment = dict(os.environ)
         environment["GMELL_TEST_SENSITIVE_MARKER"] = "do-not-retain-this-value"

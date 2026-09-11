@@ -67,7 +67,9 @@ new session, separating it from the operator's process group. Cleanup first
 polls both exact children, sends TERM to every remaining exact PID, waits one
 shared three-second deadline, sends KILL only to survivors, waits a second
 bounded deadline, and reaps each direct child. An abnormal daemon status is a
-harness failure and remains visible in `cleanup.json`.
+harness failure and remains visible in `cleanup.json`. A daemon that exits
+before harness-initiated TERM is also a harness failure even when its status is
+zero; this closes the command-completion/daemon-exit boundary race.
 
 The lifecycle does not claim ownership of arbitrary descendants that a caller
 deliberately daemonizes or moves into another process topology. Commands used
@@ -210,12 +212,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run
 ```
 
-All eight focused lifecycle tests passed. They cover strict exports, normal
+All nine focused lifecycle tests passed. They cover strict exports, normal
 cleanup, command status propagation and failure retention, failure-artifact
 value omission, concurrent disjoint instances, nesting rejection, live signal
 teardown, first-signal-during-finally teardown, and TERM-to-KILL escalation for
-only a surviving TERM-ignoring command. The unchanged smoke proof passed. Rust
-format and Clippy passed; nextest ran 54 tests with 54 passed and no skips.
+only a surviving TERM-ignoring command. They also reject a daemon that exits
+before owned teardown even with status zero. The unchanged smoke proof passed.
+Rust format and Clippy passed; nextest ran 54 tests with 54 passed and no skips.
 
 ## Known limitations and next slice
 

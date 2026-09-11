@@ -482,6 +482,11 @@ def terminate_children(
 
 
 def validate_daemon_shutdown(result: ChildShutdown) -> None:
+    if not result.sent_term:
+        raise HarnessFailure(
+            f"daemon PID {result.pid} exited before harness-initiated teardown "
+            f"with status {result.return_code}"
+        )
     expected = {0, -signal.SIGTERM}
     if result.sent_kill:
         expected.add(-signal.SIGKILL)
