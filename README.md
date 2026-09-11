@@ -45,6 +45,15 @@ single line on stdin (`--stdin`). They are never accepted as argv or flags —
 argv is world-readable in `ps`. Password values and password-bearing request
 buffers are zeroized as soon as the exchange completes.
 
+**`--stdin` contract:** exactly one line, terminated by LF or CRLF — input
+ending without a newline is an error (an empty pipe included; an empty line is
+a valid empty password). Input must be valid UTF-8 — invalid bytes error
+rather than being replaced (the control protocol itself stays byte
+transparent). Every byte before the terminator is literal password content:
+no line editing is applied, so backspace and control bytes from a pipe are
+data, not commands. Input is capped at 64 KiB. With no controlling terminal
+the TTY prompt fails with an actionable error suggesting `--stdin`.
+
 ### Exit codes
 
 | code | meaning |
@@ -163,6 +172,19 @@ control-protocol tests.
 
 The harness track's isolation requirements and reviewed work slices are in
 [`doc/harness/prompt.md`](/doc/harness/prompt.md).
+
+### Stage 2.5 — secret input
+`secret_input`: `Secret` owns a zeroized-on-drop UTF-8 string and exposes
+only borrowed `as_bytes()` — no `Debug`, `Clone`, `Display`, or ownership
+escape. Interactive prompts run through rpassword on the controlling TTY
+(no echo, terminal state restored even on error); the `--stdin` path uses
+its own bounded line-record reader because rpassword interprets DEL,
+Ctrl-U, and Ctrl-W as editing commands even over pipes, where those bytes
+are password bytes. LF/CRLF terminate a line, EOF before the newline
+errors, an empty line passes, input is capped at 64 KiB, and invalid UTF-8
+errors. ENXIO (no controlling terminal) maps to an actionable error
+suggesting `--stdin`. A reusable two-prompt confirmation (single-shot
+mismatch, zeroized temporaries) supports `change`.
 
 ### Stage 3 — `unlock`
 Socket and peer ownership checks, connect, credential-byte handshake, send
