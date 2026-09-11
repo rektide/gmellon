@@ -43,7 +43,9 @@ gmellon --control-dir ~/tmp-opencode/krtest unlock
 **Password policy:** passwords are accepted only from the TTY (default) or a
 single line on stdin (`--stdin`). They are never accepted as argv or flags —
 argv is world-readable in `ps`. Password values and password-bearing request
-buffers are zeroized as soon as the exchange completes.
+buffers use best-effort zeroization when dropped; command paths drop them
+promptly after each exchange. This cannot erase copies abandoned by dependency
+internals or allocator behavior.
 
 **`--stdin` contract:** exactly one line, terminated by LF or CRLF — input
 ending without a newline is an error (an empty pipe included; an empty line is
@@ -177,7 +179,8 @@ The harness track's isolation requirements and reviewed work slices are in
 `secret_input`: `Secret` owns a zeroized-on-drop UTF-8 string and exposes
 only borrowed `as_bytes()` — no `Debug`, `Clone`, `Display`, or ownership
 escape. Interactive prompts run through rpassword on the controlling TTY
-(no echo, terminal state restored even on error); the `--stdin` path uses
+(no echo, with rpassword's best-effort terminal-state restoration); the
+`--stdin` path uses
 its own bounded line-record reader because rpassword interprets DEL,
 Ctrl-U, and Ctrl-W as editing commands even over pipes, where those bytes
 are password bytes. LF/CRLF terminate a line, EOF before the newline

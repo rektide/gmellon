@@ -35,10 +35,11 @@
 //!
 //! # Hygiene
 //!
-//! [`Secret`] owns a zeroized-on-drop string, implements none of `Debug`,
-//! `Clone`, or `Display`, and never yields owned content. Read buffers are
-//! zeroizing, and confirmation temporaries are cleared on drop. Error values
-//! carry metadata (lengths) only — never secret content.
+//! [`Secret`] owns a best-effort zeroized-on-drop string, implements none of
+//! `Debug`, `Clone`, or `Display`, and never yields owned content. The stdin
+//! buffer is allocated once at its maximum capacity so reallocation cannot
+//! leave secret prefixes behind. Confirmation temporaries are cleared on drop.
+//! Error values carry redacted metadata only — never reader-provided text.
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -67,11 +68,15 @@ pub struct Secret {
 }
 
 impl Secret {
-    /// Adopt a `String` already decoded by the terminal reader.
-    fn from_string(value: String) -> Self {
-        Self {
-            value: Zeroizing::new(value),
+    /// Adopt and validate a `String` already decoded by the terminal reader.
+    fn from_string(value: String) -> Result<Self, SecretError> {
+        let value = Zeroizing::new(value);
+        if value.len() > MAX_SECRET_BYTES {
+            return Err(SecretError::TooLong {
+                maximum: MAX_SECRET_BYTES,
+            });
         }
+        Ok(Self { value })
     }
 
     /// Validate accumulated line bytes as UTF-8.
@@ -79,10 +84,10 @@ impl Secret {
         // `str::from_utf8` borrows, so no error value can retain the bytes;
         // `bytes` is zeroized when dropped either way.
         let value = match str::from_utf8(&bytes) {
-            Ok(text) => Zeroizing::new(text.to_owned()),
+            Ok(text) => text.to_owned(),
             Err(_) => return Err(SecretError::InvalidUtf8),
         };
-        Ok(Self { value })
+        Self::from_string(value)
     }
 
     /// The secret as raw bytes for request encoding.
@@ -107,8 +112,11 @@ pub enum SecretError {
     TooLong { maximum: usize },
     /// Input was not valid UTF-8.
     InvalidUtf8,
-    /// Reading failed.
-    Io { source: io::Error },
+    /// Reading failed. Reader-provided error text is deliberately discarded.
+    Io {
+        kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
 }
 
 impl Display for SecretError {
@@ -129,19 +137,21 @@ impl Display for SecretError {
                 "secret input exceeds the {maximum}-byte maximum length"
             ),
             Self::InvalidUtf8 => formatter.write_str("secret input is not valid UTF-8"),
-            Self::Io { source } => write!(formatter, "failed to read secret input: {source}"),
+            Self::Io {
+                kind,
+                raw_os_error,
+            } => match raw_os_error {
+                Some(code) => write!(
+                    formatter,
+                    "failed to read secret input ({kind:?}, operating system error {code})"
+                ),
+                None => write!(formatter, "failed to read secret input ({kind:?})"),
+            },
         }
     }
 }
 
-impl Error for SecretError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source } => Some(source),
-            _ => None,
-        }
-    }
-}
+impl Error for SecretError {}
 
 /// Prompt once on the controlling terminal with echo disabled.
 ///
@@ -165,14 +175,12 @@ fn prompt_once(prompt: &str) -> Result<Secret, SecretError> {
 /// values are zeroized on drop, and only the confirmed first entry is
 /// returned.
 pub fn prompt_confirmed(prompt: &str, confirmation_prompt: &str) -> Result<Secret, SecretError> {
-    confirm_with(prompt, confirmation_prompt, prompt_once)
+    let first = prompt_once(prompt)?;
+    let second = prompt_once(confirmation_prompt)?;
+    confirm(first, second)
 }
 
-/// Read a secret twice through `read` and require the entries to match.
-///
-/// The reusable core of [`prompt_confirmed`], generic over the input source
-/// so scripted callers (and tests) can confirm from any reader. `read` is
-/// called at most twice, once per prompt.
+/// Read two consecutive `--stdin` lines and require them to match.
 ///
 /// ```
 /// use std::io::Cursor;
@@ -180,32 +188,23 @@ pub fn prompt_confirmed(prompt: &str, confirmation_prompt: &str) -> Result<Secre
 /// use gmellon::secret_input::{self, SecretError};
 ///
 /// let mut input = Cursor::new(b"mellon\nmellon\n".to_vec());
-/// let source = &mut input;
-///
-/// let secret = secret_input::confirm_with(
-///     "New password: ",
-///     "Confirm password: ",
-///     |_prompt| secret_input::read_stdin_line(&mut *source),
-/// )
-/// .unwrap();
+/// let secret = secret_input::read_stdin_confirmed(&mut input).unwrap();
 ///
 /// assert_eq!(secret.as_bytes(), b"mellon");
 ///
 /// let mismatch = &mut Cursor::new(b"mellon\nfriend\n".to_vec());
 /// assert!(matches!(
-///     secret_input::confirm_with("New password: ", "Confirm password: ", |_prompt| {
-///         secret_input::read_stdin_line(&mut *mismatch)
-///     }),
+///     secret_input::read_stdin_confirmed(mismatch),
 ///     Err(SecretError::ConfirmationMismatch)
 /// ));
 /// ```
-pub fn confirm_with(
-    prompt: &str,
-    confirmation_prompt: &str,
-    mut read: impl FnMut(&str) -> Result<Secret, SecretError>,
-) -> Result<Secret, SecretError> {
-    let first = read(prompt)?;
-    let second = read(confirmation_prompt)?;
+pub fn read_stdin_confirmed(reader: &mut impl BufRead) -> Result<Secret, SecretError> {
+    let first = read_stdin_line(reader)?;
+    let second = read_stdin_line(reader)?;
+    confirm(first, second)
+}
+
+fn confirm(first: Secret, second: Secret) -> Result<Secret, SecretError> {
     if first.as_bytes() != second.as_bytes() {
         // Both values are zeroized as they drop out of scope.
         return Err(SecretError::ConfirmationMismatch);
@@ -231,13 +230,15 @@ pub fn confirm_with(
 /// assert_eq!(secret.as_bytes(), b"mellon");
 /// ```
 pub fn read_stdin_line(reader: &mut impl BufRead) -> Result<Secret, SecretError> {
-    let mut line = Zeroizing::new(Vec::new());
+    // Exact preallocation prevents secret prefixes being abandoned by a Vec
+    // reallocation before the final allocation can be zeroized.
+    let mut line = Zeroizing::new(Vec::with_capacity(MAX_LINE_BYTES));
     // `take` bounds the buffer: `read_until` can consume at most one full
     // line even from a pipe that never sends a newline.
     reader
         .take(MAX_LINE_BYTES as u64)
         .read_until(b'\n', &mut line)
-        .map_err(|source| SecretError::Io { source })?;
+        .map_err(redact_io_error)?;
 
     match line.last() {
         Some(b'\n') => {
@@ -269,19 +270,27 @@ pub fn read_stdin_line(reader: &mut impl BufRead) -> Result<Secret, SecretError>
 fn prompt_via_rpassword(prompt: &str, config: rpassword::Config) -> Result<Secret, SecretError> {
     let answer =
         rpassword::prompt_password_with_config(prompt, config).map_err(classify_terminal_error)?;
-    Ok(Secret::from_string(answer))
+    Secret::from_string(answer)
 }
 
 /// Map terminal-open failures to actionable errors.
 ///
 /// Opening `/dev/tty` without a controlling terminal fails with `ENXIO`
 /// (Linux errno 6), which otherwise surfaces as an opaque uncategorized I/O
-/// error. Everything else passes through untouched.
+/// error. Other errors retain only their kind and numeric operating-system
+/// code; reader-provided text is discarded.
 fn classify_terminal_error(error: io::Error) -> SecretError {
     if error.raw_os_error() == Some(rustix::io::Errno::NXIO.raw_os_error()) {
         return SecretError::NoControllingTerminal;
     }
-    SecretError::Io { source: error }
+    redact_io_error(error)
+}
+
+fn redact_io_error(error: io::Error) -> SecretError {
+    SecretError::Io {
+        kind: error.kind(),
+        raw_os_error: error.raw_os_error(),
+    }
 }
 
 #[cfg(test)]
@@ -403,7 +412,8 @@ mod tests {
     fn over_limit_input_without_a_newline_is_rejected_without_unbounded_reads() {
         // No newline and no end of input: the bounded reader must stop and
         // error rather than buffering a growing line.
-        let result = read_stdin_line(&mut Cursor::new(vec![b'a'; MAX_SECRET_BYTES + 5]));
+        let mut input = Cursor::new(vec![b'a'; MAX_SECRET_BYTES + 5]);
+        let result = read_stdin_line(&mut input);
 
         assert!(matches!(
             result,
@@ -411,6 +421,7 @@ mod tests {
                 maximum: MAX_SECRET_BYTES
             })
         ));
+        assert_eq!(input.position(), MAX_LINE_BYTES as u64);
     }
 
     #[test]
@@ -463,6 +474,23 @@ mod tests {
     }
 
     #[test]
+    fn tty_answers_share_the_secret_length_limit() {
+        let config = rpassword::ConfigBuilder::new()
+            .input_reader(Cursor::new(
+                [vec![b'a'; MAX_SECRET_BYTES + 1], b"\n".to_vec()].concat(),
+            ))
+            .output_discard()
+            .build();
+
+        assert!(matches!(
+            prompt_via_rpassword("Password: ", config),
+            Err(SecretError::TooLong {
+                maximum: MAX_SECRET_BYTES
+            })
+        ));
+    }
+
+    #[test]
     fn prompt_via_rpassword_maps_reader_failures_to_io_errors() {
         let config = rpassword::ConfigBuilder::new()
             .input_file_path("/nonexistent/gmellon-test-tty")
@@ -493,31 +521,41 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_returns_the_matched_value_and_uses_both_prompts() {
-        let mut input = Cursor::new(b"mellon\nmellon\n".to_vec());
-        let source = &mut input;
-        let mut prompts = Vec::new();
+    fn reader_error_text_is_redacted() {
+        struct LeakyReader;
 
-        let secret = confirm_with("New password: ", "Confirm password: ", |prompt| {
-            prompts.push(prompt.to_owned());
-            read_stdin_line(&mut *source)
-        })
-        .unwrap();
+        impl io::Read for LeakyReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("mellon must not escape"))
+            }
+        }
+
+        let mut input = io::BufReader::new(LeakyReader);
+        let error = read_stdin_line(&mut input)
+            .err()
+            .expect("the injected reader should fail");
+
+        assert!(matches!(error, SecretError::Io { .. }));
+        assert!(!error.to_string().contains("mellon"));
+        assert!(!format!("{error:?}").contains("mellon"));
+    }
+
+    #[test]
+    fn stdin_confirmation_returns_the_matched_value() {
+        let mut input = Cursor::new(b"mellon\nmellon\n".to_vec());
+
+        let secret = read_stdin_confirmed(&mut input).unwrap();
 
         assert_eq!(secret.as_bytes(), b"mellon");
-        assert_eq!(prompts, ["New password: ", "Confirm password: "]);
     }
 
     #[test]
     fn confirmation_mismatch_is_a_single_error_without_secret_content() {
         let mut input = Cursor::new(b"mellon\nfriend\n".to_vec());
-        let source = &mut input;
 
-        let error = confirm_with("New password: ", "Confirm password: ", |_prompt| {
-            read_stdin_line(&mut *source)
-        })
-        .err()
-        .expect("mismatching entries should fail");
+        let error = read_stdin_confirmed(&mut input)
+            .err()
+            .expect("mismatching entries should fail");
 
         let message = error.to_string();
         assert!(matches!(error, SecretError::ConfirmationMismatch));
@@ -528,13 +566,10 @@ mod tests {
     #[test]
     fn confirmation_propagates_read_errors() {
         let mut input = Cursor::new(b"mellon\n".to_vec());
-        let source = &mut input;
 
-        let error = confirm_with("New password: ", "Confirm password: ", |_prompt| {
-            read_stdin_line(&mut *source)
-        })
-        .err()
-        .expect("an unterminated second entry should fail");
+        let error = read_stdin_confirmed(&mut input)
+            .err()
+            .expect("an unterminated second entry should fail");
 
         assert!(matches!(
             error,
