@@ -211,18 +211,65 @@ root = Path(os.environ['GMELL_HARNESS_ROOT'])
         self.assertTrue(all(child["reaped"] for child in cleanup["children"]))
         self.assertTrue(all(process_absent(child["pid"]) for child in cleanup["children"]))
 
+    def test_term_is_followed_by_kill_only_for_a_remaining_child(self) -> None:
+        roots_before = set(lifecycle.APPROVED_TEMP_ROOT.glob("gmell-h-*"))
+        ignore_term = """
+import signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(30)
+"""
+        process = subprocess.Popen(
+            [str(LIFECYCLE_PATH), "--", "/usr/bin/python3", "-c", ignore_term],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 10
+        root = None
+        while time.monotonic() < deadline:
+            candidates = set(lifecycle.APPROVED_TEMP_ROOT.glob("gmell-h-*")) - roots_before
+            ready = [candidate for candidate in candidates if (candidate / "evidence.json").exists()]
+            if ready:
+                root = ready[0]
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(root, "harness did not become ready")
+        # Allow the command to install its SIGTERM disposition after launch.
+        time.sleep(0.1)
+        os.kill(process.pid, signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 128 + signal.SIGTERM, stdout + stderr)
+        retained = self.remember(
+            subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+        )
+        cleanup = json.loads((retained / "cleanup.json").read_text())
+        command_cleanup = next(
+            child for child in cleanup["children"] if child["name"] == "command"
+        )
+        daemon_cleanup = next(
+            child for child in cleanup["children"] if child["name"] == "daemon"
+        )
+        self.assertTrue(command_cleanup["sent_term"])
+        self.assertTrue(command_cleanup["sent_kill"])
+        self.assertEqual(command_cleanup["return_code"], -signal.SIGKILL)
+        self.assertTrue(command_cleanup["reaped"])
+        self.assertFalse(daemon_cleanup["sent_kill"])
+        self.assertTrue(daemon_cleanup["reaped"])
+
     def test_passed_environment_value_is_omitted_from_evidence(self) -> None:
         environment = dict(os.environ)
         environment["GMELL_TEST_SENSITIVE_MARKER"] = "do-not-retain-this-value"
         result = self.run_cli(
-            "--keep-success",
             "--pass-env",
             "GMELL_TEST_SENSITIVE_MARKER",
             "--",
-            "/usr/bin/true",
+            "/usr/bin/python3",
+            "-c",
+            "raise SystemExit(19)",
             env=environment,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 19, result.stderr)
         root = self.remember(result)
         retained_files = [root / "evidence.json", root / "cleanup.json", root / "daemon.stdout.log", root / "daemon.stderr.log"]
         for path in retained_files:
