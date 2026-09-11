@@ -85,7 +85,7 @@ class ShutdownResult:
     return_code: int
     sent_term: bool
     sent_kill: bool
-    process_group_gone: bool
+    process_reaped: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -212,13 +212,16 @@ def launch_daemon(
 
 def install_signal_handlers() -> dict[signal.Signals, signal.Handlers]:
     previous: dict[signal.Signals, signal.Handlers] = {}
+    handled_signals = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
 
     def interrupt(signum: int, _frame: object) -> None:
-        # Ignore repeats while the first signal unwinds through owned cleanup.
-        signal.signal(signum, signal.SIG_IGN)
+        # Ignore further handled signals while the first one unwinds through
+        # owned cleanup. SIGKILL remains intentionally uncatchable.
+        for handled_signal in handled_signals:
+            signal.signal(handled_signal, signal.SIG_IGN)
         raise HarnessSignal(signum)
 
-    for signum in (signal.SIGHUP, signal.SIGTERM):
+    for signum in handled_signals:
         previous[signum] = signal.getsignal(signum)
         signal.signal(signum, interrupt)
     return previous
@@ -400,51 +403,26 @@ def require_redacted(paths: tuple[Path, ...], sensitive_values: tuple[bytes, ...
             raise SmokeFailure(f"sensitive probe bytes appeared in retained output: {path}")
 
 
-def process_group_exists(process_group: int) -> bool:
-    try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
-        return False
-    return True
+def terminate_daemon(process: subprocess.Popen[bytes]) -> ShutdownResult:
+    return_code = process.poll()
+    if return_code is not None:
+        raise SmokeFailure(
+            f"daemon exited before owned teardown with status {return_code}"
+        )
 
-
-def signal_process_group(process_group: int, signum: signal.Signals) -> bool:
-    try:
-        os.killpg(process_group, signum)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def wait_for_process_group_exit(process_group: int, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while process_group_exists(process_group):
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.02)
-    return True
-
-
-def terminate_process_group(process: subprocess.Popen[bytes]) -> ShutdownResult:
-    process_group = process.pid
-    sent_term = signal_process_group(process_group, signal.SIGTERM)
+    # Popen still owns an unreaped child here. Even if it exits immediately
+    # after poll(), its PID cannot be reused until wait() reaps it.
+    process.terminate()
+    sent_term = True
     sent_kill = False
 
     try:
         return_code = process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        sent_kill = signal_process_group(process_group, signal.SIGKILL)
+        process.kill()
+        sent_kill = True
         return_code = process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
 
-    if not wait_for_process_group_exit(process_group, SHUTDOWN_TIMEOUT_SECONDS):
-        sent_kill = signal_process_group(process_group, signal.SIGKILL) or sent_kill
-        if not wait_for_process_group_exit(process_group, SHUTDOWN_TIMEOUT_SECONDS):
-            raise SmokeFailure(f"owned process group {process_group} survived SIGKILL")
-
-    if not sent_term:
-        raise SmokeFailure(
-            f"daemon exited before owned teardown with status {return_code}"
-        )
     expected_statuses = {0, -signal.SIGTERM}
     if sent_kill:
         expected_statuses.add(-signal.SIGKILL)
@@ -455,7 +433,7 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> ShutdownResult:
         return_code=return_code,
         sent_term=sent_term,
         sent_kill=sent_kill,
-        process_group_gone=True,
+        process_reaped=True,
     )
 
 
@@ -502,7 +480,7 @@ def write_cleanup_result(
         "return_code": result.return_code,
         "sent_term": result.sent_term,
         "sent_kill": result.sent_kill,
-        "process_group_gone": result.process_group_gone,
+        "process_reaped": result.process_reaped,
     }
     sandbox.cleanup_log.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
@@ -607,7 +585,7 @@ def run(keep_success: bool, self_test_failure: bool) -> None:
     finally:
         if process is not None:
             try:
-                shutdown_result = terminate_process_group(process)
+                shutdown_result = terminate_daemon(process)
                 if sandbox is not None:
                     write_cleanup_result(sandbox, process, shutdown_result)
             except BaseException as error:
@@ -674,7 +652,7 @@ def run(keep_success: bool, self_test_failure: bool) -> None:
     print("  readiness: stdout EOF + live child + owned Unix socket")
     print("  protocol: fresh UNLOCK OK; wrong UNLOCK DENIED")
     print("  isolation: configured paths under scratch; external sentinel unchanged")
-    print("  lifecycle: owned process group terminated and reaped")
+    print("  lifecycle: owned daemon PID terminated and reaped")
     if keep_success:
         print(f"  artifacts: {sandbox.root}")
 

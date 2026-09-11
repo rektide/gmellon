@@ -29,7 +29,7 @@ PASS: isolated control-socket smoke path
   readiness: stdout EOF + live child + owned Unix socket
   protocol: fresh UNLOCK OK; wrong UNLOCK DENIED
   isolation: configured paths under scratch; external sentinel unchanged
-  lifecycle: owned process group terminated and reaped
+  lifecycle: owned daemon PID terminated and reaped
 ```
 
 The retained representative run used a unique mode-0700 root beneath
@@ -54,7 +54,7 @@ printable non-NUL bytes and checks this invariant before sending. This was a
 probe defect rather than nondeterministic daemon behavior.
 
 After TERM, `cleanup.json` recorded daemon status 0, no KILL fallback, and the
-absence of the complete process group; the launched PID was also absent from
+successful reaping of the exact launched PID; that PID was also absent from
 `/proc`. A normal run without `--keep-success` left no new `gmell-h-*` scratch
 root or `gmell-sentinel-*` file. The committed `--self-test-failure` mode
 reproduced failure cleanup, retained both logs, and recorded the process group
@@ -64,12 +64,12 @@ as gone:
 retained scratch: /home/rektide/tmp-opencode/gmell-h-f_52dlyp
 retained sentinel: /home/rektide/tmp-opencode/gmell-sentinel-lpzbpagm
 FAIL: injected post-readiness failure
-PASS: committed failure mode retained logs and reaped process group 715523
+PASS: committed failure mode retained logs and reaped daemon PID 715523
 ```
 
 A separate live test sent SIGTERM to the harness after its control socket
 appeared. The harness returned 143, retained both daemon logs, sent TERM to its
-owned process group, verified that group disappeared, and reaped daemon PID
+owned daemon PID, waited for it to exit, and reaped daemon PID
 718184. Unexpected Python programming failures retain the same resources but
 are not converted into terse expected-failure output; their traceback remains
 visible.
