@@ -6,7 +6,7 @@ resource: /doc/harness/smoke0.gpt6a.md
 tags: [gmellon, harness, gnome-keyring, integration-test]
 status: draft
 generated: { by: model:openai/gpt-6-astra, at: 2026-09-11T17:13:31-04:00 }
-verified: { by: model:openai/gpt-6-astra, at: 2026-09-11T17:23:56-04:00 }
+verified: { by: model:openai/gpt-6-astra, at: 2026-09-11T17:28:53-04:00 }
 stale_after: 2027-03-11
 sources:
   - id: harness-contract
@@ -43,9 +43,11 @@ The first credential-prelude plus UNLOCK exchange created both
 scratch root. A second connection using a different password returned DENIED.
 The probe enumerated all observed scratch artifacts, resolved each path
 beneath the scratch root, and validated every path-valued variable reported by
-the daemon. It scanned stdout, stderr, evidence, and cleanup records for both
-generated values and their complete request frames before declaring that no
-password or frame had been retained.
+the daemon. It registered both generated values and complete request frames as
+sensitive before either socket exchange, then scanned stdout, stderr,
+evidence, and cleanup records before declaring that no password or frame had
+been retained. A forced post-send response failure confirmed that this scan is
+not skipped when an exchange fails.
 
 One development rerun initially returned FAILED because the disposable probe
 generated arbitrary bytes and occasionally included NUL, which is invalid in
@@ -56,9 +58,10 @@ probe defect rather than nondeterministic daemon behavior.
 After TERM, `cleanup.json` recorded daemon status 0, no KILL fallback, and the
 successful reaping of the exact launched PID; that PID was also absent from
 `/proc`. A normal run without `--keep-success` left no new `gmell-h-*` scratch
-root or `gmell-sentinel-*` file. The committed `--self-test-failure` mode
-reproduced failure cleanup, retained both logs, and recorded the process group
-as gone:
+root or `gmell-sentinel-*` file. Startup stdout is copied incrementally, and a
+forced early child exit confirmed that buffered output is drained before the
+exit is reported. The committed `--self-test-failure` mode reproduced failure
+cleanup, retained both logs, and recorded the exact daemon PID as reaped:
 
 ```text
 retained scratch: /home/rektide/tmp-opencode/gmell-h-f_52dlyp
@@ -67,11 +70,13 @@ FAIL: injected post-readiness failure
 PASS: committed failure mode retained logs and reaped daemon PID 715523
 ```
 
-A separate live test sent SIGTERM to the harness after its control socket
-appeared. The harness returned 143, retained both daemon logs, sent TERM to its
-owned daemon PID, waited for it to exit, and reaped daemon PID
-718184. Unexpected Python programming failures retain the same resources but
-are not converted into terse expected-failure output; their traceback remains
+Separate live tests sent SIGTERM and SIGHUP to the harness after its control
+socket appeared. The harness returned the corresponding signal status,
+retained both daemon logs, sent TERM to its exact owned daemon PID, waited for
+it to exit, and reaped it. Once HUP, INT, or TERM starts unwinding, all three
+are masked until cleanup finishes; SIGKILL remains intentionally uncatchable.
+Unexpected Python programming failures retain the same resources but are not
+converted into terse expected-failure output, so their traceback remains
 visible.
 
 ## Isolation boundary
@@ -106,8 +111,9 @@ cargo nextest run
 ```
 
 The Python syntax check, retained and normal-cleanup invocations, five
-consecutive smoke invocations, deterministic failure injection, and live
-SIGTERM injection passed their expected outcomes. After concurrent
+consecutive smoke invocations, deterministic failure injection, post-send
+response failure, early-exit stdout draining, and live SIGTERM/SIGHUP injection
+passed their expected outcomes. After concurrent
 control-transport work settled, formatting and Clippy passed and nextest ran
 28 tests successfully with no skips. The earlier transient Clippy compilation
 failure was unrelated to the harness files and was not reproduced at the
