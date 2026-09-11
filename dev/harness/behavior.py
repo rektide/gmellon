@@ -110,11 +110,7 @@ class SensitiveValues:
         return frame
 
     def scan_artifacts(self, root: Path) -> None:
-        retained_files = [
-            path
-            for path in root.rglob("*")
-            if path.is_file() and (path.suffix == ".json" or path.suffix == ".log")
-        ]
+        retained_files = [path for path in root.rglob("*") if path.is_file()]
         for path in retained_files:
             contents = path.read_bytes()
             for value in self.values:
