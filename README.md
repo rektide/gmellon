@@ -173,7 +173,7 @@ for the zsh login hook; `env` (INITIALIZE) exposure.
 | clap v4 (derive) + clap_complete | CLI + completions |
 | rpassword | no-echo TTY prompts |
 | anyhow | errors |
-| tracing (optional, Stage 5) | `-v` frame hexdumps |
+| tracing (optional, Stage 5) | redacted `-v` operation diagnostics |
 
 Publishing: `cargo bump` + `jj commit` + `cargo publish` when it earns it.
 
