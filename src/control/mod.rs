@@ -1,15 +1,15 @@
 //! GNOME Keyring's private control interface.
 
 mod protocol;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod sync;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod unix;
 
 pub use protocol::DaemonResult;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub use sync::{ControlError, IoStage, SyncClient};
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub use unix::SecurityError;
 
 /// Pure protocol machinery for alternate I/O adapters and deterministic tests.

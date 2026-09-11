@@ -126,19 +126,10 @@ pub(super) fn validate_peer_owner(
     Ok(())
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
 pub(super) fn peer_uid(socket: impl AsFd) -> io::Result<RawUid> {
     rustix::net::sockopt::socket_peercred(socket)
         .map(|credentials| credentials.uid.as_raw())
         .map_err(io::Error::from)
-}
-
-#[cfg(not(any(target_os = "android", target_os = "linux")))]
-pub(super) fn peer_uid(_socket: impl AsFd) -> io::Result<RawUid> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "peer credential lookup is not implemented on this platform",
-    ))
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::protocol::{
     DaemonResult, DecodeError, EncodeError, Request, decode_response, encode_request,
@@ -98,7 +98,11 @@ impl SyncClient {
         }
     }
 
-    /// Override the read and write timeout used for each exchange.
+    /// Override the total response-read deadline and per-write timeout.
+    ///
+    /// This does not bound `connect()`. Each operation uses a local Unix
+    /// socket, where connect normally completes immediately, but callers must
+    /// not interpret this setting as a deadline for the entire exchange.
     #[must_use]
     pub fn with_io_timeout(mut self, io_timeout: Duration) -> Self {
         self.io_timeout = io_timeout;
@@ -163,19 +167,13 @@ impl SyncClient {
             }
         })?;
         stream
-            .set_read_timeout(Some(self.io_timeout))
-            .and_then(|()| stream.set_write_timeout(Some(self.io_timeout)))
+            .set_write_timeout(Some(self.io_timeout))
             .map_err(|source| ControlError::Io {
                 stage: IoStage::ConfigureSocket,
                 source,
             })?;
 
-        let actual_uid = peer_uid(&stream).map_err(|source| ControlError::Io {
-            stage: IoStage::InspectPeer,
-            source,
-        })?;
-        validate_peer_owner(&self.socket_path, expected_uid, actual_uid)
-            .map_err(ControlError::Security)?;
+        validate_connected_peer(&stream, &self.socket_path, expected_uid)?;
 
         stream
             .write_all(&CREDENTIAL_BYTE)
@@ -190,15 +188,81 @@ impl SyncClient {
                 source,
             })?;
 
-        let mut response = [0_u8; RESPONSE_LENGTH];
-        stream
-            .read_exact(&mut response)
-            .map_err(|source| ControlError::Io {
-                stage: IoStage::ReceiveResponse,
-                source,
-            })?;
+        let response = read_response_before(&mut stream, self.io_timeout)?;
         decode_response(&response).map_err(ControlError::Decode)
     }
+}
+
+fn validate_connected_peer(
+    stream: &UnixStream,
+    path: &Path,
+    expected_uid: rustix::process::RawUid,
+) -> Result<(), ControlError> {
+    let actual_uid = peer_uid(stream).map_err(|source| ControlError::Io {
+        stage: IoStage::InspectPeer,
+        source,
+    })?;
+    validate_peer_owner(path, expected_uid, actual_uid).map_err(ControlError::Security)
+}
+
+fn read_response_before(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<[u8; RESPONSE_LENGTH], ControlError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| ControlError::Io {
+            stage: IoStage::ConfigureSocket,
+            source: io::Error::new(io::ErrorKind::InvalidInput, "response timeout is too large"),
+        })?;
+    let mut response = [0_u8; RESPONSE_LENGTH];
+    let mut received = 0;
+
+    while received < response.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| ControlError::Io {
+                stage: IoStage::ReceiveResponse,
+                source: io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "control response deadline expired",
+                ),
+            })?;
+        if remaining.is_zero() {
+            return Err(ControlError::Io {
+                stage: IoStage::ReceiveResponse,
+                source: io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "control response deadline expired",
+                ),
+            });
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|source| ControlError::Io {
+                stage: IoStage::ConfigureSocket,
+                source,
+            })?;
+
+        match stream.read(&mut response[received..]) {
+            Ok(0) => {
+                return Err(ControlError::Io {
+                    stage: IoStage::ReceiveResponse,
+                    source: io::Error::from(io::ErrorKind::UnexpectedEof),
+                });
+            }
+            Ok(count) => received += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) => {
+                return Err(ControlError::Io {
+                    stage: IoStage::ReceiveResponse,
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -354,6 +418,79 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn drip_fed_response_cannot_extend_the_deadline() {
+        let (directory, listener) = listening_control_socket();
+        let chunks = response(DaemonResult::Ok)
+            .into_iter()
+            .map(|byte| vec![byte])
+            .collect();
+        let server = serve_once(listener, chunks, Duration::from_millis(20));
+        let client = SyncClient::new(directory.path()).with_io_timeout(Duration::from_millis(55));
+
+        assert!(matches!(
+            client.unlock(b"friend"),
+            Err(ControlError::Io {
+                stage: IoStage::ReceiveResponse,
+                ..
+            })
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn connected_peer_mismatch_is_rejected_before_sending_credentials() {
+        let (directory, listener) = listening_control_socket();
+        let stream = UnixStream::connect(directory.path().join("control")).unwrap();
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let actual_uid = effective_uid();
+        let wrong_uid = actual_uid.wrapping_add(1);
+
+        assert!(matches!(
+            validate_connected_peer(&stream, Path::new("control"), wrong_uid),
+            Err(ControlError::Security(SecurityError::PeerOwnerMismatch {
+                expected,
+                actual,
+                ..
+            })) if expected == wrong_uid && actual == actual_uid
+        ));
+
+        server_stream.set_nonblocking(true).unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(matches!(
+            server_stream.read(&mut byte),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn one_client_opens_a_fresh_connection_for_each_operation() {
+        let (directory, listener) = listening_control_socket();
+        let server = thread::spawn(move || {
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                received.push(read_request(&mut stream));
+                stream.write_all(&response(DaemonResult::Ok)).unwrap();
+            }
+            received
+        });
+        let client = SyncClient::new(directory.path());
+
+        assert_eq!(client.unlock(b"first").unwrap(), DaemonResult::Ok);
+        assert_eq!(client.unlock(b"second").unwrap(), DaemonResult::Ok);
+        let received = server.join().unwrap();
+        assert_eq!(received.len(), 2);
+        match decode_request(received[0].frame.as_slice()).unwrap() {
+            Request::Unlock { password } => assert_eq!(password, b"first"),
+            Request::Change { .. } => panic!("received change instead of unlock"),
+        }
+        match decode_request(received[1].frame.as_slice()).unwrap() {
+            Request::Unlock { password } => assert_eq!(password, b"second"),
+            Request::Change { .. } => panic!("received change instead of unlock"),
+        }
+    }
+
     fn listening_control_socket() -> (TempDir, UnixListener) {
         let directory = TempDir::new().unwrap();
         let listener = UnixListener::bind(directory.path().join("control")).unwrap();
@@ -367,32 +504,40 @@ mod tests {
     ) -> JoinHandle<ReceivedRequest> {
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut credential = [0_u8; 1];
-            stream.read_exact(&mut credential).unwrap();
-
-            let mut length = [0_u8; 4];
-            stream.read_exact(&mut length).unwrap();
-            let frame_length = u32::from_be_bytes(length) as usize;
-            let mut frame = Zeroizing::new(vec![0_u8; frame_length]);
-            frame[..4].copy_from_slice(&length);
-            stream.read_exact(&mut frame[4..]).unwrap();
+            let received = read_request(&mut stream);
 
             let has_response = !response_chunks.is_empty();
             for chunk in response_chunks {
                 if !delay.is_zero() {
                     thread::sleep(delay);
                 }
-                stream.write_all(&chunk).unwrap();
+                if stream.write_all(&chunk).is_err() {
+                    break;
+                }
             }
             if !has_response && !delay.is_zero() {
                 thread::sleep(delay);
             }
 
-            ReceivedRequest {
-                credential: credential[0],
-                frame,
-            }
+            received
         })
+    }
+
+    fn read_request(stream: &mut UnixStream) -> ReceivedRequest {
+        let mut credential = [0_u8; 1];
+        stream.read_exact(&mut credential).unwrap();
+
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length).unwrap();
+        let frame_length = u32::from_be_bytes(length) as usize;
+        let mut frame = Zeroizing::new(vec![0_u8; frame_length]);
+        frame[..4].copy_from_slice(&length);
+        stream.read_exact(&mut frame[4..]).unwrap();
+
+        ReceivedRequest {
+            credential: credential[0],
+            frame,
+        }
     }
 
     fn response(result: DaemonResult) -> Vec<u8> {
