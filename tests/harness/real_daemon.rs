@@ -8,7 +8,9 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
+#[cfg(target_os = "linux")]
 use std::io::Read;
+#[cfg(target_os = "linux")]
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
