@@ -8,3 +8,7 @@
 # Added by cargo
 
 /target
+
+# Python harness probes
+__pycache__/
+*.py[cod]
