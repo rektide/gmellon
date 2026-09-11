@@ -48,6 +48,31 @@ evidence is useful; do not overwrite unrelated or provisional work.
 
 ## Current state and known facts
 
+Status at 2026-09-11 documentation reconciliation (`gmell-harness-docs`):
+
+- The core chain is implemented, reviewed, and closed in Beads:
+  `gmell-harness-smoke`, `gmell-harness-lifecycle`,
+  `gmell-harness-behavior`, and `gmell-harness-integration`, with
+  version-scoped evidence in [`smoke0.gpt6a.md`](/doc/harness/smoke0.gpt6a.md),
+  [`lifecycle0.gpt6a.md`](/doc/harness/lifecycle0.gpt6a.md),
+  [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md), and
+  [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md).
+- The durable operator and architecture contract is
+  [`/doc/harness/README.md`](/doc/harness/README.md). This prompt remains the
+  kickoff plan and safety-invariant record — planned acceptance, not
+  completion evidence.
+- `gmell-harness-broker` was promoted from optional parity to P1 and is in
+  progress: the approved product architecture now uses zbus with GNOME's
+  private internal interface to target Secret Service collections, so
+  private-bus coverage is required for product D-Bus tests. It still does not
+  gate the control-only harness, its core closure, or direct control-socket
+  tests.
+- The per-ticket sections and the closing kickoff directive below are the
+  original reviewed plan, preserved for provenance; live status lives in the
+  Beads graph.
+
+The facts recorded at kickoff follow.
+
 - Stage 0 is complete: Cargo, a clap command skeleton, and three nextest tests
   exist. The harness should not need to restructure that code.
 - `gmell-harness` is the umbrella epic. Its core chain is smoke, lifecycle,
@@ -163,16 +188,18 @@ Treat these as acceptance criteria, not aspirations:
 
 ## Ticket map
 
-The required core follows one linear chain. Broker parity is an optional
-branch and must not gate the control-protocol harness:
+The required core follows one linear chain and is complete. Broker parity
+branched after lifecycle, was promoted from optional parity to required
+in-progress work for the zbus product backend, and still does not gate the
+control-protocol harness:
 
 ```mermaid
 flowchart LR
-    smoke["gmell-harness-smoke"] --> lifecycle["gmell-harness-lifecycle"]
-    lifecycle --> behavior["gmell-harness-behavior"]
-    behavior --> integration["gmell-harness-integration"]
-    integration --> docs["gmell-harness-docs"]
-    lifecycle --> broker["gmell-harness-broker (optional)"]
+    smoke["gmell-harness-smoke (closed)"] --> lifecycle["gmell-harness-lifecycle (closed)"]
+    lifecycle --> behavior["gmell-harness-behavior (closed)"]
+    behavior --> integration["gmell-harness-integration (closed)"]
+    integration --> docs["gmell-harness-docs (this reconciliation)"]
+    lifecycle --> broker["gmell-harness-broker (promoted, in progress)"]
 ```
 
 ### `gmell-harness-smoke` — prove the isolated control-socket path
@@ -234,6 +261,14 @@ remaining optional broker work separately.
 
 ### `gmell-harness-broker` — assess optional private-broker parity
 
+> Status: promoted from this optional framing to P1 and in progress. The
+> approved product architecture now uses zbus with GNOME's private
+> `org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface` to target any
+> Secret Service collection, so private-bus coverage is required for product
+> D-Bus tests. The control-only lifecycle is preserved as a sibling mode, and
+> this ticket still does not gate control-socket work. Current acceptance
+> criteria live in the Beads record.
+
 After lifecycle support exists, make a broker-only experiment under
 `.test-agent/harness/`, reproducing the known `systemd-socket-activate`
 composition before extending it. Demonstrate a private socket, a minimal
@@ -256,4 +291,7 @@ non-prompting Secret Service observations. Report and stop.
 - Do not make raw protocol hexdumps containing secrets.
 - Do not turn broker-specific mechanics into Rust product dependencies.
 
-Begin with `gmell-harness-smoke` only.
+The kickoff directive above has been completed: smoke through integration are
+closed with evidence, and this document's reconciliation is
+`gmell-harness-docs`. The live work frontier is the Beads graph, where
+`gmell-harness-broker` continues as the promoted sibling branch.
