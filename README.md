@@ -128,9 +128,10 @@ recv: 00 00 00 08  00 00 00 00
   create the missing store. This is version-scoped harness evidence, so the
   product must treat CHANGE as create-capable rather than as a safe existence
   check.
-- Empty-password behavior is asymmetric in the observed daemon: fresh
+- Empty-password behavior is asymmetric in the observed cases: fresh
   `UNLOCK(empty)` creates an empty-password login keyring, and
-  `CHANGE(empty, nonempty)` succeeds; `CHANGE(anything, empty)` is denied.
+  `CHANGE(empty, nonempty)` succeeds. `CHANGE(A, empty)` on the existing A
+  store and `CHANGE(arbitrary, empty)` with no store were both denied.
 - No rate limiting or lockout exists server-side; a wrong password just
   returns DENIED.
 - The socket lives in a 0700 runtime dir — any process of your uid may
