@@ -167,17 +167,20 @@ synchronous stream type. A future `TokioClient` can therefore reuse the codec
 and security checks while replacing only connect/read/write scheduling; sync
 and async are not forced through one trait.
 
-### Stage 2 — test harness
-A `dev/` script (or test fixture) that starts a throwaway
+### Stage 2 — test harness (complete)
+Implemented under `dev/harness/`: the reusable
+[`lifecycle.py`](/dev/harness/lifecycle.py) supervisor starts a throwaway
 `gnome-keyring-daemon --foreground --components=secrets
 --control-directory=<tmp>`, with `HOME` and all XDG directories redirected to
 a mode-0700 scratch tree and both D-Bus addresses pointed at nonexistent
 scratch sockets. It waits for the daemon's initialization EOF, verifies child
-liveness and the control socket, and performs bounded teardown. This required
+liveness and the control socket, and performs bounded teardown. This
 control-only layer validates the transport and frame transcription without
-touching the real store or buses. A private `dbus-broker` composition is a
-later parity layer for Secret Service observations, not a prerequisite for
-control-protocol tests.
+touching the real store or buses. A private `dbus-broker` composition
+(`gmell-harness-broker`, in progress) was promoted from optional parity to
+required infrastructure for the zbus Secret Service product backend, but it
+remains separate from — and no prerequisite for — this control-only layer and
+its tests.
 
 The reproducible behavior runner adds supervisor-owned restarts over the same
 private store and explicit stopped/SIGSTOP fault transitions. Against installed
