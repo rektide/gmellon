@@ -366,7 +366,7 @@ def receive_exact(connection: socket.socket, length: int) -> bytes:
     return bytes(received)
 
 
-def unlock(control_socket: Path, daemon_pid: int, password: bytes) -> tuple[int, bytes]:
+def unlock(control_socket: Path, daemon_pid: int, frame: bytes) -> int:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(IO_TIMEOUT_SECONDS)
         connection.connect(str(control_socket))
@@ -383,14 +383,13 @@ def unlock(control_socket: Path, daemon_pid: int, password: bytes) -> tuple[int,
 
         # The credential byte is a transport prelude, not part of the frame.
         connection.sendall(b"\0")
-        frame = encode_unlock(password)
         connection.sendall(frame)
         response = receive_exact(connection, 8)
 
     total_length, result = struct.unpack("!II", response)
     if total_length != 8:
         raise SmokeFailure(f"unexpected control response length: {total_length}")
-    return result, frame
+    return result
 
 
 def random_probe_password() -> bytes:
@@ -549,8 +548,10 @@ def run(keep_success: bool, self_test_failure: bool) -> None:
         while wrong_password == password:
             wrong_password = random_probe_password()
 
-        first_result, first_frame = unlock(control_socket, process.pid, password)
-        sensitive_values = (password, wrong_password, first_frame)
+        first_frame = encode_unlock(password)
+        wrong_frame = encode_unlock(wrong_password)
+        sensitive_values = (password, wrong_password, first_frame, wrong_frame)
+        first_result = unlock(control_socket, process.pid, first_frame)
         if first_result != OK:
             raise SmokeFailure(
                 f"fresh-store UNLOCK returned result {first_result}, expected OK"
@@ -563,8 +564,7 @@ def run(keep_success: bool, self_test_failure: bool) -> None:
                 raise SmokeFailure(f"fresh-store UNLOCK did not create {expected_file.name}")
             require_beneath(expected_file, sandbox.root)
 
-        wrong_result, wrong_frame = unlock(control_socket, process.pid, wrong_password)
-        sensitive_values = (*sensitive_values, wrong_frame)
+        wrong_result = unlock(control_socket, process.pid, wrong_frame)
         if wrong_result != DENIED:
             raise SmokeFailure(
                 f"wrong-password UNLOCK returned result {wrong_result}, expected DENIED"
