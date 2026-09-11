@@ -13,17 +13,19 @@ socket-activated daemon. Read [`/README.md`](/README.md) for the provisional
 product spec and inspect the Beads graph before acting.
 
 Your track owns the reusable integration-test harness, not the Rust product
-implementation. The desired end state is a hermetic process group containing:
+implementation. The required baseline is a hermetic process group containing:
 
-1. an isolated D-Bus session broker,
-2. one manually launched `gnome-keyring-daemon`,
-3. a private mode-0700 home/runtime/data tree, and
+1. one manually launched `gnome-keyring-daemon`,
+2. a private mode-0700 home/runtime/data tree,
+3. explicit unreachable scratch addresses for both session and system D-Bus,
+   and
 4. a command or test process that can safely exercise the daemon's control
-   socket and, when useful, inspect Secret Service state over the private bus.
+   socket.
 
-The user specifically wants to explore `dbus-broker`, not merely inherit the
-real user bus. Do not start `gnome-settings-daemon`; the relevant process is
-`gnome-keyring-daemon`.
+The user also wants a later private `dbus-broker` parity layer for Secret
+Service observations. It must never inherit the real user bus, but it is not a
+prerequisite for direct control-socket tests. Do not start
+`gnome-settings-daemon`; the relevant process is `gnome-keyring-daemon`.
 
 ## How to run this work
 
@@ -53,11 +55,13 @@ evidence is useful; do not overwrite unrelated or provisional work.
 - Installed tools presently include `dbus-broker-launch` 37,
   `systemd-socket-activate`, `dbus-run-session`, `dbus-daemon`,
   `gnome-keyring-daemon` 48.0, `gdbus`, and `secret-tool`.
+- Direct control-socket operation does not require D-Bus. The daemon creates
+  its control socket and initializes its internal PKCS#11 store before its
+  non-fatal session-bus setup. The required first harness must therefore
+  poison both bus addresses rather than introduce a broker immediately.
 - `dbus-broker-launch` does **not** create its own listener. Its parent must
   pass exactly one socket using the systemd socket-activation protocol, and
-  `<listen>` entries in a D-Bus config are ignored. A likely spike is
-  `systemd-socket-activate --now --listen=... dbus-broker-launch ...`, but it
-  must be demonstrated rather than assumed.
+  `<listen>` entries in a D-Bus config are ignored.
 - `dbus-broker-launch` uses systemd for D-Bus service activation. The harness
   must not expose host service directories or permit activation of the real
   `org.freedesktop.secrets` service. Prefer a minimal custom bus config and
@@ -66,12 +70,21 @@ evidence is useful; do not overwrite unrelated or provisional work.
   topology cannot create or manipulate host units. If "no host systemd
   contact" is a hard boundary, surface that `dbus-broker-launch` may not meet
   it rather than hiding the caveat or silently falling back.
+- An assessment spike succeeded with `systemd-socket-activate`, a minimal
+  no-activation config, `--scope system`, and `DBUS_SYSTEM_BUS_ADDRESS`
+  redirected to the private bus. On this host, `--scope user` failed with
+  `ENOMEDIUM`, and the launcher also required `/run/systemd/journal/socket`.
+  Reproduce and document these constraints; do not describe this composition
+  as fully hermetic or portable.
 - Upstream GNOME Keyring tests use GLib's `GTestDBus` (normally a private
   `dbus-daemon`) plus scratch directories and a manually launched daemon.
   Those tests are useful prior art, but they do not prove the broker topology.
 - The daemon option is `--control-directory`, not `--control-dir`.
 - On startup, the daemon initializes its internal PKCS#11 stack and attempts
-  session-bus setup. The `secrets` component needs a functioning session bus.
+  session-bus setup. Bus failure is currently non-fatal for the control
+  socket; the `secrets` D-Bus API itself needs a functioning session bus.
+- Do not pass `--components=`. An absent or empty value is replaced with the
+  daemon's default component set.
 - Upstream debug builds honor `GNOME_KEYRING_TEST_PATH`; this installed daemon
   reports `testing: enabled`. That variable is useful corroboration, but it is
   compile-time debug behavior and cannot be the only isolation mechanism.
@@ -86,6 +99,10 @@ evidence is useful; do not overwrite unrelated or provisional work.
 - Source says `CHANGE` creates a missing login keyring using the new password,
   and rejects an empty new password. Record what the installed binary does;
   do not let a source reading substitute for the behavioral test.
+- Control-socket existence is not sufficient readiness. Upstream captures
+  daemon stdout and waits for EOF, which occurs when late initialization
+  redirects stdout to stderr. Combine that EOF with child-liveness and socket
+  type/ownership checks, all under a deadline.
 
 Primary local source is under `~/archive/GNOME/gnome-keyring/`; check it before
 the web. Especially inspect:
@@ -114,18 +131,21 @@ Treat these as acceptance criteria, not aspirations:
   `umask 077`; keep Unix socket path-length limits in mind.
 - Every child receives an explicit environment assembled from the harness
   contract. Do not merely override two variables in the inherited session.
-- Unset or replace `DBUS_SESSION_BUS_ADDRESS`, `GNOME_KEYRING_CONTROL`,
-  `SSH_AUTH_SOCK`, and session-discovery variables before startup. Prevent
-  useful contact with the real system bus as well, unless a test explicitly
-  proves it is harmless and necessary.
+- Set `DBUS_SESSION_BUS_ADDRESS` and `DBUS_SYSTEM_BUS_ADDRESS` to explicit
+  nonexistent sockets under the scratch root for the baseline harness;
+  unsetting them is insufficient because GLib can rediscover host buses.
+- Sanitize inherited `LISTEN_*`, `NOTIFY_SOCKET`, `GNOME_KEYRING_CONTROL`,
+  `SSH_AUTH_SOCK`, `DBUS_STARTER_*`, `DESKTOP_AUTOSTART_ID`, and
+  `XDG_SESSION_ID` before startup.
 - The private bus config must not load standard or host service directories.
   Only the harness launches `gnome-keyring-daemon`.
 - The test daemon's control socket and all keyring files must resolve beneath
   the scratch root. Record the daemon environment and selected paths as
   evidence.
-- Establish readiness with bounded waits and positive checks. File existence
-  alone is not sufficient: prove the broker answers and the intended daemon
-  owns its private bus name and/or accepts the control protocol.
+- Establish readiness with bounded waits and positive checks. For the
+  baseline, require initialization stdout EOF, child liveness, and the
+  expected socket type and owner. For broker parity, additionally prove that
+  the broker answers and the intended daemon owns its private bus names.
 - Manage exact child PIDs or one dedicated process group. Never use broad
   `pkill`, `killall`, or name-based cleanup.
 - On normal and signal exits, send TERM, wait with a deadline, then KILL only
@@ -139,48 +159,39 @@ Treat these as acceptance criteria, not aspirations:
 
 ## Proposed slices
 
-### Slice 0 — reassess and shape tickets
+### Slice 0 — control-only sandbox and smoke test
 
 This is the only slice authorized at kickoff.
 
 1. Read the README, current source, Beads issues, recent `jj` history, upstream
    files listed above, and installed manuals.
-2. Verify the known facts, especially broker socket activation and how to
-   disable host D-Bus activation. Determine whether the launcher's systemd
-   controller connection is compatible with the requested isolation boundary.
-3. Propose the smallest useful harness interface and a dependency graph of
-   human-readable Beads tickets. Search before creating duplicates.
-4. Decide whether `gmell-harness` should become an epic or remain an umbrella
-   task with namespaced children such as bus, daemon, isolation, behavior, and
-   integration. Do not mutate tickets until the human approves the graph.
-5. Report and stop.
+2. Search for duplicate tickets, then make `gmell-harness` a clear umbrella
+   with namespaced children for the control smoke test, lifecycle, behavior,
+   durable integration, and optional broker parity. Preserve dependency
+   direction and commit the exported Beads state separately.
+3. Implement only a per-test scratch sandbox and one real-daemon smoke test.
+   Spawn `gnome-keyring-daemon --foreground --components=secrets` with an
+   explicit scratch control directory and poisoned session/system bus
+   addresses.
+4. Wait for initialization stdout EOF, then verify child liveness plus control
+   socket type and ownership.
+5. Send the credential NUL and one UNLOCK request. Observe first unlock OK and
+   a subsequent wrong password DENIED without logging either password.
+6. Verify `login.keyring` and every writable artifact remain under scratch.
+   Terminate and reap the exact child with a bounded cleanup sequence.
+7. Commit evidence and implementation, report, and stop. Do not add a broker,
+   CLI commands, or the broader behavior matrix in this slice.
 
-### Slice 1 — broker-only spike
+### Slice 1 — lifecycle interface
 
-After approval, create the approved tickets, commit their exported Beads
-state, then make a broker-only experiment under `.test-agent/harness/`.
-Demonstrate a private socket, a minimal no-activation config, a successful
-bus method call, bounded readiness, and clean shutdown. Compare with
-`dbus-daemon` only as a diagnostic baseline; do not silently replace the
-requested broker. Document exact process and FD ownership. Report and stop.
+Turn the successful smoke-test spike into a composable "run this command
+inside the harness" interface. Prefer a domain-grouped location such as
+`dev/harness/` over scattered root scripts. Define exported environment
+variables and exit semantics, implement signal-safe teardown and failure
+artifact retention, and test nesting/parallel execution where practical.
+Report and stop.
 
-### Slice 2 — daemon launch and storage isolation
-
-Launch `gnome-keyring-daemon --foreground --components=secrets` manually on
-the private bus with every data-bearing directory redirected. Prove bus-name
-ownership, control-socket readiness, scratch-local keyring paths, captured
-logs, and no activation race with another secrets service. Do not send an
-unlock password yet. Report and stop.
-
-### Slice 3 — lifecycle interface
-
-Turn the successful spike into a composable "run this command inside the
-harness" interface. Prefer a domain-grouped location such as `dev/harness/`
-over scattered root scripts. Define exported environment variables and exit
-semantics, implement signal-safe teardown and failure artifact retention, and
-test nesting/parallel execution where practical. Report and stop.
-
-### Slice 4 — behavioral probes
+### Slice 2 — broader behavioral probes
 
 Use a minimal disposable probe (Python, shell plus a purpose-built helper, or
 the reviewed Rust transport if it exists by then) to send the credential byte
@@ -198,7 +209,18 @@ Use Secret Service calls only for observation that does not invoke a GUI
 prompt. Keep passwords out of logs. Update factual behavior documentation
 only after collecting evidence. Report and stop.
 
-### Slice 5 — durable test integration
+### Slice 3 — private broker parity
+
+Make a broker-only experiment under `.test-agent/harness/`, reproducing the
+known `systemd-socket-activate` composition before extending it. Demonstrate a
+private socket, a minimal no-activation config, a successful bus method call,
+bounded readiness, and clean shutdown. Then launch the daemon manually on the
+private bus and prove ownership of `org.gnome.keyring` and
+`org.freedesktop.secrets`. Document host systemd/journal dependencies and
+exact process/FD ownership. Compare with `dbus-daemon` only as a diagnostic
+baseline; do not silently replace the requested broker. Report and stop.
+
+### Slice 4 — durable test integration
 
 Promote only the useful pieces from the spike. Give Rust integration tests a
 clear opt-in/tool-availability contract so a missing system daemon is a
@@ -207,7 +229,7 @@ fake-socket transport tests independent of this external-binary harness.
 Run the relevant format, clippy, nextest, shell/static checks, and harness
 tests. Report and stop before closing tickets.
 
-### Slice 6 — documentation and closure
+### Slice 5 — documentation and closure
 
 Reconcile [`/README.md`](/README.md), harness documentation, and Beads
 acceptance criteria with observed behavior. Include troubleshooting and a

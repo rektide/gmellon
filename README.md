@@ -139,13 +139,16 @@ with golden byte vectors — including the `mellon` example above — so the
 wire format is locked by test before any socket is opened.
 
 ### Stage 2 — test harness
-A `dev/` script (or test fixture) that starts an isolated session bus and a
-throwaway `gnome-keyring-daemon --foreground --components=secrets
+A `dev/` script (or test fixture) that starts a throwaway
+`gnome-keyring-daemon --foreground --components=secrets
 --control-directory=<tmp>`, with `HOME` and all XDG directories redirected to
-a mode-0700 scratch tree, and tears down both processes. Activation must not
-be able to reach the user's real session daemon. This empirically validates
-the transport and frame transcription against a real daemon without touching
-the real store. Everything after depends on this.
+a mode-0700 scratch tree and both D-Bus addresses pointed at nonexistent
+scratch sockets. It waits for the daemon's initialization EOF, verifies child
+liveness and the control socket, and performs bounded teardown. This required
+control-only layer validates the transport and frame transcription without
+touching the real store or buses. A private `dbus-broker` composition is a
+later parity layer for Secret Service observations, not a prerequisite for
+control-protocol tests.
 
 The harness track's isolation requirements and reviewed work slices are in
 [`doc/harness/prompt.md`](/doc/harness/prompt.md).
