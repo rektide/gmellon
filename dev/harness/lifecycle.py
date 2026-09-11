@@ -284,13 +284,15 @@ def launch_daemon(
 
 
 def wait_for_initialization_stdout_eof(
-    process: subprocess.Popen[bytes], log: BinaryIO, signals: SignalLatch
+    process: subprocess.Popen[bytes],
+    log: BinaryIO,
+    signals: SignalLatch,
+    deadline: float,
 ) -> bytes:
     if process.stdout is None:
         raise HarnessFailure("daemon stdout was not captured")
     descriptor = process.stdout.fileno()
     output = bytearray()
-    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
     while True:
         signals.raise_if_pending()
         remaining = deadline - time.monotonic()
@@ -363,9 +365,8 @@ def validate_reported_paths(reported: dict[str, str], root: Path) -> None:
 
 
 def wait_for_control_socket(
-    process: subprocess.Popen[bytes], path: Path, signals: SignalLatch
+    process: subprocess.Popen[bytes], path: Path, signals: SignalLatch, deadline: float
 ) -> os.stat_result:
-    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
     while True:
         signals.raise_if_pending()
         return_code = process.poll()
@@ -448,6 +449,14 @@ def terminate_children(
                 return_codes[process.pid] = return_code
         if len(return_codes) < len(children):
             time.sleep(0.02)
+
+    # Close the boundary race where a child exits at the KILL deadline after
+    # the loop's last poll. poll() also performs the final nonblocking reap.
+    for process, _name in children:
+        if process.pid not in return_codes:
+            return_code = process.poll()
+            if return_code is not None:
+                return_codes[process.pid] = return_code
 
     unreaped = [
         f"{name} PID {process.pid}"
@@ -594,7 +603,10 @@ def run_command(
         stdout_stream = sandbox.stdout_log.open("wb")
         stderr_stream = sandbox.stderr_log.open("wb")
         daemon = launch_daemon(executable, sandbox, stderr_stream)
-        startup_output = wait_for_initialization_stdout_eof(daemon, stdout_stream, signals)
+        startup_deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+        startup_output = wait_for_initialization_stdout_eof(
+            daemon, stdout_stream, signals, startup_deadline
+        )
         if daemon.stdout is not None:
             daemon.stdout.close()
         reported = parse_reported_environment(startup_output)
@@ -602,7 +614,7 @@ def run_command(
             raise HarnessFailure("daemon did not report the selected control directory")
         validate_reported_paths(reported, sandbox.root)
         control_metadata = wait_for_control_socket(
-            daemon, sandbox.control / "control", signals
+            daemon, sandbox.control / "control", signals, startup_deadline
         )
         if read_sentinel(sentinel_path) != sentinel_before:
             raise HarnessFailure("external isolation sentinel changed before command launch")
