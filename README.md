@@ -139,6 +139,16 @@ above.
 with golden byte vectors — including the `mellon` example above — so the
 wire format is locked by test before any socket is opened.
 
+### Stage 1.5 — synchronous control transport
+`control::sans_io` exposes the pure codec for alternate adapters. The
+Linux-only `SyncClient` opens one connection per operation, validates the
+socket metadata and connected peer UID, writes the credential NUL and
+zeroizing frame, and reads the response under an absolute deadline. Unix
+validation accepts `Metadata` and `AsFd` rather than depending directly on the
+synchronous stream type. A future `TokioClient` can therefore reuse the codec
+and security checks while replacing only connect/read/write scheduling; sync
+and async are not forced through one trait.
+
 ### Stage 2 — test harness
 A `dev/` script (or test fixture) that starts a throwaway
 `gnome-keyring-daemon --foreground --components=secrets
@@ -181,6 +191,7 @@ for the zsh login hook; `env` (INITIALIZE) exposure.
 | clap v4 (derive) + clap_complete | CLI + completions |
 | rpassword | no-echo TTY prompts |
 | zeroize | clear password and request buffers after use |
+| rustix | effective and peer UID checks |
 | anyhow | errors |
 | tracing (optional, Stage 5) | redacted `-v` operation diagnostics |
 
