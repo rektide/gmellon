@@ -4,7 +4,8 @@
 
 `gmellon` is a small Rust CLI that speaks the gnome-keyring daemon's private
 control protocol directly, so you can **unlock and re-key your login keyring
-from any shell** — no GUI, no PAM, no display server, nothing else running.
+from any shell** — no GUI, no PAM, and no display server. A gnome-keyring
+daemon must be listening on its control socket.
 
 It exists because every other door is shut on a headless, SSH-only machine:
 
@@ -32,7 +33,7 @@ gmellon unlock --stdin < /dev/shm/pw
 # rotate the login keyring password, headlessly (prompts for old + new + confirm)
 gmellon change
 
-# offline inventory: control socket present?, which keyring files exist, lock state
+# offline inventory: control socket present?, which keyring files exist
 gmellon status
 
 # speak to a private/test daemon instead of the session one
@@ -58,6 +59,12 @@ argv is world-readable in `ps`.
 Transport: `AF_UNIX` `SOCK_STREAM` at `<control-dir>/control`,
 default control dir `$XDG_RUNTIME_DIR/keyring`.
 
+Immediately after connecting, the client writes one NUL credential byte. The
+daemon consumes it separately from the frame and verifies that the peer UID
+matches its own (on Linux via `SO_PEERCRED`). This byte is not included in the
+frame length. A client should also verify that the socket and connected peer
+belong to its effective UID before sending a password.
+
 All integers are **u32 big-endian**. Strings are u32 BE length + raw bytes,
 no NUL terminator. The leading length field counts the whole frame,
 including itself.
@@ -81,7 +88,7 @@ response: [u32 total_len][u32 result]
 | FAILED | 2 |
 | NO_DAEMON | 3 |
 
-Example: `unlock` with password `mellon`:
+Example: `unlock` with password `mellon` (after the credential byte):
 
 ```
 send: 00 00 00 12  00 00 00 01  00 00 00 06  6d 65 6c 6c 6f 6e
@@ -111,6 +118,8 @@ recv: 00 00 00 08  00 00 00 00
   speak to it. Same trust boundary PAM already has.
 - Works happily against the systemd socket-activated daemon (we are just
   another client connecting to `<dir>/control`).
+- Password-bearing request frames must never be logged or hexdumped. Verbose
+  diagnostics may report the operation, lengths, socket path, and result only.
 
 ## Development (readme-driven)
 
@@ -129,16 +138,19 @@ with golden byte vectors — including the `mellon` example above — so the
 wire format is locked by test before any socket is opened.
 
 ### Stage 2 — test harness
-A `dev/` script (or test fixture) that starts a throwaway
-`gnome-keyring-daemon --foreground --components=secrets --control-dir=<tmp>`
-with `HOME`/`XDG_DATA_HOME` redirected to a scratch dir, and tears it down.
-This empirically validates the frame transcription against a real daemon
-with zero risk to the real store. Everything after depends on this.
+A `dev/` script (or test fixture) that starts an isolated session bus and a
+throwaway `gnome-keyring-daemon --foreground --components=secrets
+--control-directory=<tmp>`, with `HOME` and all XDG directories redirected to
+a mode-0700 scratch tree, and tears down both processes. Activation must not
+be able to reach the user's real session daemon. This empirically validates
+the transport and frame transcription against a real daemon without touching
+the real store. Everything after depends on this.
 
 ### Stage 3 — `unlock`
-Socket connect, send UNLOCK, parse result, exit codes, TTY prompt
-(`rpassword`), `--stdin`, the `--allow-create` guard. Integration test via
-the Stage 2 harness: create → unlock → wrong-password → DENIED.
+Socket and peer ownership checks, connect, credential-byte handshake, send
+UNLOCK, parse result, exit codes, TTY prompt (`rpassword`), `--stdin`, and the
+`--allow-create` guard. Integration test via the Stage 2 harness: create →
+unlock → wrong-password → DENIED.
 
 ### Stage 4 — `change`
 Same frame machinery, two strings. Harness test: unlock with A, change
@@ -146,9 +158,9 @@ A→B, unlock with B, unlock with A → DENIED. Nail down missing-keyring
 behavior here.
 
 ### Stage 5 — polish
-`status` (offline: socket stat, keyring dir inventory), `-v` hexdump of
-frames via `tracing`, `clap_complete` shell completions, manpage-grade
-`--help`.
+`status` (offline: socket stat, keyring dir inventory), redacted `-v`
+diagnostics via `tracing`, `clap_complete` shell completions, and
+manpage-grade `--help`.
 
 ### Stage 6 — stretch (only if wanted)
 `lock` via the Secret Service D-Bus call (zbus) for symmetry; wrapper docs
@@ -174,6 +186,8 @@ Upstream source (canonical, version-observed: gnome-keyring 48.0 / gcr
 - [GNOME/gnome-keyring `daemon/control/gkd-control-client.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/control/gkd-control-client.c) — frame construction, `gkd_control_unlock` / `gkd_control_change_lock`
 - [GNOME/gnome-keyring `daemon/control/gkd-control-server.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/control/gkd-control-server.c) — dispatch: `OP_UNLOCK → control_unlock_login → gkd_login_unlock`
 - [GNOME/gnome-keyring `egg/egg-buffer.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/egg/egg-buffer.c) — big-endian u32, length-prefixed strings
+- [GNOME/gnome-keyring `egg/egg-unix-credentials.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/egg/egg-unix-credentials.c) — the pre-frame credential byte and peer credential lookup
+- [GNOME/gnome-keyring `pam/gkr-pam-client.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/pam/gkr-pam-client.c) — hardened client checks, handshake, frame I/O, and result mapping
 - [GNOME/gnome-keyring `daemon/login/gkd-login.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/login/gkd-login.c) — `login` specialness, unlock-**or-create**
 - [GNOME/gnome-keyring `pkcs11/secret-store/gkm-secret-module.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/pkcs11/secret-store/gkm-secret-module.c) — keyring identity = filename stem
 - [GNOME/gnome-keyring `daemon/gkd-main.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/gkd-main.c) — why bare `--unlock` doesn't forward to a running daemon
