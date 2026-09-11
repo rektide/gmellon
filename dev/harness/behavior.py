@@ -524,6 +524,7 @@ def write_scenario_evidence(
     context: InstalledContext,
     result: ScenarioResult,
     shutdown: list[lifecycle.ChildShutdown],
+    artifact_scan_passed: bool | None,
 ) -> None:
     document = {
         "scenario": result.name,
@@ -542,7 +543,7 @@ def write_scenario_evidence(
         "redaction": {
             "passwords_recorded": False,
             "request_frames_recorded": False,
-            "artifact_scan_passed": True,
+            "artifact_scan_passed": artifact_scan_passed,
         },
     }
     (sandbox.root / "behavior.json").write_text(
@@ -592,11 +593,25 @@ def run_scenario(
             if observations is not None:
                 result = ScenarioResult(name, observations, daemon.generations)
                 write_scenario_evidence(
-                    sandbox, executable, context, result, daemon.shutdown
+                    sandbox,
+                    executable,
+                    context,
+                    result,
+                    daemon.shutdown,
+                    artifact_scan_passed=None,
                 )
             if lifecycle.read_sentinel(sentinel_path) != sentinel_before:
                 raise BehaviorFailure("external sentinel changed during owned cleanup")
             sensitive.scan_artifacts(sandbox.root)
+            if observations is not None:
+                write_scenario_evidence(
+                    sandbox,
+                    executable,
+                    context,
+                    result,
+                    daemon.shutdown,
+                    artifact_scan_passed=True,
+                )
         except BaseException as error:
             if cleanup_failure is None:
                 cleanup_failure = error

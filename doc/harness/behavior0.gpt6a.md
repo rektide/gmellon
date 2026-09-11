@@ -145,9 +145,11 @@ environment. The probe registers each generated password and complete
 password-bearing request frame before exchange, emits only operation/result
 labels, scans **every regular retained file** under each scenario root after
 owned cleanup, and overwrites its mutable password/frame buffers before
-return. Five consecutive complete runs plus the black-box retained-artifact
-test passed this scan. Python and allocator copies remain best-effort rather
-than a memory-erasure guarantee.
+return. `behavior.json` records the scan as pending until that scan succeeds,
+then rewrites only the marker to `true`; a retained failed run therefore cannot
+self-attest successful redaction. Five consecutive complete runs plus the
+black-box retained-artifact test passed this scan. Python and allocator copies
+remain best-effort rather than a memory-erasure guarantee.
 
 ## Reproduction and verification
 
