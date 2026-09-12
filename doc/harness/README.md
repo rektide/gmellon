@@ -30,13 +30,12 @@ The control-only core chain is complete: the smoke proof, reusable lifecycle,
 installed behavior matrix, and durable Rust-test integration are all
 implemented, reviewed, and closed with version-scoped evidence under
 [Contract, implementation, and evidence](#contract-implementation-and-evidence).
-Private `dbus-broker` coverage was originally optional parity and has been
-promoted to required infrastructure for the approved zbus Secret Service
-product backend (Beads `gmell-harness-broker`, in progress). Its lifecycle,
-interface proof, and the multi-collection product-client proof
-(`collections0.glm53max.md`) are implemented; it remains a sibling topology
-that does not block these control-socket tests or the closure of the
-control-only harness. See [Private-broker profile](#private-broker-profile).
+Private `dbus-broker` coverage was originally optional parity and was promoted
+to required infrastructure for the approved zbus Secret Service product
+backend. Its lifecycle, interface proof, multi-collection client proof, and
+binary `list`/`unlock`/`change` proofs are implemented, independently reviewed,
+and closed. It remains a sibling topology that does not block the control-only
+harness. See [Private-broker profile](#private-broker-profile).
 
 ## Guide map
 
@@ -183,7 +182,8 @@ searching a caller-controlled daemon path.
 
 The private-broker profile additionally requires `systemd-socket-activate`,
 `dbus-broker-launch`, and `gdbus` in `/usr/bin:/bin`, a running host systemd
-runtime at `/run/systemd/system`, and `/run/systemd/journal/socket`. The Rust
+runtime at `/run/systemd/system`, `/run/systemd/journal/socket`, and
+`/run/dbus/system_bus_socket`. The Rust
 broker proofs additionally require `busctl` and `stdbuf` there for their
 match-filtered Lock-call monitor. These dependencies are launcher/monitor
 constraints even though the private config defines no activatable services.
@@ -260,10 +260,13 @@ The private-broker command additionally receives:
 
 The daemon receives only the private XDG/bus baseline; it does not receive the
 `GMELL_HARNESS_*` command contract. In broker mode the daemon and command keep
-`DBUS_SYSTEM_BUS_ADDRESS` on the unreachable scratch path. The broker launcher
-alone receives both bus variables pointed at the private listener, matching
-the successful assessed `--scope=system` composition while preventing an
-environmental route to either real host bus.
+`DBUS_SYSTEM_BUS_ADDRESS` on the unreachable scratch path. However,
+`systemd-socket-activate` strips that variable before exec: the broker launcher
+connects to the real system bus and subscribes to the host systemd manager.
+This contact is an explicit host dependency, not an isolation control. Host
+service activation remains disabled by the stronger measured invariant: the
+private broker config has no service directories and
+`ListActivatableNames` contains only `org.freedesktop.DBus`.
 
 ### Passing selected host values
 

@@ -39,6 +39,20 @@ same-user bus boundary temporarily. The `gmell-encrypted-session` ticket tracks
 encrypted DH/AES sessions as a release blocker; publishing must wait for that
 proof.
 
+Current implementation, verification, security boundaries, and remaining work
+are summarized in [`doc/status.md`](/doc/status.md).
+
+### Backend policy
+
+The collection-oriented zbus client is the default product backend. The proven
+login control socket will remain available through the planned Cargo feature
+`login-control`, disabled by default (`gmell-login-control-feature`). That
+backend will be named `LoginControlClient` and expose login-specific methods;
+it will never be an automatic fallback. Its inability to address other
+collections or distinguish an already-unlocked keyring, plus its create-on-
+missing UNLOCK/CHANGE behavior, must remain visible at its API and any explicit
+CLI selection point.
+
 ## Usage (spec)
 
 ```
@@ -93,9 +107,9 @@ the TTY prompt fails with an actionable error suggesting `--stdin`.
 ## Historical login-only control protocol
 
 The first implementation used GNOME Keyring's private control socket. It is
-retained temporarily as tested historical machinery, but it can address only
-the special `login` collection and is not the collection-oriented product
-backend.
+retained as tested machinery and will be packaged behind the optional
+`login-control` Rust feature. It can address only the special `login`
+collection and is not the default collection-oriented product backend.
 
 Transport: `AF_UNIX` `SOCK_STREAM` at `<control-dir>/control`,
 default control dir `$XDG_RUNTIME_DIR/keyring`.
@@ -172,21 +186,22 @@ recv: 00 00 00 08  00 00 00 00
 
 ## Development (readme-driven)
 
-This README is the spec. Stages land in order; each is independently
-committable and testable. Sizes are honest: the whole tool is ~300–500 LOC.
-The staging exists to de-risk verification, not because the work is big.
+This README is the spec. Stages land in independently committable and testable
+increments. The maintained harness and evidence are intentionally more
+substantial than the small product path because they prove isolation,
+lifecycle, and secret-handling claims against real external processes.
 
 ### Stage 0 — scaffold
 `cargo init`, clap v4 derive skeleton with stub subcommands, `.gitignore`,
 clippy + rustfmt clean, nextest wired. `gmellon --help` prints the spec
 above.
 
-### Stage 1 — login control codec (superseded)
+### Stage 1 — login control codec (optional-backend foundation)
 `protocol.rs`: op/result enums, frame + string encode/decode. Unit tests
 with golden byte vectors — including the `mellon` example above — so the
 wire format is locked by test before any socket is opened.
 
-### Stage 1.5 — login control transport (superseded)
+### Stage 1.5 — login control transport (optional-backend foundation)
 `control::sans_io` exposes the pure codec for alternate adapters. The
 Linux-only `SyncClient` opens one connection per operation, validates the
 socket metadata and connected peer UID, writes the credential NUL and
@@ -285,6 +300,9 @@ Upstream source (canonical, version-observed: gnome-keyring 48.0 / gcr
 - [GNOME/gnome-keyring `daemon/login/gkd-login.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/login/gkd-login.c) — `login` specialness, unlock-**or-create**
 - [GNOME/gnome-keyring `pkcs11/secret-store/gkm-secret-module.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/pkcs11/secret-store/gkm-secret-module.c) — keyring identity = filename stem
 - [GNOME/gnome-keyring `daemon/gkd-main.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/gkd-main.c) — why bare `--unlock` doesn't forward to a running daemon
+- [GNOME/gnome-keyring private D-Bus interface](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/dbus/org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface.xml) — collection-targeted password methods
+- [GNOME/gnome-keyring `daemon/dbus/gkd-secret-service.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/dbus/gkd-secret-service.c) — private method dispatch and collection lookup
+- [GNOME/gnome-keyring `daemon/dbus/gkd-secret-unlock.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/dbus/gkd-secret-unlock.c) — collection credential attachment and already-unlocked shortcut
 - [GNOME/gcr `gcr/gcr-ssh-agent-service.c`](https://gitlab.gnome.org/GNOME/gcr/-/blob/main/gcr/gcr-ssh-agent-service.c) — the `unique=ssh-store:<path>` passphrase-item convention (why unlocking matters for ssh)
 
 Local checkouts (same content, no network):
