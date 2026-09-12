@@ -7,6 +7,9 @@ manually launched `gnome-keyring-daemon` while redirecting keyring storage and
 normal desktop discovery away from the user's session. This is a cooperative
 test boundary, not access control against the command itself.
 
+For project-wide implementation state, backend policy, release blockers, and
+next work, see [`/doc/status.md`](/doc/status.md).
+
 The harness currently provides six executable entry points:
 
 - [`dev/harness/smoke.py`](/dev/harness/smoke.py) proves one isolated
