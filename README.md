@@ -54,9 +54,11 @@ gmellon unlock work
 # scripting: read a single line (sans newline) from stdin
 gmellon unlock work --stdin < /dev/shm/pw
 
-# Stage 4, not yet implemented: rotate a collection password
-# (prompts for old + new + confirm)
+# rotate a collection password (prompts for old + new + confirm)
 gmellon change work
+
+# scripting: current, new, and confirmation lines in that order
+gmellon change work --stdin < /dev/shm/password-change
 
 # already-unlocked collections return success without checking the password;
 # ordinary unlock never locks or relocks a collection to verify it
