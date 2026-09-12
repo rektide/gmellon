@@ -22,7 +22,8 @@ The harness currently provides six executable entry points:
   a plain Secret Service session and proves GNOME's private collection-password
   interface is exposed, without making a password call.
 - [`dev/harness/check`](/dev/harness/check) is the maintained explicit check
-  entry point for Rust, control-only Python, and private-broker checks.
+  entry point for Rust, control-only Python, and private-broker checks,
+  including the multi-collection Rust proof (`rust-broker` mode).
 
 The control-only core chain is complete: the smoke proof, reusable lifecycle,
 installed behavior matrix, and durable Rust-test integration are all
@@ -30,11 +31,11 @@ implemented, reviewed, and closed with version-scoped evidence under
 [Contract, implementation, and evidence](#contract-implementation-and-evidence).
 Private `dbus-broker` coverage was originally optional parity and has been
 promoted to required infrastructure for the approved zbus Secret Service
-product backend (Beads `gmell-harness-broker`, in progress). Its lifecycle and
-interface proof are implemented at this checkpoint; it remains a
-sibling topology that does not block these control-socket tests or the closure
-of the control-only harness. See
-[Private-broker profile](#private-broker-profile).
+product backend (Beads `gmell-harness-broker`, in progress). Its lifecycle,
+interface proof, and the multi-collection product-client proof
+(`collections0.glm53max.md`) are implemented; it remains a sibling topology
+that does not block these control-socket tests or the closure of the
+control-only harness. See [Private-broker profile](#private-broker-profile).
 
 ## Guide map
 
@@ -50,7 +51,7 @@ for how that authority divides:
 | Change lifecycle mechanics | [Lifecycle state model](#lifecycle-state-model), then [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) and its [focused tests](/dev/harness/tests/test_lifecycle.py) |
 | Run or inspect daemon behavior coverage | [Quick start](#quick-start), [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md), and [Evolution guidance](#evolution-guidance) |
 | Integrate with Rust or CI | [Durable test integration](#durable-test-integration) and [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md) |
-| Run collection-oriented Secret Service tests | [Private-broker interface](#private-broker-interface), [Private-broker profile](#private-broker-profile), and [`broker0.gpt6a.md`](/doc/harness/broker0.gpt6a.md) |
+| Run collection-oriented Secret Service tests | [Private-broker interface](#private-broker-interface), [Private-broker profile](#private-broker-profile), [`broker0.gpt6a.md`](/doc/harness/broker0.gpt6a.md), and [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md) |
 
 The supported reusable surfaces are the two executable command interfaces and
 their exported environments. Importable Python names in `lifecycle.py` and
@@ -90,6 +91,12 @@ Run the focused plain-session/private-interface proof:
 
 ```sh
 dev/harness/check broker
+```
+
+Run the maintained Rust multi-collection proof against the private bus:
+
+```sh
+dev/harness/check rust-broker
 ```
 
 See either complete executable contract without allocating a sandbox:
@@ -166,10 +173,12 @@ searching a caller-controlled daemon path.
 
 The private-broker profile additionally requires `systemd-socket-activate`,
 `dbus-broker-launch`, and `gdbus` in `/usr/bin:/bin`, a running host systemd
-runtime at `/run/systemd/system`, and `/run/systemd/journal/socket`. The latter
-dependencies are launcher constraints even though the private config defines
-no activatable services. This profile is not portable to a host without those
-facilities and must not silently substitute `dbus-daemon` or the real bus.
+runtime at `/run/systemd/system`, and `/run/systemd/journal/socket`. The Rust
+multi-collection proof additionally requires `busctl` and `stdbuf` there for
+its match-filtered Lock-call monitor. These dependencies are launcher/monitor
+constraints even though the private config defines no activatable services.
+This profile is not portable to a host without those facilities and must not
+silently substitute `dbus-daemon` or the real bus.
 
 ## Private-broker interface
 
@@ -534,9 +543,10 @@ A private-broker command should additionally use the exported explicit
 `DBUS_SESSION_BUS_ADDRESS` (or `GMELL_HARNESS_BUS_SOCKET`) and must not invoke
 service activation as a substitute for the manually owned daemon. Capability
 probes may open a plain session and introspect the private interface. Product
-behavior tests may eventually call password methods only with disposable
-fixtures and reviewed redaction; they must never lock an already-unlocked
-collection as password verification.
+behavior tests call password methods only with disposable fixtures and
+reviewed redaction, as the Rust multi-collection proof now does; they must
+never lock an already-unlocked collection as password verification, and any
+Lock call belongs to fixture setup under a separately attributed connection.
 
 The lifecycle command interface still starts one daemon per invocation. A
 command must not simulate a restart by killing it: every pre-teardown daemon
@@ -648,8 +658,26 @@ ownership, command-failure retention/redaction, signal teardown, and parallel
 instances. Direct unittest invocation may skip on a host without the required
 facilities, but the explicit wrapper always classifies that as setup failure.
 
-`dev/harness/check all` runs explicit Rust real-daemon tests, the control-only
-Python workflow, and this private-broker workflow.
+The maintained Rust multi-collection proof is:
+
+```sh
+dev/harness/check rust-broker
+```
+
+It additionally preflights `busctl` and `stdbuf`, then runs the ignored
+[`tests/harness/broker_collections.rs`](/tests/harness/broker_collections.rs)
+proof under `broker.py`. The proof's zbus fixture performs the only permitted
+mutation setup — private `CreateWithMasterPassword` plus counted standard
+`Lock` calls on disposable collections — while every assertion runs through
+the public `BlockingClient`. A match-filtered `busctl monitor` proves ordinary
+unlock/change never emits a standard Lock call; generated passwords are
+zeroized, excluded from monitor output by the match rule, and scanned out of
+every retained artifact. See
+[`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md).
+
+`dev/harness/check all` runs explicit Rust real-daemon tests, the Rust
+multi-collection proof, the control-only Python workflow, and this
+private-broker workflow.
 
 ### Complete static and Rust checks
 
@@ -672,6 +700,7 @@ python3 -m unittest -v \
 dev/harness/behavior.py
 dev/harness/smoke.py
 dev/harness/broker.py -- dev/harness/private_bus_probe.py
+cargo nextest run --test broker_collections --run-ignored ignored-only
 
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
@@ -763,6 +792,7 @@ one kind of truth:
 | [`dev/harness/private_bus_probe.py`](/dev/harness/private_bus_probe.py) | Non-password plain-session and private-interface capability proof |
 | [`dev/harness/check`](/dev/harness/check) | Maintained explicit prerequisite and check composition; delegates lifecycle/process orchestration |
 | [`tests/harness/real_daemon.rs`](/tests/harness/real_daemon.rs) | Ignored Rust integration boundary and real `SyncClient` assertions |
+| [`tests/harness/broker_collections.rs`](/tests/harness/broker_collections.rs) | Ignored Rust multi-collection proof under the private broker: zbus fixture setup plus `BlockingClient` behavior and no-relock wire evidence |
 | [`dev/harness/tests/test_lifecycle.py`](/dev/harness/tests/test_lifecycle.py) | Executable acceptance coverage for lifecycle invariants and races |
 | [`dev/harness/behavior.py`](/dev/harness/behavior.py) and its [black-box test](/dev/harness/tests/test_behavior.py) | Reproducible installed-daemon control matrix plus explicit behavior-owned restart/fault transitions |
 | [`smoke0.gpt6a.md`](/doc/harness/smoke0.gpt6a.md) | Version-scoped installed-daemon evidence for the first UNLOCK/denial path and exact-PID cleanup; evidence, not timeless daemon promises |
@@ -770,6 +800,7 @@ one kind of truth:
 | [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md) | Version-scoped UNLOCK, CHANGE, restart, empty-password, stopped, and unresponsive observations; evidence, not timeless daemon promises |
 | [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md) | Version-scoped durable entry-point, skip/fail, Rust transport, parallel-isolation, and retained-artifact evidence |
 | [`broker0.gpt6a.md`](/doc/harness/broker0.gpt6a.md) | Version-scoped private broker, daemon name ownership, plain-session/interface, host-dependency, failure-retention, and cleanup evidence |
+| [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md) | Version-scoped multi-collection `BlockingClient` proof: stable-ID unlock/change, fixture-only locking, no-relock monitor evidence, and secret-handling limits |
 | [`prompt.md`](/doc/harness/prompt.md) | Epic safety invariants, upstream facts, ticket boundaries, and the original work graph, plus a completion-status section; planned acceptance, not completion evidence |
 | Product [`README.md`](/README.md) | Product contract, private wire protocol, and the unlock-or-create hazard that motivates real-daemon testing; not the harness lifecycle contract |
 | Beads graph | Review and work status; not runtime behavior |
@@ -862,11 +893,17 @@ prevent startup on a host, report that limitation rather than using the real
 bus or substituting `dbus-daemon`. Broker mechanics stay outside Rust product
 dependencies.
 
-The next coherent slice is product-level collection fixture coverage: create
-at least two disposable collections under this private daemon, restart only
-supervisor-owned disposable daemon generations when fixture setup requires it,
-and exercise the product zbus client against stable collection IDs. Ordinary
-unlock must first inspect lock state and return already-unlocked without
+The next coherent slice was product-level collection fixture coverage; it is
+now implemented as
+[`tests/harness/broker_collections.rs`](/tests/harness/broker_collections.rs)
+with version-scoped evidence in
+[`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md). The
+proof creates at least two disposable collections under the private daemon
+through fixture-only private creation plus counted standard locks, exercises
+the product zbus client against stable collection IDs, and demonstrates that
+ordinary unlock inspects lock state and returns already-unlocked without
 locking, relocking, or pretending to verify the supplied password. Password
-methods should be invoked only for an actually locked fixture, with generated
-values excluded from logs, argv, environment, and retained artifacts.
+methods are invoked only for actually locked fixtures, with generated values
+excluded from logs, argv, environment, and retained artifacts, and a
+match-filtered monitor attributing every standard Lock call to the fixture
+connection.
