@@ -233,6 +233,18 @@ The five tests cover strict private environment and no-activation evidence,
 plain session/interface introspection, retained redacted command failure,
 parallel paths/processes, and signal-time exact teardown.
 
+The final maintained aggregate also passed:
+
+```text
+$ dev/harness/check all
+real-daemon Rust transport: 2 passed, 0 skipped
+control-only Python focused suite: 10 passed
+installed behavior matrix: PASS
+control-socket smoke: PASS
+private-broker focused suite: 5 passed
+plain-session/private-interface smoke: PASS
+```
+
 ## What this enables and what remains
 
 It is now possible to run a zbus or other explicitly addressed command against
