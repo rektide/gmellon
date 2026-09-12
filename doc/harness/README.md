@@ -578,9 +578,12 @@ cargo test
 cargo nextest run
 ```
 
-Cargo reports two tests as `ignored`; nextest reports two as `skipped`. The
-pure codec unit tests and fake Unix-socket transport tests remain in the
-ordinary run and never invoke Python or a system daemon. Do not select only the
+Cargo reports four tests as `ignored` — two real-daemon control-protocol
+tests plus one ignored proof per broker target; nextest reports the same
+four as `skipped`. The pure codec unit tests, the fake Unix-socket transport
+tests, and the `redaction_scan` positive controls for the shared secret
+scanner and streaming monitor parser remain in the ordinary run and never
+invoke Python or a system daemon. Do not select only the
 ignored test binary without `--run-ignored`: nextest correctly returns its
 "no tests to run" status in that narrowed case.
 
@@ -722,14 +725,19 @@ missing collection exits 1 before stdin is read, established by the
 `/dev/null` ordering argument; and the sibling collection's password is
 proven untouched. Because the change-call match rule selects
 password-bearing bodies — and this host's `busctl monitor` decodes matched
-bodies into recoverable `BYTE` dumps — that monitor's raw log is
-secret-scanned in literal, hex, and byte-dump form and deleted after the
-header-derived count is retained, on failure paths as well as success.
-Captured CLI stdout/stderr and every retained regular artifact are scanned
-for all generated passwords in those same forms, and the match-filtered
-Lock monitor attributes every standard Lock call to the fixture connection,
-so no CLI path locks or relocks. Python remains lifecycle and check wiring
-only. See [`cli0.glm53max.md`](/doc/harness/cli0.glm53max.md) and
+bodies into recoverable `BYTE` dumps — that monitor never writes its output
+to disk: stdout is a pipe drained by an owned reader thread that records
+only header-derived facts (method-call count and sender unique names) and
+discards every other line, including decoded bodies, as it is read. Header
+parsing is pinned to the installed busctl header shape and fails closed on
+malformed or ambiguous headers; the banner-only stderr readiness log is the
+one file that monitor keeps, deleted after the header-derived summary is
+written. Captured CLI stdout/stderr and every retained regular artifact are
+scanned for all generated passwords in those same forms, and the
+match-filtered Lock monitor attributes every standard Lock call to the
+fixture connection, so no CLI path locks or relocks. Python remains
+lifecycle and check wiring only. See
+[`cli0.glm53max.md`](/doc/harness/cli0.glm53max.md) and
 [`change0.glm53max.md`](/doc/harness/change0.glm53max.md).
 
 Both broker proofs share their fixture, monitor, secret, and runner machinery
@@ -774,8 +782,9 @@ cargo nextest run
 There is currently no tracked CI configuration in this repository. Operator
 policy is therefore explicit rather than presented as an existing CI job:
 
-1. ordinary development runs full `cargo nextest run`, whose summary must show
-   the two omitted real-daemon tests as skipped;
+1. ordinary development runs full `cargo nextest run`, whose summary must
+   show the four omitted real-daemon and private-broker proof tests as
+   skipped;
 2. a provisioned Linux integration environment runs `dev/harness/check all`;
 3. missing prerequisites in that explicitly provisioned run are setup
    failures, never allowed skips; and
@@ -867,7 +876,7 @@ one kind of truth:
 | [`broker0.gpt6a.md`](/doc/harness/broker0.gpt6a.md) | Version-scoped private broker, daemon name ownership, plain-session/interface, host-dependency, failure-retention, and cleanup evidence |
 | [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md) | Version-scoped multi-collection `BlockingClient` proof: stable-ID unlock/change, fixture-only locking, no-relock monitor evidence, and secret-handling limits |
 | [`cli0.glm53max.md`](/doc/harness/cli0.glm53max.md) | Version-scoped CLI binary proof: `gmellon list` determinism, default/explicit unlock exit semantics, no-read already-unlocked evidence, and secret scans |
-| [`change0.glm53max.md`](/doc/harness/change0.glm53max.md) | Version-scoped change CLI binary proof: three-line stdin contract, no-private-call wire evidence for input rejections, exit 2/0 rotation semantics, locked-change daemon behavior, and encoded-secret scan handling |
+| [`change0.glm53max.md`](/doc/harness/change0.glm53max.md) | Version-scoped change CLI binary proof: three-line stdin contract, no-private-call wire evidence for input rejections, exit 2/0 rotation semantics, locked-change daemon behavior, and the never-on-disk streaming policy for the password-bearing monitor |
 | [`prompt.md`](/doc/harness/prompt.md) | Epic safety invariants, upstream facts, ticket boundaries, and the original work graph, plus a completion-status section; planned acceptance, not completion evidence |
 | Product [`README.md`](/README.md) | Product contract, private wire protocol, and the unlock-or-create hazard that motivates real-daemon testing; not the harness lifecycle contract |
 | Beads graph | Review and work status; not runtime behavior |
@@ -990,11 +999,15 @@ further proof slices extend instead of duplicating it.
 
 The change slice extends that binary proof to `gmellon change`, with
 version-scoped evidence in
-[`change0.glm53max.md`](/doc/harness/change0.glm53max.md). Its new
-wire-evidence tool — a monitor matching the password-bearing private
-`ChangeWithMasterPassword` member — is deliberately held to a stricter
-artifact policy than the body-excluding Lock monitor: raw output is scanned
-for secrets in literal, hex, and decoded byte-dump form, then deleted on
-both success and failure paths, and only header-derived counts are
-retained. Keep that split policy for any future monitor whose match rule
-selects password-bearing bodies.
+[`change0.glm53max.md`](/doc/harness/change0.glm53max.md) (including its GX
+hardening addendum). Its wire-evidence tool — a monitor matching the
+password-bearing private `ChangeWithMasterPassword` member — is deliberately
+held to a stricter artifact policy than the body-excluding Lock monitor:
+its stdout is a pipe consumed by an owned streaming reader that retains only
+header-derived counts and sender names, so password-bearing output never
+exists on disk in any form — not on success, not on failure paths, not
+through a panic unwind or abrupt teardown. Header parsing is pinned to the
+installed busctl shape, fails closed on malformed or ambiguous headers, and
+is covered by the ordinary `redaction_scan` positive controls together with
+the scanner's detection side. Keep that split policy for any future monitor
+whose match rule selects password-bearing bodies.
