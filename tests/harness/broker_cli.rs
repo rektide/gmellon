@@ -26,7 +26,8 @@
 //! stdout/stderr and retained artifacts are scanned for every generated
 //! password, a match-filtered monitor attributes every standard Lock call to
 //! the fixture (ordinary CLI paths never lock or relock), and the
-//! password-bearing change monitor's raw output is deleted after counting.
+//! password-bearing change monitor counts method-call headers streamed from
+//! a pipe — its raw output never exists on disk.
 //!
 //! Ordinary `cargo test` and `cargo nextest run` visibly skip this proof. The
 //! maintained explicit entry point is `dev/harness/check rust-cli`.
@@ -112,8 +113,9 @@ fn run_proof(secrets: &ProofSecrets) {
 
     // The private change-call monitor is armed just as early so its count is
     // exhaustive over the whole run. Its match rule selects
-    // password-bearing bodies, so the raw log is deleted the moment the
-    // header-derived summary is extracted — never retained.
+    // password-bearing bodies, so its stdout is streamed from a pipe and
+    // only header-derived facts are retained — raw output never reaches
+    // disk in any form.
     let change_monitor = MethodMonitor::change_calls(&bus.address, &bus.root);
 
     // Fixture connection: separate D-Bus unique name from the product binary,

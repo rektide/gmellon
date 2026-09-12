@@ -24,3 +24,7 @@ path = "tests/harness/broker_collections.rs"
 [[test]]
 name = "broker_cli"
 path = "tests/harness/broker_cli.rs"
+
+[[test]]
+name = "redaction_scan"
+path = "tests/harness/redaction_scan.rs"

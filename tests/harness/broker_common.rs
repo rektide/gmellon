@@ -9,10 +9,15 @@
 //! permitted mutation setup (private `CreateWithMasterPassword` plus counted
 //! standard `Lock` calls), the match-filtered method-call monitors (standard
 //! `Service.Lock` for fixture-attributed locking, plus the password-bearing
-//! private `ChangeWithMasterPassword` rule whose raw output is deleted after
-//! header-derived counting), disposable proof secrets, and the outer isolated
+//! private `ChangeWithMasterPassword` rule whose stdout is consumed by a
+//! streaming reader that retains only header-derived facts and never writes
+//! a raw log to disk), disposable proof secrets, and the outer isolated
 //! runner. Include `mod common;` and
 //! `mod broker_common;` together: this module builds on [`common`].
+//!
+//! The streaming header parser [`HeaderCallParser`] is pinned against the
+//! installed busctl monitor shape by the ordinary positive-control tests in
+//! [`tests/harness/redaction_scan.rs`](../redaction_scan.rs).
 //!
 //! This file is compiled only as a module of the declared `[[test]]`
 //! targets; Cargo does not discover it as a separate test.
@@ -21,9 +26,10 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
@@ -49,9 +55,12 @@ pub const LOCK_MATCH: &str = "interface='org.freedesktop.Secret.Service',member=
 /// `ChangeWithMasterPassword` method calls. Unlike the Lock rule this one
 /// selects password-bearing bodies by design — counting method-call headers
 /// is the only wire evidence that a confirmation mismatch never reached the
-/// daemon — so its raw log carries secrets in busctl's decoded forms, is
-/// always deleted after the header-derived summary is extracted, and is
-/// deleted (not retained) on failure paths too.
+/// daemon — so its stdout is consumed by an owned streaming reader that
+/// records only header-derived facts (count and sender unique names) and
+/// discards every other line, including bodies, as it is read. Decoded
+/// password bytes therefore transit the pipe and the reader's single reused
+/// line buffer only: no raw change-monitor output ever exists on disk, in
+/// any form, on success, failure, or abrupt teardown.
 pub const CHANGE_MATCH: &str = "interface='org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface',member='ChangeWithMasterPassword'";
 pub const MONITOR_BANNER: &str = "Monitoring bus message stream.";
 
@@ -246,16 +255,29 @@ impl Fixture {
 /// bodies. Two policies cover the proof's two rules:
 ///
 /// - the standard `Service.Lock` rule excludes every password-bearing body,
-///   so its raw log is asserted secret-free (in bytes and reversible
-///   encodings) before deletion, and is left in place on failure paths;
+///   so its raw log is a file that is asserted secret-free (in bytes and
+///   reversible encodings) after the run and deleted once the summary is
+///   extracted; on failure paths it is retained for the artifact walk;
 /// - the private `ChangeWithMasterPassword` rule selects password-bearing
-///   bodies by design, so its raw log is never asserted secret-free: it is
-///   deleted on both success and failure paths, and the fail-closed walk
-///   over retained artifacts proves no encoding survived anywhere.
+///   bodies by design, so its stdout is never a file: it is a pipe drained
+///   by an owned reader thread ([`HeaderCallParser`]) that records only
+///   header-derived facts and drops every other line immediately. No raw
+///   output exists on disk in any form, so no failure path — panic unwind,
+///   reader error, malformed header, shutdown failure, abrupt signal — can
+///   retain a password-bearing file either.
 pub struct MethodMonitor {
     child: Child,
-    log_path: PathBuf,
+    /// Raw stdout log, present only for body-excluding rules. Always `None`
+    /// for password-bearing rules, whose output never touches the
+    /// filesystem.
+    log_path: Option<PathBuf>,
     ready_path: PathBuf,
+    summary_path: PathBuf,
+    /// Owned streaming header reader, present only for password-bearing
+    /// rules. Finish and Drop kill and reap the child first, so joining
+    /// always observes the pipe's end-of-file and the thread never
+    /// outlives the monitor (including through a panic unwind).
+    reader: Option<JoinHandle<ReaderOutcome>>,
     spec: MonitorSpec,
 }
 
@@ -269,6 +291,166 @@ pub struct MonitorSpec {
     pub member: &'static str,
     /// Whether the match rule selects password-bearing bodies.
     pub password_bearing: bool,
+}
+
+/// Final header-derived facts from the streaming reader thread. `failure`
+/// carries the first reader I/O error or malformed/ambiguous header reason;
+/// the proof turns any failure into a hard panic (fail closed) rather than
+/// trusting a partial count.
+pub struct ReaderOutcome {
+    pub calls: usize,
+    pub senders: Vec<String>,
+    pub failure: Option<String>,
+}
+
+/// Incremental one-line-at-a-time parser for the password-bearing monitor's
+/// stdout, pinned against the installed busctl 261 monitor rendering. Each
+/// matched message prints one block:
+///
+/// ```text
+/// ‣ Type=method_call  Endian=l  Flags=0  Version=1 Cookie=1  Timestamp="Sat 2026-09-12 07:49:30.942831 UTC"
+///   Sender=:1.7  Destination=:1.3  Path=/org/freedesktop/DBus  Interface=org.freedesktop.DBus  Member=Hello
+///   UniqueName=:1.7
+///   MESSAGE "(…)" {
+///           …body lines: quoted strings and one `BYTE <decimal>;` per
+///           `ay` element…
+///   };
+///
+/// ```
+///
+/// (captured under the private broker with a benign rule;
+/// `.test-agent/change-monitor-hardening/probe.sh`). The target header is
+/// exactly the line whose whitespace-delimited tokens include both
+/// `Sender=<unique bus name>` and `Member=<member>`; the `Timestamp` value
+/// contains spaces, so parsing is token-based, never substring-based. A line
+/// that carries one of those key shapes without the other is malformed or
+/// ambiguous for attribution and fails the proof closed instead of being
+/// counted or guessed. Everything else — type lines, `UniqueName=` lines,
+/// quoted body text, `BYTE` dumps, blank separators — is discarded
+/// immediately and can never contribute to the count.
+pub struct HeaderCallParser {
+    member_token: String,
+    pub calls: usize,
+    pub senders: Vec<String>,
+    pub failure: Option<String>,
+}
+
+impl HeaderCallParser {
+    pub fn new(member: &'static str) -> Self {
+        Self {
+            member_token: format!("Member={member}"),
+            calls: 0,
+            senders: Vec::new(),
+            failure: None,
+        }
+    }
+
+    /// Examine one raw stdout line, record header-derived facts if it is a
+    /// target header line, and drop its content. The first failure is
+    /// sticky; later lines are still drained so the reader can reach
+    /// end-of-file and be joined.
+    pub fn absorb_line(&mut self, line: &str) {
+        if self.failure.is_some() {
+            return;
+        }
+        let mut sender: Option<&str> = None;
+        let mut member_seen = false;
+        for token in line.split_whitespace() {
+            if let Some(value) = token.strip_prefix("Sender=") {
+                if sender.is_some() {
+                    self.fail_closed(format!(
+                        "header line carries more than one Sender token: {line:?}"
+                    ));
+                    return;
+                }
+                sender = Some(value);
+            } else if token == self.member_token {
+                member_seen = true;
+            }
+        }
+        match sender {
+            Some(value) if member_seen => {
+                if !is_unique_bus_name(value) {
+                    self.fail_closed(format!(
+                        "target header Sender value is not a unique bus name: {value:?}"
+                    ));
+                    return;
+                }
+                self.calls += 1;
+                self.senders.push(value.to_owned());
+            }
+            Some(_) => self.fail_closed(format!(
+                "header-shaped line without the target Member token; the \
+                 installed busctl shape cannot be attributed: {line:?}"
+            )),
+            None if member_seen => self.fail_closed(format!(
+                "target header line without a Sender token; the call cannot \
+                 be attributed: {line:?}"
+            )),
+            None => {}
+        }
+    }
+
+    fn fail_closed(&mut self, reason: String) {
+        self.failure = Some(reason);
+    }
+
+    /// The header-derived facts, consuming the parser.
+    pub fn into_outcome(self) -> ReaderOutcome {
+        ReaderOutcome {
+            calls: self.calls,
+            senders: self.senders,
+            failure: self.failure,
+        }
+    }
+}
+
+/// The D-Bus unique-name grammar the parser pins senders to: a leading `:`
+/// followed by non-empty dot-separated elements of the bus-name alphabet.
+/// Method-call senders on a bus are always unique names (the bus rewrites
+/// the field when forwarding), so anything else is malformed output.
+fn is_unique_bus_name(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(':') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.split('.').all(|element| {
+            !element.is_empty()
+                && element.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+        })
+}
+
+/// Spawn the owned reader thread that drains the password-bearing monitor's
+/// piped stdout. One line buffer is reused: each line is parsed for
+/// header-derived facts and its bytes dropped before the next line is read,
+/// so no accumulation of raw stdout — in a String, Vec, or file — ever
+/// exists, and decoded bodies live only transiently in the pipe and this
+/// one buffer.
+fn spawn_header_reader(stdout: ChildStdout, member: &'static str) -> JoinHandle<ReaderOutcome> {
+    thread::Builder::new()
+        .name(format!("{member}-monitor-headers"))
+        .spawn(move || {
+            let mut parser = HeaderCallParser::new(member);
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => parser.absorb_line(&line),
+                    Err(error) => {
+                        let mut outcome = parser.into_outcome();
+                        outcome.failure =
+                            Some(format!("reading {member} monitor stdout failed: {error}"));
+                        return outcome;
+                    }
+                }
+            }
+            parser.into_outcome()
+        })
+        .unwrap_or_else(|error| panic!("spawn the {member} monitor reader thread: {error}"))
 }
 
 pub struct MonitorSummary {
@@ -300,8 +482,9 @@ impl MethodMonitor {
 
     /// Private `ChangeWithMasterPassword` call monitor: counts the method
     /// calls whose absence proves an input-rejected `gmellon change` never
-    /// reached the daemon. The raw log is password-bearing and is always
-    /// deleted.
+    /// reached the daemon. Its match rule selects password-bearing bodies,
+    /// so its stdout is streamed through a pipe and parsed incrementally:
+    /// no raw output ever exists on disk.
     pub fn change_calls(address: &str, root: &Path) -> Self {
         Self::start(
             MonitorSpec {
@@ -316,31 +499,61 @@ impl MethodMonitor {
     }
 
     pub fn start(spec: MonitorSpec, address: &str, root: &Path) -> Self {
-        let log_path = root.join(format!("{}.log", spec.stem));
         let ready_path = root.join(format!("{}.ready.log", spec.stem));
-        let output = File::create(&log_path)
-            .unwrap_or_else(|error| panic!("create {} log: {error}", spec.stem));
-        // busctl prints its readiness banner on stderr and message traffic on
-        // stdout, so the banner gets its own file and stdout stays parseable.
+        let summary_path = root.join(format!("{}.txt", spec.stem));
+        // busctl prints its readiness banner on stderr and all message
+        // traffic — headers and bodies — on stdout, so the banner gets its
+        // own file and stdout stays parseable. The readiness file cannot
+        // carry bodies; finish still secret-scans it as proof.
         let ready = File::create(&ready_path)
-            .unwrap_or_else(|error| panic!("create {} readiness log: {error}", spec.stem));
-        let child = Command::new(STDBUF)
+            .unwrap_or_else(|error| panic!("create {} log: {error}", spec.stem));
+        let mut command = Command::new(STDBUF);
+        command
             .arg("-oL")
             .arg(BUSCTL)
             .arg(format!("--address={address}"))
             .arg("monitor")
             .arg(format!("--match={}", spec.match_rule))
             .stdin(Stdio::null())
-            .stdout(output)
-            .stderr(ready)
-            .spawn()
-            .unwrap_or_else(|error| panic!("spawn {BUSCTL} monitor: {error}"));
-
-        let monitor = Self {
-            child,
-            log_path,
-            ready_path,
-            spec,
+            .stderr(ready);
+        let monitor = if spec.password_bearing {
+            // Password-bearing bodies must never exist on disk in any form,
+            // not even transiently: stdout is a pipe drained by the owned
+            // reader thread, which records only header-derived facts and
+            // discards every other line as it is read.
+            let mut child = command
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|error| panic!("spawn {BUSCTL} monitor: {error}"));
+            let stdout = child
+                .stdout
+                .take()
+                .expect("piped monitor stdout must be takeable right after spawn");
+            let reader = Some(spawn_header_reader(stdout, spec.member));
+            Self {
+                child,
+                log_path: None,
+                ready_path,
+                summary_path,
+                reader,
+                spec,
+            }
+        } else {
+            let log_path = root.join(format!("{}.log", spec.stem));
+            let output = File::create(&log_path)
+                .unwrap_or_else(|error| panic!("create {} log: {error}", spec.stem));
+            let child = command
+                .stdout(output)
+                .spawn()
+                .unwrap_or_else(|error| panic!("spawn {BUSCTL} monitor: {error}"));
+            Self {
+                child,
+                log_path: Some(log_path),
+                ready_path,
+                summary_path,
+                reader: None,
+                spec,
+            }
         };
         // BecomeMonitor applies only after the bus replies; the tool prints
         // its banner then, so waiting for the banner closes the startup race
@@ -364,6 +577,55 @@ impl MethodMonitor {
     /// Stop the monitor, extract the header-derived evidence, retain a
     /// redacted summary, and delete the raw logs.
     pub fn finish(
+        self,
+        fixture_sender: &str,
+        fixture_calls: usize,
+        secrets: &ProofSecrets,
+    ) -> MonitorSummary {
+        if self.reader.is_some() {
+            self.finish_streaming(fixture_sender, fixture_calls, secrets)
+        } else {
+            self.finish_from_raw_log(fixture_sender, fixture_calls, secrets)
+        }
+    }
+
+    /// Success path for the password-bearing streaming monitor: stop the
+    /// monitor, join the reader, fail closed on any reader or parser
+    /// failure, retain only the header-derived summary, and delete the
+    /// banner-only readiness log. There is no raw log to delete because
+    /// none was ever created.
+    fn finish_streaming(
+        mut self,
+        fixture_sender: &str,
+        fixture_calls: usize,
+        secrets: &ProofSecrets,
+    ) -> MonitorSummary {
+        let handle = self
+            .reader
+            .take()
+            .expect("streaming monitor owns its reader");
+        let outcome = self.stop_and_join(handle);
+        self.assert_ready_and_scan(secrets);
+        if let Some(reason) = outcome.failure {
+            panic!(
+                "the streaming {} monitor failed closed: {reason}",
+                self.spec.stem
+            );
+        }
+        self.write_summary(
+            fixture_sender,
+            fixture_calls,
+            outcome.calls,
+            &outcome.senders,
+            Some("streamed-headers-never-on-disk"),
+        )
+    }
+
+    /// Success path for the body-excluding file monitor, unchanged in
+    /// policy: read the raw log after shutdown, prove it and the readiness
+    /// log secret-free, extract the header-derived count and senders,
+    /// retain the redacted summary, and delete both raw logs.
+    fn finish_from_raw_log(
         mut self,
         fixture_sender: &str,
         fixture_calls: usize,
@@ -371,33 +633,15 @@ impl MethodMonitor {
     ) -> MonitorSummary {
         let bytes = self.shutdown_and_read();
         let raw = String::from_utf8_lossy(&bytes).into_owned();
-        let ready = fs::read_to_string(&self.ready_path)
-            .unwrap_or_else(|error| panic!("read {} readiness log: {error}", self.spec.stem));
-        assert!(
-            ready.contains(MONITOR_BANNER),
-            "{} monitor log lost its readiness banner",
-            self.spec.stem
-        );
-
-        let summary_path = self
-            .log_path
-            .with_file_name(format!("{}.txt", self.spec.stem));
-        let subject = format!("the {} monitor readiness log", self.spec.stem);
+        self.assert_ready_and_scan(secrets);
         for (_name, secret) in secrets.named() {
-            // The readiness log is banner text only, whatever the rule.
-            common::assert_secret_absent(ready.as_bytes(), secret, &subject);
-            if !self.spec.password_bearing {
-                // The match rule excludes password bodies entirely, so any
-                // occurrence — literal or encoded — is a rule regression.
-                common::assert_secret_absent(
-                    raw.as_bytes(),
-                    secret,
-                    &format!("the raw {} log", self.spec.stem),
-                );
-            }
-            // Password-bearing raw logs legitimately carry decoded bodies of
-            // the counted calls; they are deleted below and the
-            // retained-artifact walk proves nothing survived.
+            // The match rule excludes password bodies entirely, so any
+            // occurrence — literal or encoded — is a rule regression.
+            common::assert_secret_absent(
+                raw.as_bytes(),
+                secret,
+                &format!("the raw {} log", self.spec.stem),
+            );
         }
 
         let member_token = format!("Member={}", self.spec.member);
@@ -410,6 +654,44 @@ impl MethodMonitor {
             })
             .map(|token| token.trim_start_matches("Sender=").to_string())
             .collect();
+        let calls = senders.len();
+        let summary = self.write_summary(fixture_sender, fixture_calls, calls, &senders, None);
+        let log_path = self
+            .log_path
+            .clone()
+            .expect("file monitor owns its raw log");
+        fs::remove_file(&log_path)
+            .unwrap_or_else(|error| panic!("delete raw {} log: {error}", self.spec.stem));
+        fs::remove_file(&self.ready_path)
+            .unwrap_or_else(|error| panic!("delete {} readiness log: {error}", self.spec.stem));
+        summary
+    }
+
+    /// Require the readiness banner and prove the banner-only readiness log
+    /// secret-free, whatever the rule.
+    fn assert_ready_and_scan(&self, secrets: &ProofSecrets) {
+        let ready = fs::read_to_string(&self.ready_path)
+            .unwrap_or_else(|error| panic!("read {} readiness log: {error}", self.spec.stem));
+        assert!(
+            ready.contains(MONITOR_BANNER),
+            "{} monitor log lost its readiness banner",
+            self.spec.stem
+        );
+        let subject = format!("the {} monitor readiness log", self.spec.stem);
+        for (_name, secret) in secrets.named() {
+            common::assert_secret_absent(ready.as_bytes(), secret, &subject);
+        }
+    }
+
+    /// Retain the redacted, header-derived summary and report it.
+    fn write_summary(
+        &self,
+        fixture_sender: &str,
+        fixture_calls: usize,
+        calls: usize,
+        senders: &[String],
+        output: Option<&str>,
+    ) -> MonitorSummary {
         let fixture_calls_observed = senders
             .iter()
             .filter(|sender| sender.as_str() == fixture_sender)
@@ -417,35 +699,48 @@ impl MethodMonitor {
         let senders_match_fixture = senders
             .iter()
             .all(|sender| sender.as_str() == fixture_sender);
-
+        let output_line = match output {
+            Some(output) => format!("output={output}\n"),
+            None => String::new(),
+        };
         let summary = format!(
-            "tool={BUSCTL} monitor\nmatch={}\nmember={}\nfixture_sender={fixture_sender}\n\
-             fixture_calls_stated={fixture_calls}\nobserved_calls={}\n\
-             observed_fixture_calls={fixture_calls_observed}\n\
+            "tool={BUSCTL} monitor\nmatch={}\nmember={}\n{output_line}\
+             fixture_sender={fixture_sender}\nfixture_calls_stated={fixture_calls}\n\
+             observed_calls={calls}\nobserved_fixture_calls={fixture_calls_observed}\n\
              senders_match_fixture={senders_match_fixture}\nsenders={}\n",
             self.spec.match_rule,
             self.spec.member,
-            senders.len(),
             senders.join(","),
         );
-        fs::write(&summary_path, summary)
+        fs::write(&self.summary_path, summary)
             .unwrap_or_else(|error| panic!("write redacted {} summary: {error}", self.spec.stem));
-        fs::remove_file(&self.log_path)
-            .unwrap_or_else(|error| panic!("delete raw {} log: {error}", self.spec.stem));
-        fs::remove_file(&self.ready_path)
-            .unwrap_or_else(|error| panic!("delete {} readiness log: {error}", self.spec.stem));
-
         MonitorSummary {
-            calls: senders.len(),
-            senders,
+            calls,
+            senders: senders.to_vec(),
             fixture_calls: fixture_calls_observed,
             senders_match_fixture,
         }
     }
 
-    fn shutdown_and_read(&mut self) -> Vec<u8> {
-        // Give the line-buffered monitor a moment to flush the last message,
-        // then TERM; a monitor that ignores TERM within the bound is KILLed.
+    /// Stop the streaming monitor and collect the reader's final facts. The
+    /// child is killed and reaped first, so its pipe write end is closed,
+    /// the reader observes end-of-file (or has already exited on its own
+    /// error), and the join cannot hang or outlive the process.
+    fn stop_and_join(&mut self, handle: JoinHandle<ReaderOutcome>) -> ReaderOutcome {
+        self.stop();
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("the {} monitor reader thread panicked", self.spec.stem))
+    }
+
+    /// Give the line-buffered monitor a moment to flush any in-flight line,
+    /// then stop it. `Child::kill` sends SIGKILL immediately on Unix — there
+    /// is deliberately no TERM-first grace period, and the old TERM-then-
+    /// KILL comment was wrong — and the pipe lives in the kernel, so every
+    /// line the monitor already wrote survives for its reader; the settle
+    /// delay plus the proof's closed-count assertions guard against a
+    /// truncated last line. The deadline only bounds reaping.
+    fn stop(&mut self) {
         thread::sleep(Duration::from_millis(200));
         let _ = self.child.kill();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -453,25 +748,40 @@ impl MethodMonitor {
             match self.child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-                Ok(None) => panic!("{} monitor did not exit after KILL", self.spec.stem),
+                Ok(None) => panic!("{} monitor did not exit after SIGKILL", self.spec.stem),
                 Err(error) => panic!("{} monitor wait failed: {error}", self.spec.stem),
             }
         }
-        fs::read(&self.log_path)
-            .unwrap_or_else(|error| panic!("read {} log: {error}", self.spec.stem))
+    }
+
+    /// Body-excluding monitor shutdown: stop the process and read its raw
+    /// log. Same stop semantics as [`MethodMonitor::stop`] — one immediate
+    /// SIGKILL, not a TERM-then-KILL sequence.
+    fn shutdown_and_read(&mut self) -> Vec<u8> {
+        self.stop();
+        let log_path = self
+            .log_path
+            .clone()
+            .expect("file monitor owns its raw log");
+        fs::read(&log_path).unwrap_or_else(|error| panic!("read {} log: {error}", self.spec.stem))
     }
 }
 
 impl Drop for MethodMonitor {
     fn drop(&mut self) {
-        // Never leak the process. Password-bearing raw logs are deleted even
-        // on failure paths, so retained failure scratch cannot carry
-        // recoverable password dumps; body-excluding raw logs stay for the
-        // artifact scan, as before.
+        // Never leak the process or the reader thread, including through a
+        // panic unwind: kill and reap the child first, which closes the
+        // pipe, then join the reader (which at worst drains and drops the
+        // remaining body lines). The password-bearing monitor has no raw
+        // log on disk at any point, so failure paths only remove its
+        // banner-only readiness log; body-excluding raw logs stay in place
+        // for the artifact scan, as before.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
         if self.spec.password_bearing {
-            let _ = fs::remove_file(&self.log_path);
             let _ = fs::remove_file(&self.ready_path);
         }
     }
