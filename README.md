@@ -77,6 +77,12 @@ no line editing is applied, so backspace and control bytes from a pipe are
 data, not commands. Input is capped at 64 KiB. With no controlling terminal
 the TTY prompt fails with an actionable error suggesting `--stdin`.
 
+**Configuration:** when a command omits its positional collection ID, the
+default is composed as `--default-collection` >
+`GMELLON_DEFAULT_COLLECTION` > `login`. Commands and password-source choices
+are invocation-only; passwords are not representable in Firmament providers,
+environment settings, configuration files, provenance, or debug output.
+
 ### Exit codes
 
 | code | meaning |
@@ -233,6 +239,16 @@ errors. ENXIO (no controlling terminal) maps to an actionable error
 suggesting `--stdin`. A reusable two-prompt confirmation (single-shot
 mismatch, zeroized temporaries) supports `change`.
 
+### Stage 2.75 — one-shot configuration
+`config` composes the non-secret default collection through the local
+[`lmmx/firmament`](https://github.com/lmmx/firmament) checkout at
+`../firmament`, with CLI > `GMELLON_` environment >
+application-default precedence. Optional CLI values are omitted when absent so
+they cannot erase lower providers. Command selection and secret source remain
+outside configuration. The local path dependency is intentional during
+development and makes the crate non-publishable until Firmament has a registry
+or explicit Git dependency.
+
 ### Stage 3 — collection `list` and `unlock`
 Connect to Secret Service with zbus, list collection IDs/labels/lock state,
 select `login` by default or an explicit ID, acquire a password from the TTY or
@@ -264,6 +280,8 @@ hook remain optional.
 | zeroize | clear password and request buffers after use |
 | rustix | effective and peer UID checks |
 | zbus | Secret Service discovery and GNOME private password methods |
+| firmament (local path) | one-shot non-secret configuration composition |
+| serde + bon | configuration serialization and builders |
 | tracing (optional, Stage 5) | redacted `-v` operation diagnostics |
 
 Publishing: `cargo bump` + `jj commit` + `cargo publish` when it earns it.
