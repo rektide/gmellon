@@ -128,7 +128,7 @@ impl BlockingClient {
     /// Connect to the caller's D-Bus session and open a plain Secret Service
     /// session.
     pub fn session() -> Result<Self, Error> {
-        Self::new(Connection::session().map_err(Error::Bus)?)
+        Self::new(Connection::session().map_err(|_| Error::ServiceUnavailable)?)
     }
 
     /// Use an existing connection, such as an isolated test-bus connection.
@@ -151,16 +151,21 @@ impl BlockingClient {
             .collections()
             .map_err(classify_service_error)?
             .into_iter()
-            .map(|path| self.collection(path))
+            .map(|path| self.inspect_collection(path))
             .collect::<Result<Vec<_>, _>>()?;
         collections.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(collections)
     }
 
+    /// Resolve one collection by its stable ID.
+    pub fn collection(&self, id: &CollectionId) -> Result<Collection, Error> {
+        self.inspect_collection(self.find_path(id)?)
+    }
+
     /// Unlock a selected collection. Already-unlocked collections are never
     /// relocked and the supplied password is not verified in that state.
     pub fn unlock(&self, id: &CollectionId, password: &[u8]) -> Result<UnlockOutcome, Error> {
-        let collection = self.find(id)?;
+        let collection = self.collection(id)?;
         if !collection.locked {
             return Ok(UnlockOutcome::AlreadyUnlocked);
         }
@@ -186,7 +191,7 @@ impl BlockingClient {
         original_password: &[u8],
         new_password: &[u8],
     ) -> Result<(), Error> {
-        let collection = self.find(id)?;
+        let collection = self.collection(id)?;
         let internal = GnomeInternalProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
         let empty_parameters: &[u8] = &[];
         let content_type = "text/plain";
@@ -201,14 +206,22 @@ impl BlockingClient {
             .map_err(|error| classify_password_error(error, id))
     }
 
-    fn find(&self, id: &CollectionId) -> Result<Collection, Error> {
-        self.collections()?
+    fn find_path(&self, id: &CollectionId) -> Result<OwnedObjectPath, Error> {
+        let service = SecretServiceProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
+        service
+            .collections()
+            .map_err(classify_service_error)?
             .into_iter()
-            .find(|collection| collection.id == *id)
+            .find_map(|path| match CollectionId::from_path(&path) {
+                Ok(found) if found == *id => Some(Ok(path)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .transpose()?
             .ok_or_else(|| Error::CollectionNotFound { id: id.clone() })
     }
 
-    fn collection(&self, path: OwnedObjectPath) -> Result<Collection, Error> {
+    fn inspect_collection(&self, path: OwnedObjectPath) -> Result<Collection, Error> {
         let id = CollectionId::from_path(&path)?;
         let proxy = SecretCollectionProxyBlocking::builder(&self.connection)
             .destination(SERVICE_NAME)
