@@ -2,7 +2,7 @@ use std::io;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use gmellon::secret_input;
+use gmellon::secret_input::{self, Secret, SecretError};
 use gmellon::secret_service::{
     BlockingClient, Collection, CollectionId, Error as ServiceError, UnlockOutcome,
 };
@@ -53,10 +53,7 @@ pub fn run(cli: Cli) -> ExitCode {
     match cli.command {
         Command::List => list(),
         Command::Unlock { collection, stdin } => unlock(&collection, stdin),
-        Command::Change { .. } => {
-            eprintln!("gmellon change is not implemented yet");
-            ExitCode::from(EXIT_ERROR)
-        }
+        Command::Change { collection, stdin } => change(&collection, stdin),
     }
 }
 
@@ -117,6 +114,58 @@ fn unlock(collection: &str, stdin: bool) -> ExitCode {
         }
         Err(error) => report_service_error(error),
     }
+}
+
+fn change(collection: &str, stdin: bool) -> ExitCode {
+    let id = match CollectionId::new(collection) {
+        Ok(id) => id,
+        Err(error) => return report_service_error(error),
+    };
+    let client = match BlockingClient::session() {
+        Ok(client) => client,
+        Err(error) => return report_service_error(error),
+    };
+    if let Err(error) = client.collection(&id) {
+        return report_service_error(error);
+    }
+
+    let secrets = if stdin {
+        read_change_stdin(&mut io::stdin().lock())
+    } else {
+        read_change_tty(&id)
+    };
+    let (original, new) = match secrets {
+        Ok(secrets) => secrets,
+        Err(error) => return report_input_error(error),
+    };
+
+    match client.change_password(&id, original.as_bytes(), new.as_bytes()) {
+        Ok(()) => {
+            println!("changed password for collection {id}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => report_service_error(error),
+    }
+}
+
+fn read_change_stdin(reader: &mut impl io::BufRead) -> Result<(Secret, Secret), SecretError> {
+    let original = secret_input::read_stdin_line(reader)?;
+    let new = secret_input::read_stdin_confirmed(reader)?;
+    Ok((original, new))
+}
+
+fn read_change_tty(id: &CollectionId) -> Result<(Secret, Secret), SecretError> {
+    let original = secret_input::prompt(&format!("Current password for {id}: "))?;
+    let new = secret_input::prompt_confirmed(
+        &format!("New password for {id}: "),
+        &format!("Confirm new password for {id}: "),
+    )?;
+    Ok((original, new))
+}
+
+fn report_input_error(error: SecretError) -> ExitCode {
+    eprintln!("gmellon: {error}");
+    ExitCode::from(EXIT_ERROR)
 }
 
 fn report_service_error(error: ServiceError) -> ExitCode {
@@ -197,6 +246,55 @@ mod tests {
                 collection,
                 stdin: true
             } if collection == "work"
+        ));
+    }
+
+    #[test]
+    fn change_defaults_to_login() {
+        let cli = Cli::try_parse_from(["gmellon", "change"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Change {
+                collection,
+                stdin: false
+            } if collection == "login"
+        ));
+    }
+
+    #[test]
+    fn change_accepts_an_explicit_collection_and_stdin() {
+        let cli = Cli::try_parse_from(["gmellon", "change", "work", "--stdin"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Change {
+                collection,
+                stdin: true
+            } if collection == "work"
+        ));
+    }
+
+    #[test]
+    fn change_stdin_reads_current_new_and_confirmation_lines() {
+        let mut input = io::Cursor::new(b"old\nnew\nnew\n".to_vec());
+        let result = read_change_stdin(&mut input);
+        let (original, new) = match result {
+            Ok(secrets) => secrets,
+            Err(error) => panic!("three valid lines should parse: {error}"),
+        };
+
+        assert_eq!(original.as_bytes(), b"old");
+        assert_eq!(new.as_bytes(), b"new");
+    }
+
+    #[test]
+    fn change_stdin_rejects_confirmation_mismatch() {
+        let mut input = io::Cursor::new(b"old\nnew\ndifferent\n".to_vec());
+
+        assert!(matches!(
+            read_change_stdin(&mut input),
+            Err(SecretError::ConfirmationMismatch)
         ));
     }
 
