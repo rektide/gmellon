@@ -2,10 +2,10 @@
 
 > *mellon* — "speak, friend, and enter."
 
-`gmellon` is a small Rust CLI that speaks the gnome-keyring daemon's private
-control protocol directly, so you can **unlock and re-key your login keyring
-from any shell** — no GUI, no PAM, and no display server. A gnome-keyring
-daemon must be listening on its control socket.
+`gmellon` is a small Rust CLI that speaks GNOME Keyring's private D-Bus
+password interface, so you can **list, unlock, and re-key any GNOME keyring
+collection from a shell** — no GUI, no PAM, and no display server. A
+`gnome-keyring-daemon` Secret Service must be available on the session bus.
 
 It exists because every other door is shut on a headless, SSH-only machine:
 
@@ -17,10 +17,6 @@ It exists because every other door is shut on a headless, SSH-only machine:
 | `secret-tool` | has `lock`, has `search --unlock`, but **no `unlock` command** — unlocking is deliberately prompt-gated |
 | Secret Service `Unlock()` D-Bus call | returns a *prompt object*; prompts are GUI |
 
-The control socket accepts a password from any client of yours, PAM or not.
-`pam_gnome_keyring` speaks it; `gmellon` is its shell-native sibling.
-
-A second door exists, proven after the paragraph above was first written:
 GNOME Keyring's Secret Service also exposes the deliberately undocumented
 `org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface`, whose
 `UnlockWithMasterPassword`, `ChangeWithMasterPassword`, and
@@ -36,23 +32,33 @@ Treat it exactly as GNOME names it: an internal, **unsupported** interface
 that may change or vanish without notice. The standard Secret Service API
 still offers no supported headless password entry.
 
+The CLI MVP uses a `plain` Secret Service session, so password bytes cross the
+user's D-Bus connection without Secret Service encryption and zbus/broker
+message copies are outside gmellon's zeroization control. This accepts the
+same-user bus boundary temporarily. The `gmell-encrypted-session` ticket tracks
+encrypted DH/AES sessions as a release blocker; publishing must wait for that
+proof.
+
 ## Usage (spec)
 
 ```
-# unlock the login keyring; password prompted on the TTY, no echo
+# list stable collection IDs, mutable labels, and lock state
+gmellon list
+
+# unlock the login collection; password prompted on the TTY, no echo
 gmellon unlock
 
+# unlock another collection by stable ID
+gmellon unlock work
+
 # scripting: read a single line (sans newline) from stdin
-gmellon unlock --stdin < /dev/shm/pw
+gmellon unlock work --stdin < /dev/shm/pw
 
-# rotate the login keyring password, headlessly (prompts for old + new + confirm)
-gmellon change
+# rotate a collection password (prompts for old + new + confirm)
+gmellon change work
 
-# offline inventory: control socket present?, which keyring files exist
-gmellon status
-
-# speak to a private/test daemon instead of the session one
-gmellon --control-dir ~/tmp-opencode/krtest unlock
+# already-unlocked collections return success without checking the password;
+# ordinary unlock never locks or relocks a collection to verify it
 ```
 
 **Password policy:** passwords are accepted only from the TTY (default) or a
@@ -79,9 +85,14 @@ the TTY prompt fails with an actionable error suggesting `--stdin`.
 | 1 | usage / io / unexpected error |
 | 2 | DENIED — wrong password |
 | 3 | FAILED — daemon-side failure |
-| 4 | NO_DAEMON — nothing listening on the control socket |
+| 4 | NO_DAEMON — GNOME Keyring's Secret Service is unavailable |
 
-## The protocol (as reverse-engineered from source)
+## Historical login-only control protocol
+
+The first implementation used GNOME Keyring's private control socket. It is
+retained temporarily as tested historical machinery, but it can address only
+the special `login` collection and is not the collection-oriented product
+backend.
 
 Transport: `AF_UNIX` `SOCK_STREAM` at `<control-dir>/control`,
 default control dir `$XDG_RUNTIME_DIR/keyring`.
@@ -167,12 +178,12 @@ The staging exists to de-risk verification, not because the work is big.
 clippy + rustfmt clean, nextest wired. `gmellon --help` prints the spec
 above.
 
-### Stage 1 — codec (pure, no I/O)
+### Stage 1 — login control codec (superseded)
 `protocol.rs`: op/result enums, frame + string encode/decode. Unit tests
 with golden byte vectors — including the `mellon` example above — so the
 wire format is locked by test before any socket is opened.
 
-### Stage 1.5 — synchronous control transport
+### Stage 1.5 — login control transport (superseded)
 `control::sans_io` exposes the pure codec for alternate adapters. The
 Linux-only `SyncClient` opens one connection per operation, validates the
 socket metadata and connected peer UID, writes the credential NUL and
@@ -192,7 +203,7 @@ scratch sockets. It waits for the daemon's initialization EOF, verifies child
 liveness and the control socket, and performs bounded teardown. This
 control-only layer validates the transport and frame transcription without
 touching the real store or buses. A private `dbus-broker` composition
-(`gmell-harness-broker`, in progress) was promoted from optional parity to
+([`broker.py`](/dev/harness/broker.py)) was promoted from optional parity to
 required infrastructure for the zbus Secret Service product backend, but it
 remains separate from — and no prerequisite for — this control-only layer and
 its tests.
@@ -222,26 +233,27 @@ errors. ENXIO (no controlling terminal) maps to an actionable error
 suggesting `--stdin`. A reusable two-prompt confirmation (single-shot
 mismatch, zeroized temporaries) supports `change`.
 
-### Stage 3 — `unlock`
-Socket and peer ownership checks, connect, credential-byte handshake, send
-UNLOCK, parse result, exit codes, TTY prompt (`rpassword`), `--stdin`, and the
-`--allow-create` guard. Integration test via the Stage 2 harness: create →
-unlock → wrong-password → DENIED.
+### Stage 3 — collection `list` and `unlock`
+Connect to Secret Service with zbus, list collection IDs/labels/lock state,
+select `login` by default or an explicit ID, acquire a password from the TTY or
+`--stdin`, and call `UnlockWithMasterPassword`. An already-unlocked collection
+returns success without checking the supplied password; ordinary unlock never
+locks or relocks. The private-broker Rust proof covers exact `login` plus a
+second collection with distinct passwords.
 
-### Stage 4 — `change`
-Same frame machinery, two strings. Harness test: unlock with A, change A→B,
-restart the daemon over the same private store, unlock with B, unlock with A →
-DENIED. Guard missing-store CHANGE because the observed daemon creates with the
-new password when it is absent.
+### Stage 4 — collection `change`
+Select a collection by ID, read old/new/confirmation secrets, and call
+`ChangeWithMasterPassword`. The private-broker Rust proof demonstrates A→B,
+fixture-only locking, old-password denial, and new-password unlock.
 
 ### Stage 5 — polish
-`status` (offline: socket stat, keyring dir inventory), redacted `-v`
-diagnostics via `tracing`, `clap_complete` shell completions, and
-manpage-grade `--help`.
+Collection/alias display refinements, redacted diagnostics via `tracing`,
+`clap_complete` shell completions, and manpage-grade `--help`.
 
 ### Stage 6 — stretch (only if wanted)
-`lock` via the Secret Service D-Bus call (zbus) for symmetry; wrapper docs
-for the zsh login hook; `env` (INITIALIZE) exposure.
+An explicit side-effecting password-verification mode may lock then unlock, but
+must never become ordinary unlock behavior. Wrapper docs for the zsh login
+hook remain optional.
 
 ### Crates
 
@@ -251,7 +263,7 @@ for the zsh login hook; `env` (INITIALIZE) exposure.
 | rpassword | no-echo TTY prompts |
 | zeroize | clear password and request buffers after use |
 | rustix | effective and peer UID checks |
-| anyhow | errors |
+| zbus | Secret Service discovery and GNOME private password methods |
 | tracing (optional, Stage 5) | redacted `-v` operation diagnostics |
 
 Publishing: `cargo bump` + `jj commit` + `cargo publish` when it earns it.
