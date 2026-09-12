@@ -6,7 +6,9 @@
 //! re-runs only this test inside the isolated command environment. The inner
 //! proof is maintained Rust: a zbus test fixture performs the *only* permitted
 //! mutation setup — creating disposable collections through GNOME's private
-//! `CreateWithMasterPassword` and returning them to the locked state with the
+//! `CreateWithMasterPassword` (one labeled exactly `login`, satisfying the
+//! parent acceptance's literal login-plus-second requirement, plus a second
+//! distinguishable collection) and returning them to the locked state with the
 //! standard `Lock` method — and every observed behavior is asserted through
 //! the public `gmellon::secret_service::BlockingClient`.
 //!
@@ -35,6 +37,13 @@ const PROOF_TEST: &str = "private_broker_collections_client_proof";
 const APPROVED_TEMP_ROOT: &str = "/home/rektide/tmp-opencode";
 const BUSCTL: &str = "/usr/bin/busctl";
 const STDBUF: &str = "/usr/bin/stdbuf";
+/// One persistent fixture collection is labeled exactly `login`, because the
+/// parent acceptance requires listing `login` plus a second collection by
+/// stable ID. On the observed daemon 48.0 the token collection persists as
+/// `login.keyring` and its D-Bus object-path ID is exactly `login` (the label
+/// needs no escaping), so the proof asserts the exact ID rather than a
+/// login-shaped approximation.
+const LOGIN_LABEL: &str = "login";
 /// The monitor sees only this traffic: standard Service.Lock method calls.
 /// Passwords travel exclusively in private-interface method bodies, which the
 /// match rule excludes, so retained monitor output cannot carry secret bytes.
@@ -72,18 +81,19 @@ fn run_proof(secrets: &ProofSecrets) {
     let mut fixture = Fixture::connect(&bus.address).expect("fixture plain session");
     let fixture_sender = fixture.unique_name();
 
-    let label_alpha = format!("gmellon-proof-alpha-{}", secrets.run_tag);
-    let label_beta = format!("gmellon-proof-beta-{}", secrets.run_tag);
+    let label_second = format!("gmellon-proof-second-{}", secrets.run_tag);
 
     // Fixture setup: persistent disposable collections with distinct
-    // passwords. This is the only code permitted to create or lock.
-    let alpha_path = fixture
-        .create(&label_alpha, &secrets.alpha)
-        .expect("fixture CreateWithMasterPassword alpha");
-    let beta_path = fixture
-        .create(&label_beta, &secrets.beta)
-        .expect("fixture CreateWithMasterPassword beta");
-    assert_ne!(alpha_path, beta_path);
+    // passwords. This is the only code permitted to create or lock. One
+    // collection is labeled exactly `login`; the second carries a per-run tag
+    // so its escaped-label ID is distinguishable from any other run's.
+    let login_path = fixture
+        .create(LOGIN_LABEL, &secrets.login)
+        .expect("fixture CreateWithMasterPassword login");
+    let second_path = fixture
+        .create(&label_second, &secrets.second)
+        .expect("fixture CreateWithMasterPassword second");
+    assert_ne!(login_path, second_path);
 
     // One product client, as a CLI process would own it. It resolves its own
     // connection from the exported DBUS_SESSION_BUS_ADDRESS.
@@ -92,81 +102,106 @@ fn run_proof(secrets: &ProofSecrets) {
     // Discovery is by label only to learn the stable IDs; every later
     // operation addresses the returned CollectionId values, never a hardcoded
     // object path or label.
-    let alpha_id = collection_id_by_label(&client, &label_alpha);
-    let beta_id = collection_id_by_label(&client, &label_beta);
-    assert_ne!(alpha_id, beta_id);
+    let login_id = collection_id_by_label(&client, LOGIN_LABEL);
+    let second_id = collection_id_by_label(&client, &label_second);
+    assert_ne!(login_id, second_id);
+
+    // The parent acceptance literally requires the `login` collection: the
+    // discovered stable ID must be exactly `login` (observed daemon 48.0
+    // behavior — the label needs no escaping), not a login-shaped run-tagged
+    // approximation.
+    assert_eq!(
+        login_id.as_str(),
+        LOGIN_LABEL,
+        "the collection labeled {LOGIN_LABEL} must expose the exact stable ID `{LOGIN_LABEL}`"
+    );
 
     // A just-created collection holds its master-password credential, so it
     // starts unlocked; the daemon persists token collections immediately.
-    assert_lock_state(&client, &alpha_id, false, "alpha after fixture create");
-    assert_lock_state(&client, &beta_id, false, "beta after fixture create");
-    assert_persisted(&bus, &label_alpha, &alpha_id);
-    assert_persisted(&bus, &label_beta, &beta_id);
+    assert_lock_state(&client, &login_id, false, "login after fixture create");
+    assert_lock_state(&client, &second_id, false, "second after fixture create");
+    assert_persisted(&bus, LOGIN_LABEL, &login_id);
+    assert_persisted(&bus, &label_second, &second_id);
 
     // Fixture-only locking: standard Lock, counted and attributed.
-    fixture.lock(&alpha_path).expect("fixture Lock alpha");
-    fixture.lock(&beta_path).expect("fixture Lock beta");
-    assert_lock_state(&client, &alpha_id, true, "alpha after fixture lock");
-    assert_lock_state(&client, &beta_id, true, "beta after fixture lock");
+    fixture.lock(&login_path).expect("fixture Lock login");
+    fixture.lock(&second_path).expect("fixture Lock second");
+    assert_lock_state(&client, &login_id, true, "login after fixture lock");
+    assert_lock_state(&client, &second_id, true, "second after fixture lock");
 
     // Wrong password while genuinely locked: denied, and the denial must not
     // change lock state.
     assert!(
         matches!(
-            client.unlock(&alpha_id, &secrets.wrong),
+            client.unlock(&login_id, &secrets.wrong),
             Err(Error::PasswordDenied)
         ),
-        "wrong password while alpha locked must be PasswordDenied"
+        "wrong password while login locked must be PasswordDenied"
     );
-    assert_lock_state(&client, &alpha_id, true, "alpha after denied attempt");
+    assert_lock_state(&client, &login_id, true, "login after denied attempt");
 
-    // Cross password: alpha's password is wrong for beta.
+    // Cross password: login's password is wrong for second.
     assert!(
         matches!(
-            client.unlock(&beta_id, &secrets.alpha),
+            client.unlock(&second_id, &secrets.login),
             Err(Error::PasswordDenied)
         ),
-        "alpha's password on locked beta must be PasswordDenied"
+        "login's password on locked second must be PasswordDenied"
     );
 
     // Each correct password unlocks only its own collection.
     assert_eq!(
         client
-            .unlock(&alpha_id, &secrets.alpha)
-            .expect("unlock alpha with its password"),
+            .unlock(&login_id, &secrets.login)
+            .expect("unlock login with its password"),
         UnlockOutcome::Unlocked
     );
-    assert_lock_state(&client, &alpha_id, false, "alpha after unlock");
-    assert_lock_state(&client, &beta_id, true, "beta untouched by alpha unlock");
+    assert_lock_state(&client, &login_id, false, "login after unlock");
+    assert_lock_state(
+        &client,
+        &second_id,
+        true,
+        "second untouched by login unlock",
+    );
 
     assert_eq!(
         client
-            .unlock(&beta_id, &secrets.beta)
-            .expect("unlock beta with its password"),
+            .unlock(&second_id, &secrets.second)
+            .expect("unlock second with its password"),
         UnlockOutcome::Unlocked
     );
-    assert_lock_state(&client, &alpha_id, false, "alpha untouched by beta unlock");
+    assert_lock_state(
+        &client,
+        &login_id,
+        false,
+        "login untouched by second unlock",
+    );
 
-    // GNOME's private UnlockWithMasterPassword short-circuits without
-    // checking the password when the collection is already unlocked, and the
-    // committed client must not relock to verify: the wrong password returns
-    // AlreadyUnlocked and the collection stays unlocked.
+    // Already-unlocked: the committed client returns AlreadyUnlocked from its
+    // lock-state guard in `blocking.rs` before any password method is sent,
+    // so no password method is invoked on this path (established by the
+    // committed early return plus this outcome — the monitor's match rule is
+    // deliberately password-excluding and proves only the no-Lock claim).
+    // Upstream's private method would short-circuit anyway, which is exactly
+    // why the client's guard, not the daemon, carries the no-verification
+    // behavior. Both a wrong and the correct password return AlreadyUnlocked
+    // and the collection stays unlocked.
     assert_eq!(
         client
-            .unlock(&alpha_id, &secrets.wrong)
-            .expect("already-unlocked alpha with wrong password"),
+            .unlock(&login_id, &secrets.wrong)
+            .expect("already-unlocked login with wrong password"),
         UnlockOutcome::AlreadyUnlocked
     );
     assert_lock_state(
         &client,
-        &alpha_id,
+        &login_id,
         false,
-        "alpha after already-unlocked path",
+        "login after already-unlocked path",
     );
     assert_eq!(
         client
-            .unlock(&alpha_id, &secrets.alpha)
-            .expect("already-unlocked alpha with its password"),
+            .unlock(&login_id, &secrets.login)
+            .expect("already-unlocked login with its password"),
         UnlockOutcome::AlreadyUnlocked
     );
 
@@ -174,42 +209,42 @@ fn run_proof(secrets: &ProofSecrets) {
     let missing = CollectionId::new("gmellon-proof-missing").expect("nonempty id");
     assert!(
         matches!(
-            client.unlock(&missing, &secrets.alpha),
+            client.unlock(&missing, &secrets.login),
             Err(Error::CollectionNotFound { .. })
         ),
         "unlock of a missing collection must be CollectionNotFound"
     );
     assert!(
         matches!(
-            client.change_password(&missing, &secrets.alpha, &secrets.alpha_two),
+            client.change_password(&missing, &secrets.login, &secrets.login_two),
             Err(Error::CollectionNotFound { .. })
         ),
         "change_password of a missing collection must be CollectionNotFound"
     );
 
-    // Password change on the unlocked alpha, then fixture-only relock: the
+    // Password change on the unlocked login, then fixture-only relock: the
     // former password is denied while locked, the new one unlocks.
     client
-        .change_password(&alpha_id, &secrets.alpha, &secrets.alpha_two)
-        .expect("change_password alpha A to A2");
-    assert_lock_state(&client, &alpha_id, false, "alpha after change_password");
+        .change_password(&login_id, &secrets.login, &secrets.login_two)
+        .expect("change_password login L to L2");
+    assert_lock_state(&client, &login_id, false, "login after change_password");
 
     fixture
-        .lock(&alpha_path)
-        .expect("fixture Lock alpha after change");
-    assert_lock_state(&client, &alpha_id, true, "alpha after fixture relock");
+        .lock(&login_path)
+        .expect("fixture Lock login after change");
+    assert_lock_state(&client, &login_id, true, "login after fixture relock");
 
     assert!(
         matches!(
-            client.unlock(&alpha_id, &secrets.alpha),
+            client.unlock(&login_id, &secrets.login),
             Err(Error::PasswordDenied)
         ),
-        "former password while alpha relocked must be PasswordDenied"
+        "former password while login relocked must be PasswordDenied"
     );
     assert_eq!(
         client
-            .unlock(&alpha_id, &secrets.alpha_two)
-            .expect("unlock alpha with the changed password"),
+            .unlock(&login_id, &secrets.login_two)
+            .expect("unlock login with the changed password"),
         UnlockOutcome::Unlocked
     );
 
@@ -556,23 +591,25 @@ impl Drop for LockMonitor {
 }
 
 /// Generated, zeroized-on-drop proof secrets and the non-secret run tag used
-/// to make fixture labels distinguishable per run.
+/// to make the second fixture label distinguishable per run. The `login`
+/// collection deliberately carries no run tag: its stable ID must be exactly
+/// `login`.
 struct ProofSecrets {
     run_tag: String,
-    alpha: Zeroizing<Vec<u8>>,
-    beta: Zeroizing<Vec<u8>>,
+    login: Zeroizing<Vec<u8>>,
+    second: Zeroizing<Vec<u8>>,
     wrong: Zeroizing<Vec<u8>>,
-    alpha_two: Zeroizing<Vec<u8>>,
+    login_two: Zeroizing<Vec<u8>>,
 }
 
 impl ProofSecrets {
     fn generate() -> Self {
-        let alpha = random_password();
-        let beta = distinct_password(&[&alpha]);
-        let alpha_two = distinct_password(&[&alpha, &beta]);
-        let wrong = distinct_password(&[&alpha, &beta, &alpha_two]);
+        let login = random_password();
+        let second = distinct_password(&[&login]);
+        let login_two = distinct_password(&[&login, &second]);
+        let wrong = distinct_password(&[&login, &second, &login_two]);
 
-        // Not a secret: a printable tag identifying this run's fixtures.
+        // Not a secret: a printable tag identifying this run's second fixture.
         let mut random = [0_u8; 4];
         read_urandom(&mut random);
         let run_tag = random
@@ -582,28 +619,28 @@ impl ProofSecrets {
 
         Self {
             run_tag,
-            alpha,
-            beta,
+            login,
+            second,
             wrong,
-            alpha_two,
+            login_two,
         }
     }
 
     fn all_slices(&self) -> Vec<&[u8]> {
         vec![
-            self.alpha.as_slice(),
-            self.beta.as_slice(),
+            self.login.as_slice(),
+            self.second.as_slice(),
             self.wrong.as_slice(),
-            self.alpha_two.as_slice(),
+            self.login_two.as_slice(),
         ]
     }
 
     fn named(&self) -> [(&'static str, &[u8]); 4] {
         [
-            ("alpha", self.alpha.as_slice()),
-            ("beta", self.beta.as_slice()),
+            ("login", self.login.as_slice()),
+            ("second", self.second.as_slice()),
             ("wrong", self.wrong.as_slice()),
-            ("alpha_two", self.alpha_two.as_slice()),
+            ("login_two", self.login_two.as_slice()),
         ]
     }
 }
@@ -629,12 +666,13 @@ fn assert_lock_state(client: &BlockingClient, id: &CollectionId, locked: bool, s
     assert_eq!(found.locked, locked, "unexpected lock state at {stage}");
 }
 
+/// Observed daemon-48.0 persistence contract for token collections, asserted
+/// per fixture: the store file stem is the raw label, and the D-Bus ID is the
+/// escaped-label form. The escaped form is asserted, not guessed: the exact
+/// `login` ID for the untagged label, and the deterministic `-` to `_2d`
+/// escaping for the tagged second label.
 fn assert_persisted(bus: &BusEnvironment, label: &str, id: &CollectionId) {
     let keyrings = required_path("XDG_DATA_HOME").join("keyrings");
-    // Observed against daemon 48.0: a token collection's file stem is the raw
-    // label, while the D-Bus object-path ID is the escaped label form (for
-    // example `gmellon_2dproof_2dalpha` for `gmellon-proof-alpha`). Assert
-    // both the persisted file and that the returned ID is the escaped label.
     let file = keyrings.join(format!("{label}.keyring"));
     assert!(
         file.is_file(),
@@ -642,10 +680,20 @@ fn assert_persisted(bus: &BusEnvironment, label: &str, id: &CollectionId) {
         file.display()
     );
     assert_beneath(&file, &bus.root);
-    assert!(
-        id.as_str().contains("gmellon_2dproof_2d"),
-        "collection ID {id} is not the escaped-label form of {label}"
+    let expected_id = expected_collection_id(label);
+    assert_eq!(
+        id.as_str(),
+        expected_id,
+        "collection ID for label {label} is not the observed escaped-label form"
     );
+}
+
+/// The stable ID the installed daemon derives from a token-collection label:
+/// the label with each `-` escaped as `_2d` (observed `gmellon_2dproof_2dalpha`
+/// for `gmellon-proof-alpha`). `login` contains no escapable characters, so
+/// its exact ID is `login` — the parent acceptance's literal requirement.
+fn expected_collection_id(label: &str) -> String {
+    label.replace('-', "_2d")
 }
 
 // --- outer runner and shared helpers ---------------------------------------
@@ -841,9 +889,15 @@ fn distinct_password(others: &[&[u8]]) -> Zeroizing<Vec<u8>> {
     }
 }
 
-/// Record the redacted observation, then scan every retained harness
-/// artifact for every generated secret before reporting success (or
-/// re-raising an earlier assertion failure).
+/// Record the redacted observation, then scan the retained harness artifacts
+/// for every generated secret before reporting success (or re-raising an
+/// earlier assertion failure). The scan covers exactly what exists beneath the
+/// harness root at scan time: every regular file is read and checked, and any
+/// symlink fails the proof instead of being skipped, so no unscanned path can
+/// point outside the scratch root. `cleanup.json` is outside this scope by
+/// construction: the supervisor writes it after the command exits, and it
+/// records metadata only (command status, handled signal, per-child teardown),
+/// never command data.
 fn finish_case(path_name: &str, secrets: &[&[u8]], outcome: std::thread::Result<()>) {
     let root = required_path("GMELL_HARNESS_ROOT");
     let observation = root.join("rust-broker-proof.txt");
@@ -872,6 +926,14 @@ fn scan_directory(directory: &Path, secrets: &[&[u8]]) {
     for entry in fs::read_dir(directory).expect("scan harness artifacts") {
         let entry = entry.expect("read harness artifact entry");
         let file_type = entry.file_type().expect("inspect harness artifact type");
+        // Fail closed: a symlink skipped by a regular-file scan would be an
+        // unscanned gap that could point outside the scratch root, so its
+        // presence is proof failure. The scan never follows links.
+        assert!(
+            !file_type.is_symlink(),
+            "symlink {} inside the retained harness root; the artifact scan refuses to skip it",
+            entry.path().display()
+        );
         if file_type.is_dir() {
             scan_directory(&entry.path(), secrets);
         } else if file_type.is_file() {
@@ -884,6 +946,10 @@ fn scan_directory(directory: &Path, secrets: &[&[u8]]) {
                 entry.path().display()
             );
         }
+        // Live Unix sockets (the private bus and control sockets) are the only
+        // other entries the retained root holds while the command runs; they
+        // carry no readable retained bytes and are deliberately outside the
+        // scan scope.
     }
 }
 
