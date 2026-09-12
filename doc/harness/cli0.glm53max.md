@@ -118,8 +118,10 @@ closed on any symlink. Observed `artifact_scan=passed`.
 - Exit codes 3 (private interface unavailable) and 4 (service unavailable)
   are unit-covered in `src/cli/mod.rs` (`service_errors_map_to_stable_exit_codes`);
   this proof does not force those daemon-side conditions.
-- No `change` coverage: the change subcommand is deliberately unimplemented
-  (`gmell-change`) and this proof stops at list/unlock.
+- No `change` coverage in this proof run: when it was recorded the change
+  subcommand was deliberately unimplemented (`gmell-change`) and this proof
+  stopped at list/unlock. The same proof binary now also covers `change`;
+  see [`change0.glm53max.md`](/doc/harness/change0.glm53max.md).
 
 ## Environment
 
