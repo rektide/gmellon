@@ -9,9 +9,10 @@ usage: dev/harness/check [--keep-success] MODE
 MODE:
   rust-cargo    run ignored Rust real-daemon tests with cargo test
   rust-nextest run ignored Rust real-daemon tests with cargo nextest
+  rust-broker   run the ignored Rust private-broker collection proof with cargo nextest
   python        run Python lifecycle tests, behavior matrix, and smoke proof
   broker        run private dbus-broker lifecycle tests and interface proof
-  all           run rust-nextest, control-only Python, and broker checks
+  all           run rust-nextest, rust-broker, control-only Python, and broker checks
 
 An explicit invocation fails before testing when a required external tool is
 missing. Ordinary `cargo test` and `cargo nextest run` visibly skip the ignored
@@ -68,6 +69,21 @@ need_broker() {
 		fail 'host systemd runtime /run/systemd/system is unavailable; --scope=system cannot be exercised'
 	[ -x dev/harness/broker.py ] || fail 'dev/harness/broker.py is missing or not executable'
 	[ -x dev/harness/private_bus_probe.py ] || fail 'dev/harness/private_bus_probe.py is missing or not executable'
+}
+
+run_rust_broker() {
+	need_broker
+	need_fixed_tool busctl 'install systemd (busctl) for the lock-call monitor proof'
+	need_fixed_tool stdbuf 'install coreutils (stdbuf) for line-buffered monitor output'
+	need_path_tool cargo 'install the Rust toolchain and make `cargo` available'
+	cargo nextest --version >/dev/null 2>&1 || \
+		fail 'cargo-nextest is unavailable; install it to run the private-broker Rust proof'
+	if [ -n "$KEEP_SUCCESS" ]; then
+		GMELL_HARNESS_KEEP_SUCCESS=1 \
+			cargo nextest run --test broker_collections --run-ignored ignored-only
+	else
+		cargo nextest run --test broker_collections --run-ignored ignored-only
+	fi
 }
 
 run_rust_cargo() {
@@ -145,6 +161,9 @@ rust-cargo)
 rust-nextest)
 	run_rust_nextest
 	;;
+rust-broker)
+	run_rust_broker
+	;;
 python)
 	run_python
 	;;
@@ -153,6 +172,7 @@ broker)
 	;;
 all)
 	run_rust_nextest
+	run_rust_broker
 	run_python
 	run_broker
 	;;

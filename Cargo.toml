@@ -16,3 +16,7 @@ tempfile = "3.27.0"
 [[test]]
 name = "real_daemon"
 path = "tests/harness/real_daemon.rs"
+
+[[test]]
+name = "broker_collections"
+path = "tests/harness/broker_collections.rs"
