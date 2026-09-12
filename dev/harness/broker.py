@@ -581,9 +581,6 @@ def wait_for_command(
 ) -> int:
     while True:
         signals.raise_if_pending()
-        return_code = command.poll()
-        if return_code is not None:
-            return return_code
         daemon_code = daemon.poll()
         if daemon_code is not None:
             raise lifecycle.HarnessFailure(
@@ -596,6 +593,9 @@ def wait_for_command(
             )
         if pidfd_exited(owned_broker.broker_pidfd):
             raise lifecycle.HarnessFailure("dbus-broker exited while the command was running")
+        return_code = command.poll()
+        if return_code is not None:
+            return return_code
         time.sleep(0.05)
 
 
