@@ -17,9 +17,24 @@ It exists because every other door is shut on a headless, SSH-only machine:
 | `secret-tool` | has `lock`, has `search --unlock`, but **no `unlock` command** — unlocking is deliberately prompt-gated |
 | Secret Service `Unlock()` D-Bus call | returns a *prompt object*; prompts are GUI |
 
-The control socket is the one interface that accepts a password from any
-client of yours, PAM or not. `pam_gnome_keyring` speaks it; `gmellon` is its
-shell-native sibling.
+The control socket accepts a password from any client of yours, PAM or not.
+`pam_gnome_keyring` speaks it; `gmellon` is its shell-native sibling.
+
+A second door exists, proven after the paragraph above was first written:
+GNOME Keyring's Secret Service also exposes the deliberately undocumented
+`org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface`, whose
+`UnlockWithMasterPassword`, `ChangeWithMasterPassword`, and
+`CreateWithMasterPassword` methods accept a collection's master password
+from any D-Bus client — headless, no prompt, and per collection rather
+than only `login`. `gmellon`'s collection-oriented Rust client
+([`src/secret_service`](/src/secret_service)) speaks it; the isolated
+private-broker harness proves listing, unlocking, and re-keying multiple
+collections with distinct passwords by stable ID, without ever locking a
+collection to verify a password
+([`doc/harness/collections0.glm53max.md`](/doc/harness/collections0.glm53max.md)).
+Treat it exactly as GNOME names it: an internal, **unsupported** interface
+that may change or vanish without notice. The standard Secret Service API
+still offers no supported headless password entry.
 
 ## Usage (spec)
 
