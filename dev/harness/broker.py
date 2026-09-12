@@ -34,6 +34,18 @@ BUS_PATH = "/org/freedesktop/DBus"
 KEYRING_NAMES = ("org.gnome.keyring", "org.freedesktop.secrets")
 JOURNAL_SOCKET = Path("/run/systemd/journal/socket")
 SYSTEMD_RUNTIME = Path("/run/systemd/system")
+SYSTEM_BUS_SOCKET = Path("/run/dbus/system_bus_socket")
+# systemd-socket-activate 261 exec_process() passes only this whitelist (plus
+# LISTEN_* variables and explicit --setenv values) to the activated service;
+# every other variable in the activator's environment is stripped.
+SOCKET_ACTIVATE_ENVIRONMENT_WHITELIST = (
+    "TERM",
+    "COLORTERM",
+    "NO_COLOR",
+    "PATH",
+    "USER",
+    "HOME",
+)
 GDBUS_CALL_TIMEOUT_SECONDS = 1.0
 
 BUS_CONFIG = """<busconfig>
@@ -112,12 +124,19 @@ def private_bus_environment(
 def launcher_environment(
     sandbox: lifecycle.Sandbox, paths: BrokerPaths
 ) -> dict[str, str]:
-    environment = private_bus_environment(sandbox, paths)
-    # The successful assessed composition redirected the selected system scope
-    # away from the real system bus as well. With zero service definitions the
-    # launcher's documented activation scope has no units to activate.
-    environment["DBUS_SYSTEM_BUS_ADDRESS"] = f"unix:path={paths.socket}"
-    return environment
+    # This environment reaches systemd-socket-activate, not dbus-broker-launch
+    # itself: the activator execs the service with only the whitelist above
+    # (plus LISTEN_*), so every other variable here - including the
+    # unreachable-scratch DBUS_SYSTEM_BUS_ADDRESS inherited from the base
+    # environment - is stripped before the launcher runs. dbus-broker-launch
+    # --scope=system then opens its libsystemd controller with
+    # sd_bus_open_system(), which connects to the real system bus socket on
+    # this host, and calls org.freedesktop.systemd1.Manager.Subscribe there
+    # even though this config declares zero activatable services. Redirecting
+    # the system-bus address here would be dead configuration that falsely
+    # suggests controller isolation: launcher contact with host systemd and
+    # the system bus is an accepted host dependency, recorded in evidence.
+    return private_bus_environment(sandbox, paths)
 
 
 def command_environment(
@@ -167,6 +186,22 @@ def require_host_dependencies() -> dict[str, str]:
     if not stat.S_ISSOCK(journal_metadata.st_mode):
         raise lifecycle.HarnessFailure(
             f"host journal endpoint is not a socket: {JOURNAL_SOCKET}"
+        )
+    # dbus-broker-launch --scope=system opens its libsystemd controller with
+    # sd_bus_open_system(), which eagerly connects to the host system bus:
+    # without it the launcher exits before readiness. The harness's
+    # DBUS_SYSTEM_BUS_ADDRESS never steers this connection (see
+    # launcher_environment), so the system bus is a hard host dependency.
+    try:
+        system_bus_metadata = SYSTEM_BUS_SOCKET.stat()
+    except FileNotFoundError as error:
+        raise lifecycle.HarnessFailure(
+            "dbus-broker-launch --scope=system requires the host system bus at "
+            f"{SYSTEM_BUS_SOCKET} for its libsystemd controller connection"
+        ) from error
+    if not stat.S_ISSOCK(system_bus_metadata.st_mode):
+        raise lifecycle.HarnessFailure(
+            f"host system bus endpoint is not a socket: {SYSTEM_BUS_SOCKET}"
         )
     if not SYSTEMD_RUNTIME.is_dir():
         raise lifecycle.HarnessFailure(
@@ -430,14 +465,19 @@ def prove_broker_ready(
         )
     launcher_identity(launcher)
     identity, pidfd = wait_for_broker_child(launcher, signals, deadline)
-    listener_inode = unix_listener_inode(paths.socket)
-    launcher_fds = process_socket_fds(launcher.pid, listener_inode)
-    broker_fds = process_socket_fds(identity.pid, listener_inode)
-    if not launcher_fds or not broker_fds:
+    try:
+        listener_inode = unix_listener_inode(paths.socket)
+        launcher_fds = process_socket_fds(launcher.pid, listener_inode)
+        broker_fds = process_socket_fds(identity.pid, listener_inode)
+        if not launcher_fds or not broker_fds:
+            raise lifecycle.HarnessFailure(
+                "listener FD ownership was not shared by dbus-broker-launch and dbus-broker"
+            )
+    except BaseException:
+        # Keep exact ownership: the pidfd acquired above still refers to the
+        # broker child, so only this function may close it, on every path.
         os.close(pidfd)
-        raise lifecycle.HarnessFailure(
-            "listener FD ownership was not shared by dbus-broker-launch and dbus-broker"
-        )
+        raise
     return (
         OwnedBroker(
             launcher=launcher,
@@ -604,12 +644,41 @@ def wait_pidfd(pidfd: int, timeout: float) -> bool:
     return bool(readable)
 
 
-def wait_process_absent(pid: int, timeout: float) -> bool:
+def process_identity_matches(pid: int, start_time_ticks: int) -> bool:
+    """Whether /proc/<pid> still refers to the exact recorded process.
+
+    Start ticks from /proc/<pid>/stat (field 22) stay stable for the life of
+    the process, including while it is a zombie. A missing /proc entry, or an
+    entry whose start ticks differ, therefore means the recorded process is
+    gone from this PID - for an exited process that it was reaped (possibly
+    followed by PID reuse), never that it is still running.
+    """
+    try:
+        raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        # ENOENT for a fully gone PID, ESRCH for the transient procfs
+        # window while the entry disappears underneath the open.
+        return False
+    after_command = raw_stat.rsplit(")", 1)[1].split()
+    return int(after_command[19]) == start_time_ticks
+
+
+def wait_broker_reaped(identity: ProcessIdentity, timeout: float) -> None:
+    """Require the exited broker's launcher to reap it, bounded.
+
+    The caller has already observed exit through the broker pidfd, so a
+    matching /proc entry here can only be an unreaped zombie. If the PID was
+    reused after reaping, the start ticks differ and the wait succeeds: only a
+    reaped process can have its PID reused. The check is one-directional - it
+    can fail loudly on a stalled launcher, never pass on an unreaped broker.
+    """
     deadline = time.monotonic() + timeout
-    path = Path(f"/proc/{pid}")
-    while path.exists() and time.monotonic() < deadline:
+    while process_identity_matches(identity.pid, identity.start_time_ticks):
+        if time.monotonic() >= deadline:
+            raise lifecycle.HarnessFailure(
+                f"dbus-broker PID {identity.pid} exited but was not reaped by its launcher"
+            )
         time.sleep(0.02)
-    return not path.exists()
 
 
 def stop_owned_broker(
@@ -631,19 +700,31 @@ def stop_owned_broker(
 
     # dbus-broker-launch is the broker's real parent. Give it the opportunity
     # to reap that exact child before terminating/reaping the launcher itself.
-    if not wait_process_absent(owned.broker.pid, lifecycle.SHUTDOWN_TIMEOUT_SECONDS):
-        raise lifecycle.HarnessFailure(
-            f"dbus-broker PID {owned.broker.pid} exited but was not reaped by its launcher"
-        )
+    wait_broker_reaped(owned.broker, lifecycle.SHUTDOWN_TIMEOUT_SECONDS)
+
+    # A launcher whose broker died by signal always exits by itself once it
+    # has reaped the child (launcher_on_child_exit exits the event loop with
+    # EXIT_FAILURE). Wait briefly for that self-exit so the launcher's own
+    # status is observed instead of racing a TERM into its exit path.
+    if (
+        broker_sent_kill or not broker_was_live
+    ) and owned.launcher.poll() is None:
+        deadline = time.monotonic() + lifecycle.SHUTDOWN_TIMEOUT_SECONDS
+        while owned.launcher.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
 
     launcher_shutdown = lifecycle.terminate_children(
         ((owned.launcher, "broker-launcher"),)
     )[0]
-    if launcher_shutdown.return_code not in {
-        0,
-        -signal.SIGTERM,
-        -signal.SIGKILL,
-    }:
+    expected_launcher_codes = {0, -signal.SIGTERM, -signal.SIGKILL}
+    if broker_sent_kill or not broker_was_live:
+        # dbus-broker-launch 37 launcher_on_child_exit() exits with
+        # EXIT_FAILURE (1) whenever its broker child died by a signal instead
+        # of exiting normally. Both cases here are harness-supervised teardown,
+        # not launcher faults: the broker was KILLed by this function after
+        # TERM did not suffice, or had already exited before teardown began.
+        expected_launcher_codes.add(1)
+    if launcher_shutdown.return_code not in expected_launcher_codes:
         raise lifecycle.HarnessFailure(
             "dbus-broker-launch exited abnormally with status "
             f"{launcher_shutdown.return_code}"
@@ -658,6 +739,23 @@ def stop_owned_broker(
         reaper=f"broker-launcher PID {owned.launcher.pid}",
     )
     return launcher_shutdown, broker_shutdown
+
+
+def validate_broker_daemon_shutdown(
+    result: lifecycle.ChildShutdown, failure_already_recorded: bool
+) -> None:
+    """Validate daemon teardown without masking an already-recorded failure.
+
+    Identical to ``lifecycle.validate_daemon_shutdown`` except that a daemon
+    which exited before harness-initiated teardown is only a harness failure
+    when nothing else already failed: when the broker or launcher died under
+    the command, the daemon's private bus disappears and the daemon exits by
+    itself (observed status 0), and the primary failure is the actionable
+    report. A TERMed daemon is always status-checked strictly.
+    """
+    if not result.sent_term and failure_already_recorded:
+        return
+    lifecycle.validate_daemon_shutdown(result)
 
 
 def discover_partial_broker(
@@ -716,16 +814,45 @@ def write_evidence(
         "isolation": {
             "kind": "configuration-and-session",
             "daemon_environment": private_bus_environment(sandbox, paths),
-            "launcher_environment": launcher_environment(sandbox, paths),
+            "launcher_environment": {
+                "passed_to_systemd_socket_activate": launcher_environment(
+                    sandbox, paths
+                ),
+                "reaches_dbus_broker_launch": (
+                    "only the systemd-socket-activate 261 exec_process whitelist: "
+                    + ", ".join(SOCKET_ACTIVATE_ENVIRONMENT_WHITELIST)
+                    + ", plus LISTEN_* variables"
+                ),
+                "dbus_system_bus_address_reaches_launcher": False,
+            },
             "command_environment": safe_environment,
             "explicitly_passed_environment_names": list(pass_environment),
             "host_service_activation_directories": [],
             "activatable_names": owned_broker.activatable_names,
+            "no_host_service_activation_proven_by": [
+                "zero service directories in the private bus config",
+                "ListActivatableNames returned only org.freedesktop.DBus",
+            ],
+            "launcher_controller": {
+                "connection": (
+                    "libsystemd sd_bus_open_system (dbus-broker-launch 37 "
+                    "launcher_connect)"
+                ),
+                "system_bus_socket": str(SYSTEM_BUS_SOCKET),
+                "isolated_by_harness": False,
+                "note": (
+                    "the launcher calls org.freedesktop.systemd1.Manager.Subscribe "
+                    "on the host system bus regardless of service definitions; "
+                    "DBUS_SYSTEM_BUS_ADDRESS cannot redirect it because "
+                    "systemd-socket-activate strips it before exec"
+                ),
+            },
             "host_dependencies": {
                 "systemd_socket_activation_protocol": True,
                 "scope": "system",
                 "journal_socket": str(JOURNAL_SOCKET),
                 "systemd_runtime": str(SYSTEMD_RUNTIME),
+                "launcher_controller_system_bus": str(SYSTEM_BUS_SOCKET),
                 "total_host_independence": False,
             },
         },
@@ -909,7 +1036,7 @@ def run_command(
                 (child for child in direct_shutdown if child.name == "daemon"), None
             )
             if daemon_shutdown is not None:
-                lifecycle.validate_daemon_shutdown(daemon_shutdown)
+                validate_broker_daemon_shutdown(daemon_shutdown, failure is not None)
         except BaseException as error:
             cleanup_failure = error
 
@@ -1032,10 +1159,13 @@ def parse_args() -> argparse.Namespace:
   GMELL_HARNESS_BROKER_{STDOUT,STDERR}
 
 DBUS_SYSTEM_BUS_ADDRESS remains an unreachable scratch path for the daemon and
-command. The minimal bus config has no service directories: only this harness
-manually launches gnome-keyring-daemon. The assessed dbus-broker-launch
-topology still depends on host systemd socket-activation/journal facilities, so
-this is configuration and session isolation, not total host independence.
+command. The minimal bus config has no service directories, so no host D-Bus
+service activation exists; only this harness manually launches
+gnome-keyring-daemon. The launcher itself is exec'd by systemd-socket-activate
+with a minimal whitelisted environment: its libsystemd controller connects to
+the real system bus and subscribes to the host systemd manager, so host
+systemd/journald/system-bus facilities are required dependencies. This is
+configuration and session isolation, not total host independence.
 
 Exit, retention, --pass-env, nesting, and stream semantics match lifecycle.py.
 """,

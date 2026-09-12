@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
 
 SERVICE = "org.freedesktop.secrets"
 SERVICE_PATH = "/org/freedesktop/secrets"
+SERVICE_INTERFACE = "org.freedesktop.Secret.Service"
+COLLECTION_INTERFACE = "org.freedesktop.Secret.Collection"
+PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
 PRIVATE_INTERFACE = "org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface"
 PRIVATE_ENVIRONMENT_NAMES = (
     "HOME",
@@ -45,6 +49,38 @@ def run(*arguments: str) -> str:
     return result.stdout
 
 
+def property_get(object_path: str, interface: str, name: str) -> str:
+    return run(
+        "call",
+        f"--address={os.environ['DBUS_SESSION_BUS_ADDRESS']}",
+        f"--dest={SERVICE}",
+        f"--object-path={object_path}",
+        f"--method={PROPERTIES_INTERFACE}.Get",
+        interface,
+        name,
+    ).strip()
+
+
+def measure_collections() -> tuple[list[str], dict[str, bool]]:
+    """Read the advertised collection set and each collection's Locked state.
+
+    Both are standard Secret Service property reads: no collection is created,
+    locked, unlocked, or otherwise mutated. A collection that disappears
+    between the two reads fails loudly instead of being silently skipped.
+    """
+    output = property_get(SERVICE_PATH, SERVICE_INTERFACE, "Collections")
+    inner = output[output.index("[") + 1 : output.rindex("]")]
+    paths = re.findall(r"objectpath '([^']+)'", inner)
+    locked: dict[str, bool] = {}
+    for path in paths:
+        state = property_get(path, COLLECTION_INTERFACE, "Locked")
+        match = re.fullmatch(r"\(<(true|false)>,\)", state)
+        if match is None:
+            raise RuntimeError(f"unexpected Locked response shape for {path}: {state}")
+        locked[path] = match.group(1) == "true"
+    return paths, locked
+
+
 def main() -> int:
     if os.environ.get("GMELL_HARNESS_MODE") != "private-broker":
         raise RuntimeError("private_bus_probe.py must run inside broker.py")
@@ -55,12 +91,14 @@ def main() -> int:
         raise RuntimeError("command did not receive the explicit private bus address")
     socket.resolve(strict=True).relative_to(root.resolve(strict=True))
 
+    collections_before, locked_before = measure_collections()
+
     session = run(
         "call",
         f"--address={expected_address}",
         f"--dest={SERVICE}",
         f"--object-path={SERVICE_PATH}",
-        "--method=org.freedesktop.Secret.Service.OpenSession",
+        f"--method={SERVICE_INTERFACE}.OpenSession",
         "plain",
         "<''>",
     )
@@ -82,14 +120,31 @@ def main() -> int:
     if missing:
         raise RuntimeError(f"private interface introspection omitted: {', '.join(missing)}")
 
+    collections_after, locked_after = measure_collections()
+
+    if collections_after != collections_before:
+        raise RuntimeError(
+            "collection set changed across OpenSession and introspection: "
+            f"{collections_before} -> {collections_after}"
+        )
+    if locked_after != locked_before:
+        raise RuntimeError(
+            "collection lock state changed across OpenSession and introspection: "
+            f"{locked_before} -> {locked_after}"
+        )
+
     (root / "private-bus-probe.json").write_text(
         json.dumps(
             {
                 "plain_session_opened": True,
                 "private_interface_introspectable": True,
                 "private_interface": PRIVATE_INTERFACE,
-                "password_method_called": False,
-                "collection_lock_state_changed": False,
+                "collections_before": collections_before,
+                "locked_before": locked_before,
+                "collections_after": collections_after,
+                "locked_after": locked_after,
+                "collections_unchanged": True,
+                "locked_state_unchanged": True,
             },
             indent=2,
         )

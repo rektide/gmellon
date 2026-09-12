@@ -62,6 +62,8 @@ need_broker() {
 	need_fixed_tool gdbus 'install the GLib D-Bus command-line tools'
 	[ -S /run/systemd/journal/socket ] || \
 		fail 'host journal socket /run/systemd/journal/socket is unavailable; dbus-broker-launch cannot start in this topology'
+	[ -S /run/dbus/system_bus_socket ] || \
+		fail 'host system bus /run/dbus/system_bus_socket is unavailable; the dbus-broker-launch --scope=system controller requires it'
 	[ -d /run/systemd/system ] || \
 		fail 'host systemd runtime /run/systemd/system is unavailable; --scope=system cannot be exercised'
 	[ -x dev/harness/broker.py ] || fail 'dev/harness/broker.py is missing or not executable'
