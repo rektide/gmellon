@@ -667,12 +667,16 @@ dev/harness/check rust-broker
 It additionally preflights `busctl` and `stdbuf`, then runs the ignored
 [`tests/harness/broker_collections.rs`](/tests/harness/broker_collections.rs)
 proof under `broker.py`. The proof's zbus fixture performs the only permitted
-mutation setup — private `CreateWithMasterPassword` plus counted standard
-`Lock` calls on disposable collections — while every assertion runs through
-the public `BlockingClient`. A match-filtered `busctl monitor` proves ordinary
-unlock/change never emits a standard Lock call; generated passwords are
-zeroized, excluded from monitor output by the match rule, and scanned out of
-every retained artifact. See
+mutation setup — private `CreateWithMasterPassword` (one collection labeled
+exactly `login`, satisfying the parent acceptance's literal login-plus-second
+requirement, plus a second tagged collection) with counted standard `Lock`
+calls — while every assertion runs through the public `BlockingClient`. A
+match-filtered `busctl monitor` proves ordinary unlock/change never emits a
+standard Lock call (that no password method is sent on the already-unlocked
+path is the committed client's early return plus the observed outcome, not a
+monitor claim); generated passwords are zeroized, excluded from monitor
+output by the match rule, and scanned out of every retained regular artifact
+by a walk that fails closed on symlinks. See
 [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md).
 
 `dev/harness/check all` runs explicit Rust real-daemon tests, the Rust
@@ -898,12 +902,15 @@ now implemented as
 [`tests/harness/broker_collections.rs`](/tests/harness/broker_collections.rs)
 with version-scoped evidence in
 [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md). The
-proof creates at least two disposable collections under the private daemon
-through fixture-only private creation plus counted standard locks, exercises
-the product zbus client against stable collection IDs, and demonstrates that
-ordinary unlock inspects lock state and returns already-unlocked without
-locking, relocking, or pretending to verify the supplied password. Password
-methods are invoked only for actually locked fixtures, with generated values
-excluded from logs, argv, environment, and retained artifacts, and a
-match-filtered monitor attributing every standard Lock call to the fixture
-connection.
+proof creates the literal `login` collection (exact stable ID `login`,
+persisted as `login.keyring`) plus a second disposable collection under the
+private daemon through fixture-only private creation plus counted standard
+locks, exercises the product zbus client against stable collection IDs, and
+demonstrates that ordinary unlock inspects lock state and returns
+already-unlocked without locking, relocking, or pretending to verify the
+supplied password. Password methods are invoked only for actually locked
+fixtures, with generated values excluded from logs, argv, environment, and
+retained artifacts — the final artifact scan reads every regular file
+present at scan time beneath the harness root and fails closed on any
+symlink — with a match-filtered monitor attributing every standard Lock call
+to the fixture connection.

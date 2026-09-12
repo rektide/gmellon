@@ -6,7 +6,7 @@ resource: /doc/harness/collections0.glm53max.md
 tags: [gmellon, harness, dbus-broker, gnome-keyring, secret-service, zbus, collections]
 status: draft
 generated: { by: model:zai/glm-5.3-max, at: 2026-09-12T01:30:00-04:00 }
-verified: { by: model:zai/glm-5.3-max, at: 2026-09-12T01:30:00-04:00 }
+verified: { by: model:zai/glm-5.3-max, at: 2026-09-11T21:45:00-04:00 }
 stale_after: 2027-03-12
 sources:
   - id: rust-proof
@@ -66,9 +66,13 @@ The proof demonstrates, entirely through the committed public
 `gmellon::secret_service::BlockingClient`
 ([`blocking.rs`](/src/secret_service/blocking.rs)):
 
-1. two persistent disposable collections with distinct random passwords are
-   addressable by stable `CollectionId` after label discovery, never by a
-   hardcoded object path or label;
+1. one persistent disposable collection is labeled exactly `login`, and the
+   discovered stable `CollectionId` is **exactly `login`** (observed daemon
+   48.0 behavior: the label needs no escaping) with the token store persisted
+   as `login.keyring` beneath the isolated root — the parent acceptance's
+   literal login requirement — alongside a second persistent collection with a
+   distinguishable tagged label; both are addressable by stable `CollectionId`
+   after label discovery, never by a hardcoded object path or label;
 2. a wrong password on a locked collection is `PasswordDenied`, and the denial
    does not change lock state;
 3. each distinct password unlocks only its own collection — the sibling stays
@@ -77,8 +81,8 @@ The proof demonstrates, entirely through the committed public
    left `false`, for a wrong *and* the right password, without relocking and
    without password verification;
 5. a missing ID returns `CollectionNotFound` for both unlock and change;
-6. `change_password` A→A2 succeeds, and after a fixture-only relock the former
-   password A is denied while A2 unlocks;
+6. `change_password` L→L2 succeeds, and after a fixture-only relock the former
+   password L is denied while L2 unlocks;
 7. on the wire, **ordinary product unlock/change never emits a standard
    `org.freedesktop.Secret.Service.Lock` method call** — a match-filtered bus
    monitor attributes every observed Lock call to the fixture connection.
@@ -97,18 +101,19 @@ boundary)
 
 ## Exact commands and results
 
-```sh
-dev/harness/check rust-broker
-# Summary: 1 test run: 1 passed, 0 skipped
-# broker.py: PASS: command completed in isolated private-broker harness
+2026-09-11/12 correction re-verification (after the GX review corrections):
 
+```sh
+dev/harness/check rust-broker          # PASS (and 4x more below)
 cargo nextest run --test broker_collections --run-ignored ignored-only
-# Summary: 1 test run: 1 passed, 0 skipped   (run 4x, all passed)
+# Summary: 1 test run: 1 passed, 0 skipped   (2x, both passed; 6 successful
+# runs of the corrected proof in total this session)
 
 cargo nextest run          # Summary: 61 tests run: 61 passed, 3 skipped
 dev/harness/check broker   # 7/7 focused tests + interface smoke, PASS
-dev/harness/check rust-nextest  # 2/2 control-path real-daemon tests, PASS
-dev/harness/check python   # 10/10 focused + behavior matrix + smoke, PASS
+dev/harness/check all
+# exit 0: rust-nextest 2/2 real-daemon control tests, rust-broker 1/1 proof,
+# python 10/10 focused + behavior matrix + smoke, broker 7/7 + probe
 cargo fmt --all -- --check   # clean
 cargo clippy --all-targets --all-features -- -D warnings   # clean
 cargo doc --no-deps          # clean
@@ -116,35 +121,49 @@ PATH=/nonexistent dev/harness/check rust-broker
 # HARNESS PREREQUISITE FAILURE: python3 was not found on PATH; exit 125
 ```
 
-Retained successful run (GMELL_HARNESS_KEEP_SUCCESS=1):
-`/home/rektide/tmp-opencode/gmell-h-bz2zhy5v` — `rust-broker-proof.txt`
-(`artifact_scan=passed`, `secret_values=4`), `lock-monitor.txt`, and both
-encrypted `<label>.keyring` fixture stores.
+Retained successful run (`dev/harness/check --keep-success rust-broker`):
+`/home/rektide/tmp-opencode/gmell-h-5g5tbiw8` — `rust-broker-proof.txt`
+(`artifact_scan=passed`, `secret_values=4`), `lock-monitor.txt`
+(`fixture_lock_calls=3 observed_lock_calls=3 senders_match_fixture=true`), and
+the encrypted `login.keyring` plus `gmellon-proof-second-<tag>.keyring` fixture
+stores; the root contains no symlinks.
+
+Observed anomaly, recorded honestly: one direct (unkept) successful run at
+2026-09-11 21:28 left a fully complete, clean, secret-free retained root
+(`gmell-h-h46jz2me`, `command_return_code=0`, all children reaped) although
+neither `--keep-success` nor any failure/signal was involved; it did not recur
+across five subsequent unkept runs. Retention is the contract's safe direction,
+so this is noted rather than chased; no action taken in this slice.
 
 ## Fixture and lock-state transitions
 
 All state is observed through `BlockingClient::collections()`. Fixture calls
 (private `CreateWithMasterPassword`, standard `Lock`) run on a separate zbus
-connection whose unique bus name is the only permitted Lock sender.
+connection whose unique bus name is the only permitted Lock sender. Passwords:
+login's is L, the second collection's is S, `wrong` is a fourth random value,
+and L2 is the changed login password.
 
-| Step | alpha | beta | Product call / fixture action | Result |
+| Step | login | second | Product call / fixture action | Result |
 | --- | --- | --- | --- | --- |
-| fixture create alpha (pw A), beta (pw B) | unlocked | unlocked | — | persisted `<label>.keyring`; D-Bus IDs are the escaped labels |
-| fixture `Lock(alpha)`, `Lock(beta)` | locked | locked | — | 2 counted fixture lock calls |
-| `unlock(alpha, wrong)` | locked | locked | product | `Err(PasswordDenied)` |
-| `unlock(beta, A)` (cross password) | locked | locked | product | `Err(PasswordDenied)` |
-| `unlock(alpha, A)` | unlocked | locked | product | `Ok(Unlocked)`; beta untouched |
-| `unlock(beta, B)` | unlocked | unlocked | product | `Ok(Unlocked)` |
-| `unlock(alpha, wrong)` | unlocked | unlocked | product | `Ok(AlreadyUnlocked)`; state stays false |
-| `unlock(alpha, A)` | unlocked | unlocked | product | `Ok(AlreadyUnlocked)` |
+| fixture create `login` (pw L), `second` (pw S) | unlocked | unlocked | — | persisted `login.keyring` (ID exactly `login`) and `gmellon-proof-second-<tag>.keyring`; second's D-Bus ID is the escaped label |
+| fixture `Lock(login)`, `Lock(second)` | locked | locked | — | 2 counted fixture lock calls |
+| `unlock(login, wrong)` | locked | locked | product | `Err(PasswordDenied)` |
+| `unlock(second, L)` (cross password) | locked | locked | product | `Err(PasswordDenied)` |
+| `unlock(login, L)` | unlocked | locked | product | `Ok(Unlocked)`; second untouched |
+| `unlock(second, S)` | unlocked | unlocked | product | `Ok(Unlocked)` |
+| `unlock(login, wrong)` | unlocked | unlocked | product | `Ok(AlreadyUnlocked)`; state stays false |
+| `unlock(login, L)` | unlocked | unlocked | product | `Ok(AlreadyUnlocked)` |
 | `unlock(missing, …)` / `change_password(missing, …)` | unlocked | unlocked | product | `Err(CollectionNotFound)` |
-| `change_password(alpha, A→A2)` | unlocked | unlocked | product | `Ok(())` (credential swap leaves it unlocked) |
-| fixture `Lock(alpha)` | locked | unlocked | — | 3rd counted fixture lock call |
-| `unlock(alpha, A)` | locked | unlocked | product | `Err(PasswordDenied)` |
-| `unlock(alpha, A2)` | unlocked | unlocked | product | `Ok(Unlocked)` |
+| `change_password(login, L→L2)` | unlocked | unlocked | product | `Ok(())` (credential swap leaves it unlocked) |
+| fixture `Lock(login)` | locked | unlocked | — | 3rd counted fixture lock call |
+| `unlock(login, L)` | locked | unlocked | product | `Err(PasswordDenied)` |
+| `unlock(login, L2)` | unlocked | unlocked | product | `Ok(Unlocked)` |
 
-## No-relock evidence
+## No-relock and no-verification evidence
 
+Two distinct claims, with distinct evidence; neither is overstated:
+
+**No standard Lock call (monitor-proven).**
 `stdbuf -oL /usr/bin/busctl --address=<private bus> monitor
 --match="interface='org.freedesktop.Secret.Service',member='Lock'"` is armed
 before any fixture traffic; readiness is gated on the tool's
@@ -162,9 +181,26 @@ senders_match_fixture=true
 ```
 
 Any product-emitted Lock would break the exact count or the sender
-attribution; a lock-then-verify implementation would additionally surface as
-`PasswordDenied` instead of `AlreadyUnlocked` in step 7. The daemon-side
-shortcut is real: upstream `gkd_secret_unlock_with_secret` returns success
+attribution. This is what the monitor proves: ordinary product
+unlock/change **never emits a standard `Service.Lock` method call**.
+
+**No password method on the already-unlocked path (code-path plus outcome,
+not the monitor).** The bus monitor is deliberately password-excluding, so it
+*cannot* prove anything about password-method invocation, and this evidence
+must not claim it does. That no password method is invoked when the
+collection is already unlocked is established by the committed client's
+early return — [`blocking.rs`](/src/secret_service/blocking.rs) checks the
+listed lock state and returns `UnlockOutcome::AlreadyUnlocked` before any
+`UnlockWithMasterPassword` call is constructed — together with the observed
+outcome in result item 4 (both a wrong and the correct password return
+`AlreadyUnlocked` with state still `false`). A lock-then-verify
+implementation would additionally surface as `PasswordDenied` instead of
+`AlreadyUnlocked` on the wrong-password already-unlocked step. The match rule
+must not be widened to "prove" this: doing so would deliver password-bearing
+bodies into the retained monitor log.
+
+The daemon-side shortcut is real and worth knowing even though the client no
+longer relies on it: upstream `gkd_secret_unlock_with_secret` returns success
 *without checking the password* when the collection is unlocked, which is why
 the committed client's lock-state guard (and this proof's password assertions,
 which only run while locked) matter.
@@ -175,7 +211,13 @@ which only run while locked) matter.
   <string>}` creates a **token** collection that persists immediately as
   `~/.local/share/keyrings/<label>.keyring` (raw label as file stem), while
   the D-Bus object-path ID is the escaped label — observed
-  `gmellon_2dproof_2dalpha_2dc4f96eee` for `gmellon-proof-alpha-c4f96eee`.
+  `gmellon_2dproof_2dsecond_2d<tag>` for `gmellon-proof-second-<tag>`.
+- A collection labeled exactly `login` persists as `login.keyring` and
+  exposes the **exact stable ID `login`** (the label contains no escapable
+  characters), which is how this proof satisfies the parent acceptance's
+  literal login-plus-second requirement without touching any real store. The
+  fresh isolated daemon starts with only the in-memory `session` collection,
+  so no pre-existing `login` collection can collide.
 - A just-created collection starts **unlocked** (it holds the master-password
   credential); the standard `Lock` destroys that credential.
 - `ChangeWithMasterPassword` swaps the collection credential to the new
@@ -198,14 +240,26 @@ product code changed in this proof.
 
 ## Secret handling and limits
 
-- Four random 32-byte printable passwords (A, B, wrong, A2) are generated from
+- Four random 32-byte printable passwords (L, S, wrong, L2) are generated from
   `/dev/urandom` inside the test process, held in `Zeroizing` buffers, never
   printed, logged, passed through argv or environment, and never appear in
   harness-exported values.
 - The raw monitor log and readiness log are scanned for all four values before
-  the redacted `lock-monitor.txt` summary replaces them; then every regular
-  file in the retained root (including `evidence.json`, daemon logs, and the
-  encrypted `*.keyring` stores) is scanned again before success.
+  the redacted `lock-monitor.txt` summary replaces them; then the retained
+  root is scanned again before success.
+- **Exact measured scan scope:** the final scan walks every directory beneath
+  `GMELL_HARNESS_ROOT` and reads every **regular file present at scan time**
+  — concretely `evidence.json`, `daemon.stdout.log`, `daemon.stderr.log`,
+  `rust-broker-proof.txt`, `lock-monitor.txt`, `bus.conf`, the launcher logs,
+  and the encrypted `login.keyring` / `gmellon-proof-second-<tag>.keyring`
+  stores. The walk **fails closed on symlinks**: any symlink inside the root
+  is proof failure, never a skip, so no unscanned path can point outside the
+  scratch root. The live Unix sockets (private bus, control) are the only
+  other entries; they carry no readable retained bytes and are outside the
+  scope. `cleanup.json` is also outside the scope **by construction**: the
+  supervisor writes it after the command exits, and it records metadata only
+  (command status, handled signal, per-child teardown), never command data —
+  verified against the retained run's `cleanup.json`.
 - **Limit, stated honestly:** the plain Secret Service session sends secret
   values inside D-Bus message bodies in the clear over the private socket.
   zbus-owned serialization buffers and daemon-side copies cannot be zeroized
@@ -228,12 +282,51 @@ product code changed in this proof.
   reachable through the D-Bus surface GNOME exposes.
 - One daemon per run; the proof does not cover daemon restart persistence
   (that remains with `behavior.py`'s supervisor model).
+- Maintainability follow-up, deliberately not taken in this correction slice:
+  the outer-runner helper set (`repository_root`, `require_command`,
+  `random_password`, `distinct_password`, `assert_beneath`, `finish_case`,
+  `scan_directory`, `contains`, `relay`, `required_path` — roughly 200 lines)
+  is duplicated between `tests/harness/broker_collections.rs` and
+  `tests/harness/real_daemon.rs`. Extracting a shared harness-support module
+  (behind a `#[path]` include or a shared crate) is a separate, reviewable
+  change and must not be mixed into evidence corrections.
 
 ## What this enables and the next slice
 
 With this proof, the collection-oriented backend claims of
 `gmell-dbus-collections` are now demonstrated end-to-end against an isolated
-real daemon: stable-ID addressing, per-collection passwords, no-relock unlock,
-and headless re-key. The natural next slice is CLI wiring (`gmell-unlock`,
+real daemon: stable-ID addressing — including the literal `login` collection
+plus a second — per-collection passwords, no-relock unlock, and headless
+re-key. The natural next slice is CLI wiring (`gmell-unlock`,
 `gmell-change`) over this client, plus extending the harness guide's fixture
-story if restart persistence coverage is wanted.
+story if restart persistence coverage is wanted. One product decision
+remains open in the parent ticket: whether the product session should use a
+Diffie-Hellman-encrypted Secret Service session instead of the plain session
+this proof and the current client use (the plain-session D-Bus-copy limit
+above is that decision's input).
+
+## Correction log
+
+- 2026-09-12 GX review corrections (applied to this document and
+  [`tests/harness/broker_collections.rs`](/tests/harness/broker_collections.rs),
+  verified the same day; earlier content preserved in version control):
+  1. **Exact `login` fixture.** The proof now creates one persistent
+     collection labeled exactly `login` (private `CreateWithMasterPassword`,
+     no run tag) and asserts the listed stable ID is exactly `login` with the
+     store persisted as `login.keyring`, alongside a second tagged collection
+     — satisfying the parent acceptance's literal "login plus a second"
+     wording. No real store is touched; the fallback to a control-only
+     fixture was not needed.
+  2. **Fail-closed artifact scan.** The retained-root scan now treats any
+     symlink as proof failure instead of silently skipping it, and the
+     evidence wording states the exact measured scope (every regular file
+     present at scan time) plus the fact that `cleanup.json` is
+     supervisor-written after the scan and metadata-only.
+  3. **No-verification wording.** The no-relock section now separates the
+     monitor-proven claim (no standard `Service.Lock` call) from the
+     code-path-plus-outcome claim (no password method invoked on the
+     already-unlocked path, established by the committed early return in
+     `blocking.rs`, not by the password-excluding monitor); the monitor
+     match rule is unchanged and must not be widened.
+  4. **No helper dedupe** in this slice; recorded as a maintainability
+     follow-up in Limitations.
