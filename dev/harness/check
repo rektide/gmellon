@@ -10,9 +10,10 @@ MODE:
   rust-cargo    run ignored Rust real-daemon tests with cargo test
   rust-nextest run ignored Rust real-daemon tests with cargo nextest
   rust-broker   run the ignored Rust private-broker collection proof with cargo nextest
+  rust-cli      run the ignored Rust private-broker CLI binary proof with cargo nextest
   python        run Python lifecycle tests, behavior matrix, and smoke proof
   broker        run private dbus-broker lifecycle tests and interface proof
-  all           run rust-nextest, rust-broker, control-only Python, and broker checks
+  all           run rust-nextest, rust-broker, rust-cli, control-only Python, and broker checks
 
 An explicit invocation fails before testing when a required external tool is
 missing. Ordinary `cargo test` and `cargo nextest run` visibly skip the ignored
@@ -71,18 +72,32 @@ need_broker() {
 	[ -x dev/harness/private_bus_probe.py ] || fail 'dev/harness/private_bus_probe.py is missing or not executable'
 }
 
-run_rust_broker() {
+need_rust_broker_proof() {
 	need_broker
 	need_fixed_tool busctl 'install systemd (busctl) for the lock-call monitor proof'
 	need_fixed_tool stdbuf 'install coreutils (stdbuf) for line-buffered monitor output'
 	need_path_tool cargo 'install the Rust toolchain and make `cargo` available'
 	cargo nextest --version >/dev/null 2>&1 || \
-		fail 'cargo-nextest is unavailable; install it to run the private-broker Rust proof'
+		fail 'cargo-nextest is unavailable; install it to run the private-broker Rust proofs'
+}
+
+run_rust_broker() {
+	need_rust_broker_proof
 	if [ -n "$KEEP_SUCCESS" ]; then
 		GMELL_HARNESS_KEEP_SUCCESS=1 \
 			cargo nextest run --test broker_collections --run-ignored ignored-only
 	else
 		cargo nextest run --test broker_collections --run-ignored ignored-only
+	fi
+}
+
+run_rust_cli() {
+	need_rust_broker_proof
+	if [ -n "$KEEP_SUCCESS" ]; then
+		GMELL_HARNESS_KEEP_SUCCESS=1 \
+			cargo nextest run --test broker_cli --run-ignored ignored-only
+	else
+		cargo nextest run --test broker_cli --run-ignored ignored-only
 	fi
 }
 
@@ -164,6 +179,9 @@ rust-nextest)
 rust-broker)
 	run_rust_broker
 	;;
+rust-cli)
+	run_rust_cli
+	;;
 python)
 	run_python
 	;;
@@ -173,6 +191,7 @@ broker)
 all)
 	run_rust_nextest
 	run_rust_broker
+	run_rust_cli
 	run_python
 	run_broker
 	;;

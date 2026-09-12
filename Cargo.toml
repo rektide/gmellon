@@ -20,3 +20,7 @@ path = "tests/harness/real_daemon.rs"
 [[test]]
 name = "broker_collections"
 path = "tests/harness/broker_collections.rs"
+
+[[test]]
+name = "broker_cli"
+path = "tests/harness/broker_cli.rs"

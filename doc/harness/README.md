@@ -23,7 +23,8 @@ The harness currently provides six executable entry points:
   interface is exposed, without making a password call.
 - [`dev/harness/check`](/dev/harness/check) is the maintained explicit check
   entry point for Rust, control-only Python, and private-broker checks,
-  including the multi-collection Rust proof (`rust-broker` mode).
+  including the multi-collection Rust proof (`rust-broker` mode) and the CLI
+  binary proof (`rust-cli` mode).
 
 The control-only core chain is complete: the smoke proof, reusable lifecycle,
 installed behavior matrix, and durable Rust-test integration are all
@@ -52,6 +53,7 @@ for how that authority divides:
 | Run or inspect daemon behavior coverage | [Quick start](#quick-start), [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md), and [Evolution guidance](#evolution-guidance) |
 | Integrate with Rust or CI | [Durable test integration](#durable-test-integration) and [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md) |
 | Run collection-oriented Secret Service tests | [Private-broker interface](#private-broker-interface), [Private-broker profile](#private-broker-profile), [`broker0.gpt6a.md`](/doc/harness/broker0.gpt6a.md), and [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md) |
+| Run or inspect the collection CLI binary proof | [Private-broker workflow](#private-broker-workflow) and [`cli0.glm53max.md`](/doc/harness/cli0.glm53max.md) |
 
 The supported reusable surfaces are the two executable command interfaces and
 their exported environments. Importable Python names in `lifecycle.py` and
@@ -97,6 +99,13 @@ Run the maintained Rust multi-collection proof against the private bus:
 
 ```sh
 dev/harness/check rust-broker
+```
+
+Run the maintained Rust CLI binary proof, which drives the actual compiled
+`gmellon` binary under the private bus:
+
+```sh
+dev/harness/check rust-cli
 ```
 
 See either complete executable contract without allocating a sandbox:
@@ -174,8 +183,8 @@ searching a caller-controlled daemon path.
 The private-broker profile additionally requires `systemd-socket-activate`,
 `dbus-broker-launch`, and `gdbus` in `/usr/bin:/bin`, a running host systemd
 runtime at `/run/systemd/system`, and `/run/systemd/journal/socket`. The Rust
-multi-collection proof additionally requires `busctl` and `stdbuf` there for
-its match-filtered Lock-call monitor. These dependencies are launcher/monitor
+broker proofs additionally require `busctl` and `stdbuf` there for their
+match-filtered Lock-call monitor. These dependencies are launcher/monitor
 constraints even though the private config defines no activatable services.
 This profile is not portable to a host without those facilities and must not
 silently substitute `dbus-daemon` or the real bus.
@@ -679,9 +688,39 @@ output by the match rule, and scanned out of every retained regular artifact
 by a walk that fails closed on symlinks. See
 [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md).
 
+The maintained Rust CLI binary proof is:
+
+```sh
+dev/harness/check rust-cli
+```
+
+It shares the same preflight, then runs the ignored
+[`tests/harness/broker_cli.rs`](/tests/harness/broker_cli.rs) proof under
+`broker.py`. The same fixture setup creates the literal `login` collection
+plus a second tagged collection and locks both, but every observed behavior
+belongs to the actual compiled `gmellon` binary, located through the
+Cargo-provided `CARGO_BIN_EXE_gmellon` integration-test path (never a hosted
+bus or store): `gmellon list` is asserted byte-deterministic with the exact
+`login` ID row and no control-protocol artifacts; default and explicit
+`unlock --stdin` exit codes and messages cover wrong (2), cross (2), correct
+(0), and missing (1) collections; and the already-unlocked path is proven
+with `/dev/null` stdin, which the `--stdin` reader would reject as
+unterminated — so exit 0 plus the not-checked message proves the pre-resolved
+lock state was trusted without reading any secret. Captured CLI stdout/stderr
+and every retained regular artifact are scanned for the generated passwords,
+and the match-filtered monitor attributes every standard Lock call to the
+fixture connection, so no CLI path locks or relocks. Python remains lifecycle
+and check wiring only. See [`cli0.glm53max.md`](/doc/harness/cli0.glm53max.md).
+
+Both broker proofs share their fixture, monitor, secret, and runner machinery
+through [`tests/harness/broker_common.rs`](/tests/harness/broker_common.rs),
+which builds on the cross-proof helpers in
+[`tests/harness/common/mod.rs`](/tests/harness/common/mod.rs) that
+`real_daemon.rs` also consumes.
+
 `dev/harness/check all` runs explicit Rust real-daemon tests, the Rust
-multi-collection proof, the control-only Python workflow, and this
-private-broker workflow.
+multi-collection proof, the Rust CLI binary proof, the control-only Python
+workflow, and this private-broker workflow.
 
 ### Complete static and Rust checks
 
@@ -705,6 +744,7 @@ dev/harness/behavior.py
 dev/harness/smoke.py
 dev/harness/broker.py -- dev/harness/private_bus_probe.py
 cargo nextest run --test broker_collections --run-ignored ignored-only
+cargo nextest run --test broker_cli --run-ignored ignored-only
 
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
@@ -797,6 +837,7 @@ one kind of truth:
 | [`dev/harness/check`](/dev/harness/check) | Maintained explicit prerequisite and check composition; delegates lifecycle/process orchestration |
 | [`tests/harness/real_daemon.rs`](/tests/harness/real_daemon.rs) | Ignored Rust integration boundary and real `SyncClient` assertions |
 | [`tests/harness/broker_collections.rs`](/tests/harness/broker_collections.rs) | Ignored Rust multi-collection proof under the private broker: zbus fixture setup plus `BlockingClient` behavior and no-relock wire evidence |
+| [`tests/harness/broker_cli.rs`](/tests/harness/broker_cli.rs) | Ignored Rust CLI binary proof under the private broker: the compiled `gmellon` binary's list/unlock exit codes, messages, no-read already-unlocked path, and secret scans |
 | [`dev/harness/tests/test_lifecycle.py`](/dev/harness/tests/test_lifecycle.py) | Executable acceptance coverage for lifecycle invariants and races |
 | [`dev/harness/behavior.py`](/dev/harness/behavior.py) and its [black-box test](/dev/harness/tests/test_behavior.py) | Reproducible installed-daemon control matrix plus explicit behavior-owned restart/fault transitions |
 | [`smoke0.gpt6a.md`](/doc/harness/smoke0.gpt6a.md) | Version-scoped installed-daemon evidence for the first UNLOCK/denial path and exact-PID cleanup; evidence, not timeless daemon promises |
@@ -805,6 +846,7 @@ one kind of truth:
 | [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md) | Version-scoped durable entry-point, skip/fail, Rust transport, parallel-isolation, and retained-artifact evidence |
 | [`broker0.gpt6a.md`](/doc/harness/broker0.gpt6a.md) | Version-scoped private broker, daemon name ownership, plain-session/interface, host-dependency, failure-retention, and cleanup evidence |
 | [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md) | Version-scoped multi-collection `BlockingClient` proof: stable-ID unlock/change, fixture-only locking, no-relock monitor evidence, and secret-handling limits |
+| [`cli0.glm53max.md`](/doc/harness/cli0.glm53max.md) | Version-scoped CLI binary proof: `gmellon list` determinism, default/explicit unlock exit semantics, no-read already-unlocked evidence, and secret scans |
 | [`prompt.md`](/doc/harness/prompt.md) | Epic safety invariants, upstream facts, ticket boundaries, and the original work graph, plus a completion-status section; planned acceptance, not completion evidence |
 | Product [`README.md`](/README.md) | Product contract, private wire protocol, and the unlock-or-create hazard that motivates real-daemon testing; not the harness lifecycle contract |
 | Beads graph | Review and work status; not runtime behavior |
@@ -914,3 +956,13 @@ retained artifacts — the final artifact scan reads every regular file
 present at scan time beneath the harness root and fails closed on any
 symlink — with a match-filtered monitor attributing every standard Lock call
 to the fixture connection.
+
+The CLI-facing slice extends the same fixture to the shipped binary:
+[`tests/harness/broker_cli.rs`](/tests/harness/broker_cli.rs) runs the
+actual compiled `gmellon` through `CARGO_BIN_EXE_gmellon` against the same
+isolated fixtures, with version-scoped evidence in
+[`cli0.glm53max.md`](/doc/harness/cli0.glm53max.md). The shared fixture,
+monitor, secret, and runner machinery now lives in
+[`tests/harness/common/mod.rs`](/tests/harness/common/mod.rs) and
+[`tests/harness/broker_common.rs`](/tests/harness/broker_common.rs) so
+further proof slices extend instead of duplicating it.
