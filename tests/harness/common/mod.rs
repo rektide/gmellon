@@ -3,8 +3,11 @@
 //! [`tests/harness/real_daemon.rs`](../../tests/harness/real_daemon.rs) and
 //! the private-broker proofs include this module for the common environment
 //! contract, disposable-secret generation, and the fail-closed retained
-//! artifact scan. Files here are compiled only as modules of the declared
-//! `[[test]]` targets; Cargo does not discover them as separate tests.
+//! artifact scan. The scan checks every generated secret for its literal
+//! bytes and for the reversible encodings a diagnostic tool could emit
+//! (contiguous hex, decoded decimal byte dumps). Files here are compiled
+//! only as modules of the declared `[[test]]` targets; Cargo does not
+//! discover them as separate tests.
 
 use std::env;
 use std::ffi::OsStr;
@@ -92,6 +95,63 @@ pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Reversible textual encodings of `secret` that a leaked log line could
+/// carry even when the raw bytes are absent: contiguous lowercase and
+/// uppercase hex. (busctl's per-byte decimal dumps are handled separately by
+/// [`contains_byte_dump`], because their separators defeat a plain search.)
+pub fn contains_encoded(haystack: &[u8], secret: &[u8]) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    let lower: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+    let upper: String = secret.iter().map(|byte| format!("{byte:02X}")).collect();
+    contains(haystack, lower.as_bytes()) || contains(haystack, upper.as_bytes())
+}
+
+/// Whether `haystack` carries `secret` as a decoded byte-array dump, in the
+/// `BYTE <decimal>;` token form `busctl monitor` prints for `ay` bodies.
+///
+/// The tokens are newline-separated, so the values are extracted in order
+/// and searched as one contiguous reconstructed stream; only a lossy text
+/// view is examined, which cannot create tokens that were not already
+/// present as text.
+pub fn contains_byte_dump(haystack: &[u8], secret: &[u8]) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(haystack);
+    let mut stream = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("BYTE ") else {
+            continue;
+        };
+        let Some(digits) = rest.strip_suffix(';') else {
+            continue;
+        };
+        if let Ok(value) = digits.trim().parse::<u8>() {
+            stream.push(value);
+        }
+    }
+    contains(&stream, secret)
+}
+
+/// One secret is absent only when neither its bytes nor their reversible
+/// encodings appear.
+pub fn assert_secret_absent(haystack: &[u8], secret: &[u8], subject: &str) {
+    assert!(
+        !contains(haystack, secret),
+        "generated password appeared literally in {subject}"
+    );
+    assert!(
+        !contains_encoded(haystack, secret),
+        "generated password appeared hex-encoded in {subject}"
+    );
+    assert!(
+        !contains_byte_dump(haystack, secret),
+        "generated password appeared as a decoded byte dump in {subject}"
+    );
+}
+
 /// Record the redacted observation, then scan the retained harness artifacts
 /// for every generated secret before reporting success (or re-raising an
 /// earlier assertion failure). The scan covers exactly what exists beneath the
@@ -141,11 +201,13 @@ pub fn scan_directory(directory: &Path, secrets: &[&[u8]]) {
             let contents =
                 fs::read(entry.path()).expect("read harness artifact for redaction scan");
             assert!(secrets.iter().all(|secret| !secret.is_empty()));
-            assert!(
-                secrets.iter().all(|secret| !contains(&contents, secret)),
-                "generated password appeared in retained harness artifact {}",
-                entry.path().display()
-            );
+            for secret in secrets {
+                assert_secret_absent(
+                    &contents,
+                    secret,
+                    &format!("retained harness artifact {}", entry.path().display()),
+                );
+            }
         }
         // Live Unix sockets (the private bus and control sockets) are the only
         // other entries the retained root holds while the command runs; they

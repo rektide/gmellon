@@ -7,8 +7,11 @@
 //! isolated private bus and daemon. They share this module for the validated
 //! environment contract, the fixture connection that performs the only
 //! permitted mutation setup (private `CreateWithMasterPassword` plus counted
-//! standard `Lock` calls), the match-filtered Lock-call monitor, disposable
-//! proof secrets, and the outer isolated runner. Include `mod common;` and
+//! standard `Lock` calls), the match-filtered method-call monitors (standard
+//! `Service.Lock` for fixture-attributed locking, plus the password-bearing
+//! private `ChangeWithMasterPassword` rule whose raw output is deleted after
+//! header-derived counting), disposable proof secrets, and the outer isolated
+//! runner. Include `mod common;` and
 //! `mod broker_common;` together: this module builds on [`common`].
 //!
 //! This file is compiled only as a module of the declared `[[test]]`
@@ -42,6 +45,14 @@ pub const LOGIN_LABEL: &str = "login";
 /// Passwords travel exclusively in private-interface method bodies, which the
 /// match rule excludes, so retained monitor output cannot carry secret bytes.
 pub const LOCK_MATCH: &str = "interface='org.freedesktop.Secret.Service',member='Lock'";
+/// The change monitor sees only this traffic: private
+/// `ChangeWithMasterPassword` method calls. Unlike the Lock rule this one
+/// selects password-bearing bodies by design — counting method-call headers
+/// is the only wire evidence that a confirmation mismatch never reached the
+/// daemon — so its raw log carries secrets in busctl's decoded forms, is
+/// always deleted after the header-derived summary is extracted, and is
+/// deleted (not retained) on failure paths too.
+pub const CHANGE_MATCH: &str = "interface='org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface',member='ChangeWithMasterPassword'";
 pub const MONITOR_BANNER: &str = "Monitoring bus message stream.";
 
 /// Harness environment contract: proofs run inside `broker.py`, never on a
@@ -227,36 +238,98 @@ impl Fixture {
     }
 }
 
-/// Match-filtered bus monitor counting standard `Service.Lock` method calls.
+/// Match-filtered bus monitor counting method calls of one member.
 ///
-/// The monitor connects only to the harness's private bus and its match rule
-/// excludes every password-bearing private-interface message body, so its log
-/// cannot contain secret bytes; the proof still scans it before deleting it.
-pub struct LockMonitor {
+/// The monitor connects only to the harness's private bus. Its match rule
+/// selects exactly one member's method calls; the summary retains only
+/// header-derived facts (count and sender unique names), never message
+/// bodies. Two policies cover the proof's two rules:
+///
+/// - the standard `Service.Lock` rule excludes every password-bearing body,
+///   so its raw log is asserted secret-free (in bytes and reversible
+///   encodings) before deletion, and is left in place on failure paths;
+/// - the private `ChangeWithMasterPassword` rule selects password-bearing
+///   bodies by design, so its raw log is never asserted secret-free: it is
+///   deleted on both success and failure paths, and the fail-closed walk
+///   over retained artifacts proves no encoding survived anywhere.
+pub struct MethodMonitor {
     child: Child,
     log_path: PathBuf,
     ready_path: PathBuf,
+    spec: MonitorSpec,
+}
+
+/// What one monitor instance counts and how its artifacts are treated.
+pub struct MonitorSpec {
+    /// File stem for the raw log, readiness log, and redacted summary.
+    pub stem: &'static str,
+    /// The exclusive busctl match rule selecting the counted traffic.
+    pub match_rule: &'static str,
+    /// The member whose method-call headers are counted.
+    pub member: &'static str,
+    /// Whether the match rule selects password-bearing bodies.
+    pub password_bearing: bool,
 }
 
 pub struct MonitorSummary {
-    pub lock_calls: usize,
+    /// Observed method calls of [`MonitorSpec::member`].
+    pub calls: usize,
+    /// Every sender unique name, in arrival order.
+    pub senders: Vec<String>,
+    /// Observed calls whose sender is the fixture connection.
+    pub fixture_calls: usize,
+    /// Whether every observed call came from the fixture connection.
     pub senders_match_fixture: bool,
 }
 
-impl LockMonitor {
-    pub fn start(address: &str, root: &Path) -> Self {
-        let log_path = root.join("lock-monitor.log");
-        let ready_path = root.join("lock-monitor.ready.log");
-        let output = File::create(&log_path).expect("create lock monitor log");
+impl MethodMonitor {
+    /// Standard `Service.Lock` monitor: fixture-attribution evidence for the
+    /// no-relock guarantee. Password bodies are excluded by the match rule.
+    pub fn lock(address: &str, root: &Path) -> Self {
+        Self::start(
+            MonitorSpec {
+                stem: "lock-monitor",
+                match_rule: LOCK_MATCH,
+                member: "Lock",
+                password_bearing: false,
+            },
+            address,
+            root,
+        )
+    }
+
+    /// Private `ChangeWithMasterPassword` call monitor: counts the method
+    /// calls whose absence proves an input-rejected `gmellon change` never
+    /// reached the daemon. The raw log is password-bearing and is always
+    /// deleted.
+    pub fn change_calls(address: &str, root: &Path) -> Self {
+        Self::start(
+            MonitorSpec {
+                stem: "change-monitor",
+                match_rule: CHANGE_MATCH,
+                member: "ChangeWithMasterPassword",
+                password_bearing: true,
+            },
+            address,
+            root,
+        )
+    }
+
+    pub fn start(spec: MonitorSpec, address: &str, root: &Path) -> Self {
+        let log_path = root.join(format!("{}.log", spec.stem));
+        let ready_path = root.join(format!("{}.ready.log", spec.stem));
+        let output = File::create(&log_path)
+            .unwrap_or_else(|error| panic!("create {} log: {error}", spec.stem));
         // busctl prints its readiness banner on stderr and message traffic on
         // stdout, so the banner gets its own file and stdout stays parseable.
-        let ready = File::create(&ready_path).expect("create lock monitor readiness log");
+        let ready = File::create(&ready_path)
+            .unwrap_or_else(|error| panic!("create {} readiness log: {error}", spec.stem));
         let child = Command::new(STDBUF)
             .arg("-oL")
             .arg(BUSCTL)
             .arg(format!("--address={address}"))
             .arg("monitor")
-            .arg(format!("--match={LOCK_MATCH}"))
+            .arg(format!("--match={}", spec.match_rule))
             .stdin(Stdio::null())
             .stdout(output)
             .stderr(ready)
@@ -267,6 +340,7 @@ impl LockMonitor {
             child,
             log_path,
             ready_path,
+            spec,
         };
         // BecomeMonitor applies only after the bus replies; the tool prints
         // its banner then, so waiting for the banner closes the startup race
@@ -281,11 +355,14 @@ impl LockMonitor {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        panic!("lock monitor did not reach monitoring state before the deadline");
+        panic!(
+            "{} monitor did not reach monitoring state before the deadline",
+            monitor.spec.stem
+        );
     }
 
-    /// Stop the monitor, verify its log carries no secret bytes, extract the
-    /// Lock-call evidence, retain a redacted summary, and delete the raw log.
+    /// Stop the monitor, extract the header-derived evidence, retain a
+    /// redacted summary, and delete the raw logs.
     pub fn finish(
         mut self,
         fixture_sender: &str,
@@ -294,47 +371,74 @@ impl LockMonitor {
     ) -> MonitorSummary {
         let bytes = self.shutdown_and_read();
         let raw = String::from_utf8_lossy(&bytes).into_owned();
-        let ready = fs::read_to_string(&self.ready_path).expect("read lock monitor readiness log");
+        let ready = fs::read_to_string(&self.ready_path)
+            .unwrap_or_else(|error| panic!("read {} readiness log: {error}", self.spec.stem));
         assert!(
             ready.contains(MONITOR_BANNER),
-            "lock monitor log lost its readiness banner"
+            "{} monitor log lost its readiness banner",
+            self.spec.stem
         );
 
-        for (name, secret) in secrets.named() {
-            assert!(
-                !common::contains(raw.as_bytes(), secret),
-                "generated password {name} appeared in the raw monitor log"
-            );
-            assert!(
-                !common::contains(ready.as_bytes(), secret),
-                "generated password {name} appeared in the monitor readiness log"
-            );
+        let summary_path = self
+            .log_path
+            .with_file_name(format!("{}.txt", self.spec.stem));
+        let subject = format!("the {} monitor readiness log", self.spec.stem);
+        for (_name, secret) in secrets.named() {
+            // The readiness log is banner text only, whatever the rule.
+            common::assert_secret_absent(ready.as_bytes(), secret, &subject);
+            if !self.spec.password_bearing {
+                // The match rule excludes password bodies entirely, so any
+                // occurrence — literal or encoded — is a rule regression.
+                common::assert_secret_absent(
+                    raw.as_bytes(),
+                    secret,
+                    &format!("the raw {} log", self.spec.stem),
+                );
+            }
+            // Password-bearing raw logs legitimately carry decoded bodies of
+            // the counted calls; they are deleted below and the
+            // retained-artifact walk proves nothing survived.
         }
 
+        let member_token = format!("Member={}", self.spec.member);
         let senders: Vec<String> = raw
             .lines()
-            .filter(|line| line.contains("Sender=") && line.contains("Member=Lock"))
+            .filter(|line| line.contains("Sender=") && line.contains(&member_token))
             .filter_map(|line| {
                 line.split_whitespace()
                     .find(|token| token.starts_with("Sender="))
             })
             .map(|token| token.trim_start_matches("Sender=").to_string())
             .collect();
-        let senders_match_fixture = senders.iter().all(|sender| sender == fixture_sender);
+        let fixture_calls_observed = senders
+            .iter()
+            .filter(|sender| sender.as_str() == fixture_sender)
+            .count();
+        let senders_match_fixture = senders
+            .iter()
+            .all(|sender| sender.as_str() == fixture_sender);
 
         let summary = format!(
-            "tool={BUSCTL} monitor\nmatch={LOCK_MATCH}\nfixture_sender={fixture_sender}\n\
-             fixture_lock_calls={fixture_calls}\nobserved_lock_calls={}\n\
-             senders_match_fixture={senders_match_fixture}\n",
-            senders.len()
+            "tool={BUSCTL} monitor\nmatch={}\nmember={}\nfixture_sender={fixture_sender}\n\
+             fixture_calls_stated={fixture_calls}\nobserved_calls={}\n\
+             observed_fixture_calls={fixture_calls_observed}\n\
+             senders_match_fixture={senders_match_fixture}\nsenders={}\n",
+            self.spec.match_rule,
+            self.spec.member,
+            senders.len(),
+            senders.join(","),
         );
-        fs::write(self.log_path.with_file_name("lock-monitor.txt"), summary)
-            .expect("write redacted lock monitor summary");
-        fs::remove_file(&self.log_path).expect("delete raw lock monitor log");
-        fs::remove_file(&self.ready_path).expect("delete monitor readiness log");
+        fs::write(&summary_path, summary)
+            .unwrap_or_else(|error| panic!("write redacted {} summary: {error}", self.spec.stem));
+        fs::remove_file(&self.log_path)
+            .unwrap_or_else(|error| panic!("delete raw {} log: {error}", self.spec.stem));
+        fs::remove_file(&self.ready_path)
+            .unwrap_or_else(|error| panic!("delete {} readiness log: {error}", self.spec.stem));
 
         MonitorSummary {
-            lock_calls: senders.len(),
+            calls: senders.len(),
+            senders,
+            fixture_calls: fixture_calls_observed,
             senders_match_fixture,
         }
     }
@@ -349,20 +453,27 @@ impl LockMonitor {
             match self.child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-                Ok(None) => panic!("lock monitor did not exit after KILL"),
-                Err(error) => panic!("lock monitor wait failed: {error}"),
+                Ok(None) => panic!("{} monitor did not exit after KILL", self.spec.stem),
+                Err(error) => panic!("{} monitor wait failed: {error}", self.spec.stem),
             }
         }
-        fs::read(&self.log_path).expect("read lock monitor log")
+        fs::read(&self.log_path)
+            .unwrap_or_else(|error| panic!("read {} log: {error}", self.spec.stem))
     }
 }
 
-impl Drop for LockMonitor {
+impl Drop for MethodMonitor {
     fn drop(&mut self) {
-        // Failure path: never leak the process; the raw log stays for the
-        // artifact scan, and the match rule kept password bodies out of it.
+        // Never leak the process. Password-bearing raw logs are deleted even
+        // on failure paths, so retained failure scratch cannot carry
+        // recoverable password dumps; body-excluding raw logs stay for the
+        // artifact scan, as before.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if self.spec.password_bearing {
+            let _ = fs::remove_file(&self.log_path);
+            let _ = fs::remove_file(&self.ready_path);
+        }
     }
 }
 
@@ -376,6 +487,9 @@ pub struct ProofSecrets {
     pub second: Zeroizing<Vec<u8>>,
     pub wrong: Zeroizing<Vec<u8>>,
     pub login_two: Zeroizing<Vec<u8>>,
+    /// The rotated password for the second collection: `second` becomes
+    /// invalid and `second_two` unlocks after a proven `gmellon change`.
+    pub second_two: Zeroizing<Vec<u8>>,
 }
 
 impl ProofSecrets {
@@ -383,7 +497,8 @@ impl ProofSecrets {
         let login = common::random_password();
         let second = common::distinct_password(&[&login]);
         let login_two = common::distinct_password(&[&login, &second]);
-        let wrong = common::distinct_password(&[&login, &second, &login_two]);
+        let second_two = common::distinct_password(&[&login, &second, &login_two]);
+        let wrong = common::distinct_password(&[&login, &second, &login_two, &second_two]);
 
         // Not a secret: a printable tag identifying this run's second fixture.
         let mut random = [0_u8; 4];
@@ -399,6 +514,7 @@ impl ProofSecrets {
             second,
             wrong,
             login_two,
+            second_two,
         }
     }
 
@@ -408,15 +524,17 @@ impl ProofSecrets {
             self.second.as_slice(),
             self.wrong.as_slice(),
             self.login_two.as_slice(),
+            self.second_two.as_slice(),
         ]
     }
 
-    pub fn named(&self) -> [(&'static str, &[u8]); 4] {
+    pub fn named(&self) -> [(&'static str, &[u8]); 5] {
         [
             ("login", self.login.as_slice()),
             ("second", self.second.as_slice()),
             ("wrong", self.wrong.as_slice()),
             ("login_two", self.login_two.as_slice()),
+            ("second_two", self.second_two.as_slice()),
         ]
     }
 }

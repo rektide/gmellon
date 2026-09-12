@@ -16,9 +16,17 @@
 //! default and explicit `unlock --stdin` exit codes and messages; wrong,
 //! cross, and correct passwords; the already-unlocked early return proven
 //! with stdin that is guaranteed to fail if read; missing-collection exit 1;
-//! captured stdout/stderr and retained artifacts scanned for generated
-//! passwords; and a match-filtered monitor attributing every standard Lock
-//! call to the fixture (ordinary CLI paths never lock or relock).
+//! and the `change --stdin` contract — mismatched confirmation and
+//! unterminated input exit 1 while a private-method monitor proves the daemon
+//! was never asked to change anything, wrong current password exits 2 with
+//! the old password still valid, explicit second-collection A→B and default
+//! login L→L2 changes exit 0 and rotate exactly the selected collection
+//! (former password denied, new password accepted after fixture-only locks),
+//! and a missing collection is rejected before stdin is read. Captured
+//! stdout/stderr and retained artifacts are scanned for every generated
+//! password, a match-filtered monitor attributes every standard Lock call to
+//! the fixture (ordinary CLI paths never lock or relock), and the
+//! password-bearing change monitor's raw output is deleted after counting.
 //!
 //! Ordinary `cargo test` and `cargo nextest run` visibly skip this proof. The
 //! maintained explicit entry point is `dev/harness/check rust-cli`.
@@ -33,7 +41,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use broker_common::{
-    Fixture, LOGIN_LABEL, LockMonitor, ProofSecrets, expected_collection_id, run_broker_isolated,
+    Fixture, LOGIN_LABEL, MethodMonitor, ProofSecrets, expected_collection_id, run_broker_isolated,
     validated_harness_environment,
 };
 use common::{contains, required_path};
@@ -74,6 +82,10 @@ enum CliStdin {
     /// One password line, newline-terminated, as the `--stdin` contract
     /// requires.
     Password(Zeroizing<Vec<u8>>),
+    /// Several newline-terminated lines (the `change --stdin` contract):
+    /// current, new, and confirmation in order. Unterminated-line variants
+    /// are built by hand from the same zeroizing buffer.
+    Lines(Zeroizing<Vec<u8>>),
     /// Standard input is `/dev/null`: any read returns end of input, which
     /// the `--stdin` reader rejects as unterminated, so a successful
     /// invocation proves no secret was read at all.
@@ -96,7 +108,13 @@ fn run_proof(secrets: &ProofSecrets) {
 
     // The lock-call monitor must be armed before any fixture traffic so the
     // count is exhaustive; readiness is proven by its banner, not a sleep.
-    let monitor = LockMonitor::start(&bus.address, &bus.root);
+    let monitor = MethodMonitor::lock(&bus.address, &bus.root);
+
+    // The private change-call monitor is armed just as early so its count is
+    // exhaustive over the whole run. Its match rule selects
+    // password-bearing bodies, so the raw log is deleted the moment the
+    // header-derived summary is extracted — never retained.
+    let change_monitor = MethodMonitor::change_calls(&bus.address, &bus.root);
 
     // Fixture connection: separate D-Bus unique name from the product binary,
     // so every observed Lock call can be attributed to a sender.
@@ -303,20 +321,323 @@ fn run_proof(secrets: &ProofSecrets) {
         "the missing-collection failure must not write stdout"
     );
 
+    // --- `gmellon change`: three-line stdin contract on the second fixture --
+    // State entering this section: both collections unlocked. Every
+    // fixture-only Lock below is counted and attributed by the monitor; the
+    // CLI itself must never lock or relock.
+
+    // Mismatched confirmation is rejected client-side: exit 1, and — proven
+    // at the change monitor below — no private ChangeWithMasterPassword call
+    // ever reaches the daemon. Fixture-lock first so "password unchanged" is
+    // observable as a successful unlock with the original password.
+    fixture
+        .lock(&second_path)
+        .expect("fixture Lock second before mismatch");
+    assert_listed_locked(secrets, &second_id, true, "second before mismatch");
+    let mismatch = run_gmellon(
+        &["change", &second_id, "--stdin"],
+        CliStdin::Lines(change_stdin([
+            secrets.second.as_slice(),
+            secrets.second_two.as_slice(),
+            secrets.wrong.as_slice(),
+        ])),
+        secrets,
+        "change second with mismatched confirmation",
+    );
+    assert_eq!(
+        exit_code(&mismatch),
+        Some(1),
+        "mismatched confirmation must exit 1"
+    );
+    let mismatch_stderr = String::from_utf8_lossy(&mismatch.stderr);
+    assert!(
+        mismatch_stderr.contains("do not match"),
+        "the mismatch diagnostic must explain the confirmation mismatch"
+    );
+    assert!(
+        mismatch.stdout.is_empty(),
+        "the mismatch rejection must not write stdout"
+    );
+    assert_listed_locked(secrets, &second_id, true, "second after mismatch");
+    // The old password still unlocks, so the mismatch changed nothing.
+    let old_still_valid = run_gmellon(
+        &["unlock", &second_id, "--stdin"],
+        CliStdin::Password(password_line(&secrets.second)),
+        secrets,
+        "unlock second with the original password after mismatch",
+    );
+    assert_eq!(
+        exit_code(&old_still_valid),
+        Some(0),
+        "the original password must remain valid after a rejected mismatch"
+    );
+
+    // Wrong current password with matching new+confirmation: the daemon is
+    // asked (one private call) and denies; exit 2 with the old password
+    // still valid.
+    fixture
+        .lock(&second_path)
+        .expect("fixture Lock second before denied change");
+    let denied_change = run_gmellon(
+        &["change", &second_id, "--stdin"],
+        CliStdin::Lines(change_stdin([
+            secrets.wrong.as_slice(),
+            secrets.second_two.as_slice(),
+            secrets.second_two.as_slice(),
+        ])),
+        secrets,
+        "change second with the wrong current password",
+    );
+    assert_eq!(
+        exit_code(&denied_change),
+        Some(2),
+        "wrong current password must exit 2"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_change.stderr).contains("denied"),
+        "the denied change must explain the denial on stderr"
+    );
+    assert_listed_locked(secrets, &second_id, true, "second after denied change");
+    let old_after_denial = run_gmellon(
+        &["unlock", &second_id, "--stdin"],
+        CliStdin::Password(password_line(&secrets.second)),
+        secrets,
+        "unlock second with the original password after denied change",
+    );
+    assert_eq!(
+        exit_code(&old_after_denial),
+        Some(0),
+        "the original password must remain valid after a denied change"
+    );
+
+    // Successful explicit second-collection change A to B.
+    fixture
+        .lock(&second_path)
+        .expect("fixture Lock second before successful change");
+    let changed = run_gmellon(
+        &["change", &second_id, "--stdin"],
+        CliStdin::Lines(change_stdin([
+            secrets.second.as_slice(),
+            secrets.second_two.as_slice(),
+            secrets.second_two.as_slice(),
+        ])),
+        secrets,
+        "change second A to B",
+    );
+    assert_eq!(exit_code(&changed), Some(0), "a correct change must exit 0");
+    assert!(
+        String::from_utf8_lossy(&changed.stdout)
+            .contains(&format!("changed password for collection {second_id}")),
+        "successful change must report the changed collection"
+    );
+    // Observed daemon 48.0 behavior: a change on a locked collection
+    // succeeds without unlocking it.
+    assert_listed_locked(secrets, &second_id, true, "second after change");
+
+    // After the rotation the former password is denied and the new one
+    // unlocks; no fixture lock is needed because the change kept it locked.
+    let former_denied = run_gmellon(
+        &["unlock", &second_id, "--stdin"],
+        CliStdin::Password(password_line(&secrets.second)),
+        secrets,
+        "unlock second with the former password after change",
+    );
+    assert_eq!(
+        exit_code(&former_denied),
+        Some(2),
+        "the former password must be denied after the change"
+    );
+    assert_listed_locked(
+        secrets,
+        &second_id,
+        true,
+        "second still locked after former-password denial",
+    );
+    let new_unlocks = run_gmellon(
+        &["unlock", &second_id, "--stdin"],
+        CliStdin::Password(password_line(&secrets.second_two)),
+        secrets,
+        "unlock second with the new password after change",
+    );
+    assert_eq!(
+        exit_code(&new_unlocks),
+        Some(0),
+        "the new password must unlock after the change"
+    );
+
+    // Sibling isolation: rotating the second collection left login's
+    // password untouched.
+    fixture
+        .lock(&login_path)
+        .expect("fixture Lock login before sibling check");
+    let sibling = run_gmellon(
+        &["unlock", "--stdin"],
+        CliStdin::Password(password_line(&secrets.login)),
+        secrets,
+        "unlock login with its original password after second's change",
+    );
+    assert_eq!(
+        exit_code(&sibling),
+        Some(0),
+        "login's original password must still work after second's change"
+    );
+
+    // Omitted collection defaults to login: L to L2.
+    fixture
+        .lock(&login_path)
+        .expect("fixture Lock login before default change");
+    let default_change = run_gmellon(
+        &["change", "--stdin"],
+        CliStdin::Lines(change_stdin([
+            secrets.login.as_slice(),
+            secrets.login_two.as_slice(),
+            secrets.login_two.as_slice(),
+        ])),
+        secrets,
+        "change default login L to L2",
+    );
+    assert_eq!(
+        exit_code(&default_change),
+        Some(0),
+        "the default-selection change must exit 0"
+    );
+    assert!(
+        String::from_utf8_lossy(&default_change.stdout)
+            .contains("changed password for collection login"),
+        "the default-selection change must report the login collection"
+    );
+    assert_listed_locked(secrets, LOGIN_LABEL, true, "login after default change");
+    let login_former_denied = run_gmellon(
+        &["unlock", "--stdin"],
+        CliStdin::Password(password_line(&secrets.login)),
+        secrets,
+        "unlock default login with the former password after change",
+    );
+    assert_eq!(
+        exit_code(&login_former_denied),
+        Some(2),
+        "login's former password must be denied after the default change"
+    );
+    let login_new_unlocks = run_gmellon(
+        &["unlock", "--stdin"],
+        CliStdin::Password(password_line(&secrets.login_two)),
+        secrets,
+        "unlock default login with the new password after change",
+    );
+    assert_eq!(
+        exit_code(&login_new_unlocks),
+        Some(0),
+        "login's new password must unlock after the default change"
+    );
+
+    // Missing collection: rejected before stdin is read. `/dev/null` stdin
+    // makes any read fail the `--stdin` contract with an unterminated-input
+    // diagnostic, so the not-found diagnostic on stderr proves the
+    // collection was resolved before any input was consumed.
+    let change_missing = run_gmellon(
+        &["change", MISSING_ID, "--stdin"],
+        CliStdin::FailIfRead,
+        secrets,
+        "change a missing collection",
+    );
+    assert_eq!(
+        exit_code(&change_missing),
+        Some(1),
+        "change of a missing collection must exit 1"
+    );
+    let change_missing_stderr = String::from_utf8_lossy(&change_missing.stderr);
+    assert!(
+        change_missing_stderr.contains("collection ID does not exist"),
+        "change of a missing collection must be reported actionably on stderr"
+    );
+    assert!(
+        change_missing_stderr.contains(MISSING_ID),
+        "the missing-collection change diagnostic must name the requested ID"
+    );
+    assert!(
+        !change_missing_stderr.contains("without a newline"),
+        "the missing-collection change must fail before reading stdin, not on input"
+    );
+    assert!(
+        change_missing.stdout.is_empty(),
+        "the missing-collection change failure must not write stdout"
+    );
+
+    // Fewer than three terminated lines map to exit 1 — the collection
+    // exists, so reaching the input contract at all is expected — and, per
+    // the change monitor below, none of these sends a private change call.
+    let truncated_variants: [(&str, Zeroizing<Vec<u8>>); 3] = [
+        ("change second from empty stdin", Zeroizing::new(Vec::new())),
+        (
+            "change second with two terminated lines",
+            lines_stdin(&[&secrets.second, &secrets.second_two]),
+        ),
+        ("change second with an unterminated confirmation", {
+            let mut bytes = lines_stdin(&[&secrets.second, &secrets.second_two]);
+            bytes.extend_from_slice(secrets.second_two.as_slice());
+            bytes
+        }),
+    ];
+    for (stage, stdin_bytes) in truncated_variants {
+        let truncated = run_gmellon(
+            &["change", &second_id, "--stdin"],
+            CliStdin::Lines(stdin_bytes),
+            secrets,
+            stage,
+        );
+        assert_eq!(
+            exit_code(&truncated),
+            Some(1),
+            "truncated change input must exit 1 ({stage})"
+        );
+        assert!(
+            String::from_utf8_lossy(&truncated.stderr).contains("without a newline"),
+            "truncated change input must report unterminated input ({stage})"
+        );
+        assert!(
+            truncated.stdout.is_empty(),
+            "truncated change input must not write stdout ({stage})"
+        );
+    }
+
     // --- wire evidence: no CLI path locked or relocked anything -----------
     let observed = monitor.finish(&fixture_sender, fixture.lock_calls(), secrets);
     assert!(
-        observed.lock_calls >= 1,
+        observed.calls >= 1,
         "the monitor observed no Lock traffic although the fixture locked collections"
     );
     assert_eq!(
-        observed.lock_calls,
+        observed.calls,
         fixture.lock_calls(),
         "observed Service.Lock calls must equal the fixture's deliberate calls"
     );
     assert!(
         observed.senders_match_fixture,
         "every observed Service.Lock call must come from the fixture connection"
+    );
+
+    // --- wire evidence: exactly the legitimate private change calls --------
+    // The change section made exactly three legitimate private
+    // ChangeWithMasterPassword calls — the denied wrong-current attempt and
+    // the two successful rotations — each from a fresh CLI connection. Any
+    // input-rejected invocation (mismatch, truncated lines, missing ID)
+    // reaching the daemon would raise the count; a broken monitor would
+    // lower it; a fixture call would appear in observed_fixture_calls.
+    let observed_changes = change_monitor.finish(&fixture_sender, 0, secrets);
+    assert_eq!(
+        observed_changes.calls, 3,
+        "expected exactly the three legitimate private change calls (denied attempt plus two rotations)"
+    );
+    assert_eq!(
+        observed_changes.fixture_calls, 0,
+        "the fixture never performs a private change call"
+    );
+    assert!(
+        observed_changes
+            .senders
+            .iter()
+            .all(|sender| sender != &fixture_sender),
+        "every private change call must come from a CLI connection, not the fixture"
     );
 }
 
@@ -400,9 +721,28 @@ fn password_line(secret: &[u8]) -> Zeroizing<Vec<u8>> {
     line
 }
 
+/// Newline-terminated lines, zeroized when dropped; the base for both the
+/// three-line `change` input and its truncated variants.
+fn lines_stdin(lines: &[&[u8]]) -> Zeroizing<Vec<u8>> {
+    let capacity = lines.iter().map(|line| line.len() + 1).sum::<usize>();
+    let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
+    for line in lines {
+        bytes.extend_from_slice(line);
+        bytes.push(b'\n');
+    }
+    bytes
+}
+
+/// Exactly three newline-terminated lines — current, new, confirmation — as
+/// the `change --stdin` contract requires.
+fn change_stdin(lines: [&[u8]; 3]) -> Zeroizing<Vec<u8>> {
+    lines_stdin(&lines)
+}
+
 /// Spawn the compiled gmellon binary with the harness-inherited environment,
 /// feed the chosen stdin, capture both streams, and scan the captured bytes
-/// for every generated password before the caller inspects the result.
+/// for every generated password — literal bytes and the reversible encodings
+/// a diagnostic dump could carry — before the caller inspects the result.
 fn run_gmellon(arguments: &[&str], stdin: CliStdin, secrets: &ProofSecrets, stage: &str) -> Output {
     INVOCATIONS.fetch_add(1, Ordering::Relaxed);
     let mut command = Command::new(env!("CARGO_BIN_EXE_gmellon"));
@@ -411,33 +751,37 @@ fn run_gmellon(arguments: &[&str], stdin: CliStdin, secrets: &ProofSecrets, stag
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(match stdin {
-            CliStdin::Password(_) => Stdio::piped(),
+            CliStdin::Password(_) | CliStdin::Lines(_) => Stdio::piped(),
             CliStdin::FailIfRead => Stdio::null(),
         });
     let mut child = command
         .spawn()
         .unwrap_or_else(|error| panic!("spawn the gmellon binary for `{stage}`: {error}"));
-    if let CliStdin::Password(line) = stdin
+    let piped_stdin = match stdin {
+        CliStdin::Password(line) => Some(line),
+        CliStdin::Lines(bytes) => Some(bytes),
+        CliStdin::FailIfRead => None,
+    };
+    if let Some(bytes) = piped_stdin
         && let Some(mut handle) = child.stdin.take()
     {
         // A broken pipe is expected when the binary exits before reading
         // (for example the missing-collection rejection); the exit-code
         // and message assertions surface any unexpected early exit.
-        let _ = handle.write_all(&line);
+        let _ = handle.write_all(&bytes);
     }
     let output = child
         .wait_with_output()
         .unwrap_or_else(|error| panic!("wait for the gmellon binary for `{stage}`: {error}"));
 
     for (name, secret) in secrets.named() {
-        assert!(
-            !contains(&output.stdout, secret),
-            "gmellon `{stage}` stdout leaked the generated {name} password"
-        );
-        assert!(
-            !contains(&output.stderr, secret),
-            "gmellon `{stage}` stderr leaked the generated {name} password"
-        );
+        for (stream, label) in [(&output.stdout, "stdout"), (&output.stderr, "stderr")] {
+            common::assert_secret_absent(
+                stream,
+                secret,
+                &format!("gmellon `{stage}` {label} (generated {name} password)"),
+            );
+        }
     }
     output
 }

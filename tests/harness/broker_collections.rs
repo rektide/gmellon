@@ -15,13 +15,16 @@
 //! Ordinary `cargo test` and `cargo nextest run` visibly skip this proof. The
 //! maintained explicit entry point is `dev/harness/check rust-broker`.
 
+// The change-call monitor and its summary fields serve the CLI proof's
+// change coverage; this proof compiles the shared module without using them.
+#[allow(dead_code)]
 mod broker_common;
 mod common;
 
 use std::env;
 
 use broker_common::{
-    BusEnvironment, Fixture, LOGIN_LABEL, LockMonitor, ProofSecrets, expected_collection_id,
+    BusEnvironment, Fixture, LOGIN_LABEL, MethodMonitor, ProofSecrets, expected_collection_id,
     run_broker_isolated, validated_harness_environment,
 };
 use common::required_path;
@@ -53,7 +56,7 @@ fn run_proof(secrets: &ProofSecrets) {
 
     // The lock-call monitor must be armed before any fixture traffic so the
     // count is exhaustive; readiness is proven by its banner, not a sleep.
-    let monitor = LockMonitor::start(&bus.address, &bus.root);
+    let monitor = MethodMonitor::lock(&bus.address, &bus.root);
 
     // Fixture connection: separate D-Bus unique name from the product client,
     // so every observed Lock call can be attributed to a sender.
@@ -233,11 +236,11 @@ fn run_proof(secrets: &ProofSecrets) {
     // positive, so a silently broken monitor cannot pass vacuously.
     let observed = monitor.finish(&fixture_sender, fixture.lock_calls(), secrets);
     assert!(
-        observed.lock_calls >= 1,
+        observed.calls >= 1,
         "the monitor observed no Lock traffic although the fixture locked collections"
     );
     assert_eq!(
-        observed.lock_calls,
+        observed.calls,
         fixture.lock_calls(),
         "observed Service.Lock calls must equal the fixture's deliberate calls"
     );
