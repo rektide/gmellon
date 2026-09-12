@@ -63,4 +63,11 @@ mod tests {
     fn secret_tuple_matches_the_secret_service_signature() {
         assert_eq!(Secret::SIGNATURE.to_string(), "(oayays)");
     }
+
+    #[test]
+    fn gnome_plain_session_input_is_a_string_variant() {
+        let input = zbus::zvariant::Value::from("");
+
+        assert_eq!(input.value_signature().to_string(), "s");
+    }
 }

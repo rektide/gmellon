@@ -11,6 +11,8 @@ use super::proxies::{
 
 const DENIED_ERROR: &str = "org.gnome.keyring.Error.Denied";
 const NO_SUCH_OBJECT_ERROR: &str = "org.freedesktop.Secret.Error.NoSuchObject";
+const NAME_HAS_NO_OWNER_ERROR: &str = "org.freedesktop.DBus.Error.NameHasNoOwner";
+const SERVICE_UNKNOWN_ERROR: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
 const UNKNOWN_INTERFACE_ERROR: &str = "org.freedesktop.DBus.Error.UnknownInterface";
 const UNKNOWN_METHOD_ERROR: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 
@@ -75,6 +77,7 @@ pub enum Error {
     InvalidCollectionId,
     InvalidCollectionPath { path: OwnedObjectPath },
     CollectionNotFound { id: CollectionId },
+    ServiceUnavailable,
     PasswordDenied,
     PrivateInterfaceUnavailable,
     Bus(zbus::Error),
@@ -89,6 +92,9 @@ impl Display for Error {
             }
             Self::CollectionNotFound { id } => {
                 write!(formatter, "collection ID does not exist: {id}")
+            }
+            Self::ServiceUnavailable => {
+                formatter.write_str("GNOME Keyring's Secret Service is unavailable")
             }
             Self::PasswordDenied => formatter.write_str("collection password was denied"),
             Self::PrivateInterfaceUnavailable => formatter.write_str(
@@ -129,7 +135,9 @@ impl BlockingClient {
     pub fn new(connection: Connection) -> Result<Self, Error> {
         let service = SecretServiceProxyBlocking::new(&connection).map_err(Error::Bus)?;
         let input = Value::from("");
-        let (_output, session_path) = service.open_session("plain", &input).map_err(Error::Bus)?;
+        let (_output, session_path) = service
+            .open_session("plain", &input)
+            .map_err(classify_service_error)?;
         Ok(Self {
             connection,
             session_path,
@@ -141,7 +149,7 @@ impl BlockingClient {
         let service = SecretServiceProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
         let mut collections = service
             .collections()
-            .map_err(Error::Bus)?
+            .map_err(classify_service_error)?
             .into_iter()
             .map(|path| self.collection(path))
             .collect::<Result<Vec<_>, _>>()?;
@@ -167,7 +175,7 @@ impl BlockingClient {
                 &path,
                 (&session, empty_parameters, password, content_type),
             )
-            .map_err(classify_password_error)?;
+            .map_err(|error| classify_password_error(error, id))?;
         Ok(UnlockOutcome::Unlocked)
     }
 
@@ -190,7 +198,7 @@ impl BlockingClient {
                 (&session, empty_parameters, original_password, content_type),
                 (&session, empty_parameters, new_password, content_type),
             )
-            .map_err(classify_password_error)
+            .map_err(|error| classify_password_error(error, id))
     }
 
     fn find(&self, id: &CollectionId) -> Result<Collection, Error> {
@@ -209,8 +217,8 @@ impl BlockingClient {
             .map_err(Error::Bus)?
             .build()
             .map_err(Error::Bus)?;
-        let label = proxy.label().map_err(Error::Bus)?;
-        let locked = proxy.locked().map_err(Error::Bus)?;
+        let label = proxy.label().map_err(classify_service_error)?;
+        let locked = proxy.locked().map_err(classify_service_error)?;
         Ok(Collection {
             id,
             path,
@@ -220,16 +228,47 @@ impl BlockingClient {
     }
 }
 
-fn classify_password_error(error: zbus::Error) -> Error {
+fn classify_password_error(error: zbus::Error, id: &CollectionId) -> Error {
     let zbus::Error::MethodError(name, _, _) = &error else {
         return Error::Bus(error);
     };
 
-    match name.as_str() {
-        DENIED_ERROR => Error::PasswordDenied,
-        NO_SUCH_OBJECT_ERROR => Error::Bus(error),
-        UNKNOWN_INTERFACE_ERROR | UNKNOWN_METHOD_ERROR => Error::PrivateInterfaceUnavailable,
-        _ => Error::Bus(error),
+    match classify_error_name(name.as_str()) {
+        RemoteError::Denied => Error::PasswordDenied,
+        RemoteError::NoSuchObject => Error::CollectionNotFound { id: id.clone() },
+        RemoteError::PrivateInterfaceUnavailable => Error::PrivateInterfaceUnavailable,
+        RemoteError::ServiceUnavailable => Error::ServiceUnavailable,
+        RemoteError::Other => Error::Bus(error),
+    }
+}
+
+fn classify_service_error(error: zbus::Error) -> Error {
+    let zbus::Error::MethodError(name, _, _) = &error else {
+        return Error::Bus(error);
+    };
+    if classify_error_name(name.as_str()) == RemoteError::ServiceUnavailable {
+        Error::ServiceUnavailable
+    } else {
+        Error::Bus(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteError {
+    Denied,
+    NoSuchObject,
+    PrivateInterfaceUnavailable,
+    ServiceUnavailable,
+    Other,
+}
+
+fn classify_error_name(name: &str) -> RemoteError {
+    match name {
+        DENIED_ERROR => RemoteError::Denied,
+        NO_SUCH_OBJECT_ERROR => RemoteError::NoSuchObject,
+        UNKNOWN_INTERFACE_ERROR | UNKNOWN_METHOD_ERROR => RemoteError::PrivateInterfaceUnavailable,
+        NAME_HAS_NO_OWNER_ERROR | SERVICE_UNKNOWN_ERROR => RemoteError::ServiceUnavailable,
+        _ => RemoteError::Other,
     }
 }
 
@@ -271,18 +310,33 @@ mod tests {
 
     #[test]
     fn private_interface_error_names_are_recognized() {
-        assert!(is_private_interface_error(UNKNOWN_INTERFACE_ERROR));
-        assert!(is_private_interface_error(UNKNOWN_METHOD_ERROR));
-        assert!(!is_private_interface_error(DENIED_ERROR));
+        assert_eq!(
+            classify_error_name(UNKNOWN_INTERFACE_ERROR),
+            RemoteError::PrivateInterfaceUnavailable
+        );
+        assert_eq!(
+            classify_error_name(UNKNOWN_METHOD_ERROR),
+            RemoteError::PrivateInterfaceUnavailable
+        );
+        assert_eq!(classify_error_name(DENIED_ERROR), RemoteError::Denied);
+        assert_eq!(
+            classify_error_name(NO_SUCH_OBJECT_ERROR),
+            RemoteError::NoSuchObject
+        );
+        assert_eq!(
+            classify_error_name(SERVICE_UNKNOWN_ERROR),
+            RemoteError::ServiceUnavailable
+        );
+        assert_eq!(
+            classify_error_name(NAME_HAS_NO_OWNER_ERROR),
+            RemoteError::ServiceUnavailable
+        );
+        assert_eq!(classify_error_name("org.example.Other"), RemoteError::Other);
     }
 
     #[test]
     fn service_constants_match_the_upstream_object() {
         assert_eq!(SERVICE_NAME, "org.freedesktop.secrets");
         assert!(ObjectPath::try_from("/org/freedesktop/secrets").is_ok());
-    }
-
-    fn is_private_interface_error(name: &str) -> bool {
-        matches!(name, UNKNOWN_INTERFACE_ERROR | UNKNOWN_METHOD_ERROR)
     }
 }
