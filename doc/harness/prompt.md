@@ -5,15 +5,18 @@ the `gmell-harness` Beads epic in the `gmellon` repository.
 
 ## Total mission
 
-`gmellon` is a small Rust CLI that unlocks or changes the password of the
-GNOME **login** keyring by speaking `gnome-keyring-daemon`'s private Unix
-control protocol. The product must be safe to use from a headless shell and
-must be tested without touching the user's real keyring, session bus, or
-socket-activated daemon. Read [`/README.md`](/README.md) for the provisional
-product spec and inspect the Beads graph before acting.
+`gmellon` is a small Rust CLI that lists, unlocks, or changes the password of
+any GNOME Keyring Secret Service collection by stable ID. The approved product
+architecture uses zbus with the standard Secret Service interfaces plus
+GNOME's private
+`org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface`. The product must
+be safe to use from a headless shell and must be tested without touching the
+user's real keyrings, session bus, or socket-activated daemon. Read
+[`/README.md`](/README.md) for the evolving product spec and inspect the Beads
+graph before acting.
 
 This epic owns the reusable integration-test harness, not the Rust product
-implementation. The required baseline is a configuration- and
+implementation. The historical control-only baseline is a configuration- and
 session-isolated process topology containing:
 
 1. one manually launched `gnome-keyring-daemon`,
@@ -23,10 +26,17 @@ session-isolated process topology containing:
 4. a command or test process that can safely exercise the daemon's control
    socket.
 
-The user also wants a later private `dbus-broker` parity layer for Secret
-Service observations. It must never inherit the real user bus, but it is not a
-prerequisite for direct control-socket tests. Do not start
-`gnome-settings-daemon`; the relevant process is `gnome-keyring-daemon`.
+The product-relevant sibling replaces the dead session address with a unique
+private `dbus-broker` listener, adds exact launcher/broker ownership, and does
+not start its command until the bus answers and the manually launched daemon
+owns both required names.
+
+The older control-only profile remains useful historical and transport
+coverage, but it cannot exercise collection-targeted product behavior. The
+private `dbus-broker` profile is therefore required by the zbus-only product
+architecture. It must never inherit the real user bus. Do not start
+`gnome-settings-daemon`; the relevant process is a manually launched
+`gnome-keyring-daemon`.
 
 ## How to run this work
 
@@ -61,12 +71,13 @@ Status at 2026-09-11 documentation reconciliation (`gmell-harness-docs`):
   [`/doc/harness/README.md`](/doc/harness/README.md). This prompt remains the
   kickoff plan and safety-invariant record — planned acceptance, not
   completion evidence.
-- `gmell-harness-broker` was promoted from optional parity to P1 and is in
-  progress: the approved product architecture now uses zbus with GNOME's
-  private internal interface to target Secret Service collections, so
-  private-bus coverage is required for product D-Bus tests. It still does not
-  gate the control-only harness, its core closure, or direct control-socket
-  tests.
+- `gmell-harness-broker` was promoted from optional parity to P1 and remains in
+  progress. Its reusable private-broker lifecycle and plain-session/private-
+  interface proof are implemented in [`dev/harness/broker.py`](/dev/harness/broker.py)
+  and recorded in [`broker0.gpt6a.md`](/doc/harness/broker0.gpt6a.md). Product
+  collection fixtures and zbus behavior are the proposed next slice. It still
+  does not gate the control-only harness, its core closure, or direct
+  control-socket tests.
 - The per-ticket sections and the closing kickoff directive below are the
   original reviewed plan, preserved for provenance; live status lives in the
   Beads graph.
@@ -75,10 +86,10 @@ The facts recorded at kickoff follow.
 
 - Stage 0 is complete: Cargo, a clap command skeleton, and three nextest tests
   exist. The harness should not need to restructure that code.
-- `gmell-harness` is the umbrella epic. Its core chain is smoke, lifecycle,
-  behavior, durable integration, and documentation. Optional broker parity
-  branches after lifecycle and does not block the core chain or product
-  unlock work.
+- `gmell-harness` is the umbrella epic. Its historical control-only chain is
+  smoke, lifecycle, behavior, durable integration, and documentation. The
+  broker branch still reuses lifecycle policy, but the product pivot promotes
+  it from optional parity to required zbus integration support.
 - Installed tools presently include `dbus-broker-launch` 37,
   `systemd-socket-activate`, `dbus-run-session`, `dbus-daemon`,
   `gnome-keyring-daemon` 48.0, `gdbus`, and `secret-tool`.
@@ -173,8 +184,9 @@ Treat these as acceptance criteria, not aspirations:
   writes outside scratch are impossible.
 - Establish readiness with bounded waits and positive checks. For the
   baseline, require initialization stdout EOF, child liveness, and the
-  expected socket type and owner. For broker parity, additionally prove that
-  the broker answers and the intended daemon owns its private bus names.
+  expected socket type and owner. For the private-broker profile, additionally
+  prove that the broker answers and the intended daemon owns its private bus
+  names.
 - Manage exact child PIDs or one dedicated process group. Never use broad
   `pkill`, `killall`, or name-based cleanup.
 - On normal and signal exits, send TERM, wait with a deadline, then KILL only
@@ -188,9 +200,10 @@ Treat these as acceptance criteria, not aspirations:
 
 ## Ticket map
 
-The required core follows one linear chain and is complete. Broker parity
-branched after lifecycle, was promoted from optional parity to required
-in-progress work for the zbus product backend, and still does not gate the
+The required control-only core follows one linear chain and is complete. The
+private-broker profile branched after lifecycle, was promoted from optional
+parity to required in-progress work for the zbus product backend, and still
+does not gate the
 control-protocol harness:
 
 ```mermaid
@@ -256,10 +269,10 @@ and stop before closing tickets. Completion of this ticket unblocks
 Reconcile [`/README.md`](/README.md), harness documentation, and Beads
 acceptance criteria with observed behavior. Document the isolation boundary,
 troubleshooting, and process ownership; include a process diagram when useful.
-Close only tickets whose acceptance criteria are demonstrated and report any
-remaining optional broker work separately.
+Close only tickets whose acceptance criteria are demonstrated and report the
+promoted broker work separately.
 
-### `gmell-harness-broker` — assess optional private-broker parity
+### `gmell-harness-broker` — provide the required private-broker profile
 
 > Status: promoted from this optional framing to P1 and in progress. The
 > approved product architecture now uses zbus with GNOME's private
@@ -269,17 +282,21 @@ remaining optional broker work separately.
 > this ticket still does not gate control-socket work. Current acceptance
 > criteria live in the Beads record.
 
-After lifecycle support exists, make a broker-only experiment under
-`.test-agent/harness/`, reproducing the known `systemd-socket-activate`
-composition before extending it. Demonstrate a private socket, a minimal
-no-activation config, a successful bus method call, bounded readiness, and
-clean shutdown. Then launch the daemon manually on the private bus and prove
-ownership of `org.gnome.keyring` and `org.freedesktop.secrets`. Document host
-systemd/journal dependencies and exact process/FD ownership. Compare with
+After lifecycle support exists, reproduce the known
+`systemd-socket-activate` composition before promoting it into a reusable
+command mode. Demonstrate a private socket, a minimal config with no host
+activation directories, a successful bus method call, bounded readiness, and
+clean shutdown. Launch the daemon manually on the private bus and prove the
+same daemon PID owns `org.gnome.keyring` and `org.freedesktop.secrets`. Provide
+a focused probe that opens a plain Secret Service session and establishes that
+`org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface` is introspectable
+or callable, without invoking a password operation or touching the real bus.
+Document host systemd/journal dependencies, inherited-listener FD ownership,
+`--scope system` success, and `--scope user` ENOMEDIUM. Compare with
 `dbus-daemon` only as a diagnostic baseline; do not silently replace the
-requested broker. A well-supported finding that the required isolation cannot
-be achieved is an acceptable result. This is the only ticket that may make
-non-prompting Secret Service observations. Report and stop.
+requested broker. Ordinary unlock behavior must never lock an already-unlocked
+collection merely to verify a password. Report and stop after the reusable
+lifecycle/proof checkpoint; product zbus behavior belongs to the next slice.
 
 ## Deliberate non-goals
 
@@ -291,7 +308,7 @@ non-prompting Secret Service observations. Report and stop.
 - Do not make raw protocol hexdumps containing secrets.
 - Do not turn broker-specific mechanics into Rust product dependencies.
 
-The kickoff directive above has been completed: smoke through integration are
-closed with evidence, and this document's reconciliation is
-`gmell-harness-docs`. The live work frontier is the Beads graph, where
-`gmell-harness-broker` continues as the promoted sibling branch.
+The kickoff directive above has been completed: smoke through integration and
+core documentation are closed with evidence. The live work frontier is the
+Beads graph, where `gmell-harness-broker` continues as the promoted sibling
+branch.

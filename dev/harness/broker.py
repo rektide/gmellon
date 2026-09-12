@@ -1033,9 +1033,9 @@ def parse_args() -> argparse.Namespace:
 
 DBUS_SYSTEM_BUS_ADDRESS remains an unreachable scratch path for the daemon and
 command. The minimal bus config has no service directories: only this harness
-manually launches gnome-keyring-daemon. dbus-broker-launch 37 still depends on
-host systemd socket-activation/journal facilities, so this is configuration and
-session isolation, not total host independence.
+manually launches gnome-keyring-daemon. The assessed dbus-broker-launch
+topology still depends on host systemd socket-activation/journal facilities, so
+this is configuration and session isolation, not total host independence.
 
 Exit, retention, --pass-env, nesting, and stream semantics match lifecycle.py.
 """,

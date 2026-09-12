@@ -1,12 +1,13 @@
 # GNOME Keyring integration harness
 
-The `gmellon` harness makes the private control protocol testable from an
-ordinary headless development shell: it runs commands against a fresh,
-manually launched `gnome-keyring-daemon` while redirecting normal keyring,
-bus, and activation discovery away from the user's desktop session. This is
-a cooperative test boundary, not access control against the command itself.
+The `gmellon` harness makes both the historical private control protocol and
+the collection-oriented Secret Service path testable from an ordinary
+headless development shell. Both profiles run commands against a fresh,
+manually launched `gnome-keyring-daemon` while redirecting keyring storage and
+normal desktop discovery away from the user's session. This is a cooperative
+test boundary, not access control against the command itself.
 
-The harness currently provides four executable entry points:
+The harness currently provides six executable entry points:
 
 - [`dev/harness/smoke.py`](/dev/harness/smoke.py) proves one isolated
   fresh-UNLOCK and wrong-password-DENIED path.
@@ -15,8 +16,13 @@ The harness currently provides four executable entry points:
 - [`dev/harness/behavior.py`](/dev/harness/behavior.py) characterizes UNLOCK,
   CHANGE, restart persistence, empty passwords, and explicit transport faults
   against the installed daemon without making Secret Service calls.
+- [`dev/harness/broker.py`](/dev/harness/broker.py) runs an arbitrary command
+  with a private `dbus-broker` and manually launched daemon.
+- [`dev/harness/private_bus_probe.py`](/dev/harness/private_bus_probe.py) opens
+  a plain Secret Service session and proves GNOME's private collection-password
+  interface is exposed, without making a password call.
 - [`dev/harness/check`](/dev/harness/check) is the maintained explicit check
-  entry point for Rust real-daemon tests and the broader Python checks.
+  entry point for Rust, control-only Python, and private-broker checks.
 
 The control-only core chain is complete: the smoke proof, reusable lifecycle,
 installed behavior matrix, and durable Rust-test integration are all
@@ -24,9 +30,11 @@ implemented, reviewed, and closed with version-scoped evidence under
 [Contract, implementation, and evidence](#contract-implementation-and-evidence).
 Private `dbus-broker` coverage was originally optional parity and has been
 promoted to required infrastructure for the approved zbus Secret Service
-product backend (Beads `gmell-harness-broker`, in progress); it remains a
+product backend (Beads `gmell-harness-broker`, in progress). Its lifecycle and
+interface proof are implemented at this checkpoint; it remains a
 sibling topology that does not block these control-socket tests or the closure
-of the control-only harness. See [Broker parity](#broker-parity).
+of the control-only harness. See
+[Private-broker profile](#private-broker-profile).
 
 ## Guide map
 
@@ -42,12 +50,12 @@ for how that authority divides:
 | Change lifecycle mechanics | [Lifecycle state model](#lifecycle-state-model), then [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) and its [focused tests](/dev/harness/tests/test_lifecycle.py) |
 | Run or inspect daemon behavior coverage | [Quick start](#quick-start), [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md), and [Evolution guidance](#evolution-guidance) |
 | Integrate with Rust or CI | [Durable test integration](#durable-test-integration) and [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md) |
-| Investigate Secret Service parity | [Broker parity](#broker-parity) |
+| Run collection-oriented Secret Service tests | [Private-broker interface](#private-broker-interface), [Private-broker profile](#private-broker-profile), and [`broker0.gpt6a.md`](/doc/harness/broker0.gpt6a.md) |
 
-The supported reusable surface is the executable command interface and the
-exported environment documented below. Importable Python names in
-`lifecycle.py` are implementation details used by focused tests, not a stable
-library API.
+The supported reusable surfaces are the two executable command interfaces and
+their exported environments. Importable Python names in `lifecycle.py` and
+`broker.py` are implementation details used by focused tests, not stable
+library APIs.
 
 ## Quick start
 
@@ -72,10 +80,23 @@ Run a command inside the reusable lifecycle:
 dev/harness/lifecycle.py -- /usr/bin/env
 ```
 
-See the complete executable contract without allocating a sandbox:
+Run a command against the product-relevant private Secret Service bus:
+
+```sh
+dev/harness/broker.py -- /usr/bin/env
+```
+
+Run the focused plain-session/private-interface proof:
+
+```sh
+dev/harness/check broker
+```
+
+See either complete executable contract without allocating a sandbox:
 
 ```sh
 dev/harness/lifecycle.py --help
+dev/harness/broker.py --help
 ```
 
 Run the maintained Rust transport against two independent real daemons using
@@ -87,7 +108,7 @@ dev/harness/check rust-nextest
 
 Use `dev/harness/check rust-cargo` for normal Cargo test conventions. Run all
 external-tool harness checks, including the Python lifecycle suite, installed
-behavior matrix, and smoke proof, with:
+behavior matrix, smoke proof, and private-broker proof, with:
 
 ```sh
 dev/harness/check all
@@ -143,6 +164,41 @@ intentionally host-specific today: portable or packaged integration must make
 these prerequisites explicit rather than silently weakening isolation or
 searching a caller-controlled daemon path.
 
+The private-broker profile additionally requires `systemd-socket-activate`,
+`dbus-broker-launch`, and `gdbus` in `/usr/bin:/bin`, a running host systemd
+runtime at `/run/systemd/system`, and `/run/systemd/journal/socket`. The latter
+dependencies are launcher constraints even though the private config defines
+no activatable services. This profile is not portable to a host without those
+facilities and must not silently substitute `dbus-daemon` or the real bus.
+
+## Private-broker interface
+
+[`dev/harness/broker.py`](/dev/harness/broker.py) accepts the same command,
+retention, selected environment, nesting, stream, and exit contract as the
+control-only lifecycle:
+
+```text
+dev/harness/broker.py [--keep-success] [--pass-env NAME] -- COMMAND [ARG...]
+```
+
+It allocates the same unique private tree, writes a bus config containing no
+`<servicedir>`, standard-service-directory, or include directives, starts
+`systemd-socket-activate`, and triggers it through an explicit private bus
+call. The activator execs `dbus-broker-launch --scope=system` at the same PID;
+the launcher then owns one exact `dbus-broker` child. Only after the bus
+answers, has no external activatable names, and listener FD ownership is
+proved does the harness manually launch `gnome-keyring-daemon`. The command
+starts only after that daemon owns both `org.gnome.keyring` and
+`org.freedesktop.secrets` at its verified Unix PID.
+
+The focused [`private_bus_probe.py`](/dev/harness/private_bus_probe.py) uses the
+explicit address to open a plain Secret Service session and introspect
+`/org/freedesktop/secrets`. It requires
+`org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface` plus
+`UnlockWithMasterPassword` and `ChangeWithMasterPassword`. It sends no
+password, makes no lock/unlock/change call, and changes no collection lock
+state.
+
 ## Command environment
 
 Each child environment is constructed from an empty mapping. The command
@@ -157,7 +213,7 @@ receives the private baseline plus these harness variables:
 | `XDG_CACHE_HOME` | private `<root>/cache` |
 | `XDG_STATE_HOME` | private `<root>/state` |
 | `TMPDIR` | private `<root>/tmp` |
-| `DBUS_SESSION_BUS_ADDRESS` | unreachable `<root>/missing-session-bus` |
+| `DBUS_SESSION_BUS_ADDRESS` | unreachable `<root>/missing-session-bus` in `lifecycle.py`; explicit `unix:path=<root>/bus` in `broker.py` |
 | `DBUS_SYSTEM_BUS_ADDRESS` | unreachable `<root>/missing-system-bus` |
 | `PATH` | fixed `/usr/bin:/bin` |
 | `LANG`, `LC_ALL` | fixed `C.UTF-8` |
@@ -172,8 +228,23 @@ receives the private baseline plus these harness variables:
 | `GMELL_HARNESS_EVIDENCE` | readiness and isolation evidence |
 | `GMELL_HARNESS_CLEANUP` | teardown evidence, written during cleanup |
 
-The daemon receives only the private XDG/bus baseline; it does not receive
-the `GMELL_HARNESS_*` command contract.
+The private-broker command additionally receives:
+
+| Variable | Meaning |
+| --- | --- |
+| `GMELL_HARNESS_MODE` | `private-broker` capability marker |
+| `GMELL_HARNESS_BUS_SOCKET` | exact private listener path |
+| `GMELL_HARNESS_BUS_CONFIG` | minimal no-activation config |
+| `GMELL_HARNESS_BROKER_LAUNCHER_PID` | exact launcher PID after socket activator exec |
+| `GMELL_HARNESS_BROKER_PID` | exact broker child PID |
+| `GMELL_HARNESS_BROKER_STDOUT`, `GMELL_HARNESS_BROKER_STDERR` | private launcher/activator logs |
+
+The daemon receives only the private XDG/bus baseline; it does not receive the
+`GMELL_HARNESS_*` command contract. In broker mode the daemon and command keep
+`DBUS_SYSTEM_BUS_ADDRESS` on the unreachable scratch path. The broker launcher
+alone receives both bus variables pointed at the private listener, matching
+the successful assessed `--scope=system` composition while preventing an
+environmental route to either real host bus.
 
 ### Passing selected host values
 
@@ -215,6 +286,24 @@ deliberately tolerates the daemon's unreachable-session-bus diagnostic —
 GNOME Keyring 48.0 initializes its control socket and internal store before
 that non-fatal failure — but Secret Service itself is unavailable in this
 mode.
+
+The private-broker profile first applies a bounded positive bus gate:
+
+1. `systemd-socket-activate` creates the private Unix listener, which the
+   harness tightens to mode 0600 beneath the mode-0700 root;
+2. `org.freedesktop.DBus.ListNames` answers over the explicit address;
+3. `ListActivatableNames` contains only `org.freedesktop.DBus`, proving the
+   minimal config did not load host service definitions;
+4. the activator has exec'd to the expected `dbus-broker-launch` executable;
+5. the launcher has exactly one `dbus-broker` child, identified by parent PID,
+   executable, process start ticks, and a pidfd; and
+6. both launcher and broker hold FDs for the listener kernel inode.
+
+It then applies the normal daemon readiness gate and finally requires
+`GetNameOwner` to return one unique owner for `org.gnome.keyring` and
+`org.freedesktop.secrets`; `GetConnectionUnixProcessID` must map that owner to
+the exact manually launched daemon PID. The command never starts on socket
+existence or name existence alone.
 
 ## Exit and retention semantics
 
@@ -264,18 +353,21 @@ from the outer test runner instead.
 
 Each invocation creates a short, unpredictable mode-0700 root beneath
 `/home/rektide/tmp-opencode`, launches one foreground daemon manually with
-its known writable paths redirected into that root, and points both session
-and system D-Bus addresses at explicitly nonexistent sockets under the same
-root. The resulting boundary is **configuration and session isolation**:
+its known writable paths redirected into that root, and gives every child an
+empty-based explicit environment. The control profile points both D-Bus
+addresses at nonexistent scratch sockets. The broker profile provides its own
+session socket while keeping the daemon and command system-bus address
+nonexistent. Both boundaries are **configuration and session isolation**:
 
 | Invariant | Mechanism and enforcement |
 | --- | --- |
 | Login keyring, PKCS#11, and all daemon-selected storage stays private | Private `HOME`, `XDG_DATA_HOME`, dedicated config/cache/state directories, and `TMPDIR` beneath the unique root; reported absolute daemon paths must resolve beneath scratch |
 | Runtime and control endpoints are invocation-local | Private `XDG_RUNTIME_DIR`, unique control directory, and explicit `--control-directory` |
-| Neither child can discover the user's buses through its environment | Both bus addresses name nonexistent scratch sockets; environments are built from empty maps |
-| Host socket activation is not inherited | Empty-based environments omit `LISTEN_*`, `NOTIFY_SOCKET`, and D-Bus starter state |
+| Children cannot discover the user's buses through their environment | Addresses are explicit scratch paths; broker mode exposes only its private session listener and keeps the system address dead for daemon/command |
+| Host D-Bus service activation is unavailable | Control mode has no bus; broker config has no service directories/includes and `ListActivatableNames` returns only the bus itself |
+| Socket activation state is deliberate | Empty-based environments omit inherited `LISTEN_*`, `NOTIFY_SOCKET`, and D-Bus starter state; broker mode starts one exact `systemd-socket-activate` child itself |
 | A command never starts against a merely present or stale path | One bounded readiness gate combines all checks in the [readiness contract](#readiness-contract) |
-| Process ownership stays narrow | The supervisor signals and reaps its exact daemon and command PIDs; no name-based or host-wide cleanup |
+| Process ownership stays narrow | The supervisor signals/reaps exact direct children and tracks the exact broker child by pidfd; no name-based or host-wide cleanup |
 | Failure remains inspectable | Nonzero command outcomes, handled signals, and harness failures retain allocated scratch state |
 | Concurrent invocations do not share mutable harness state | Every root, store, socket, log, sentinel, and child PID is invocation-specific |
 | Ownership is unambiguous | Nesting is rejected before allocation; detached descendants are outside the supported topology |
@@ -295,6 +387,9 @@ not a security boundary against hostile code.
 
 Do not describe this layer as fully hermetic. A stronger sandbox could be
 added deliberately later, but it is not implied by XDG and bus redirection.
+The broker profile also intentionally uses the host journal and systemd
+launcher facilities; no service definitions are loaded or activated, but that
+host dependency prevents a claim of total host independence.
 
 ## Process topology
 
@@ -319,6 +414,32 @@ process-group effects; it does not make descendants supervisor-owned. The
 lifecycle does not claim a command's intentionally detached descendants:
 integration-test commands must not daemonize and escape supervision, and the
 command stops and reaps any workers it creates.
+
+The private-broker sibling adds the following owned topology:
+
+```mermaid
+flowchart TD
+    operatorBus["operator / test runner"] --> supervisorBus["broker.py supervisor"]
+    supervisorBus -->|"exact PID; inherited listener FD 3"| launcher["systemd-socket-activate → exec dbus-broker-launch"]
+    launcher -->|"exact child; listener FD 6"| broker["dbus-broker"]
+    supervisorBus -->|"private bus env; exact PID"| daemonBus["gnome-keyring-daemon --foreground"]
+    supervisorBus -->|"explicit DBUS_SESSION_BUS_ADDRESS; exact PID"| commandBus["caller command / test"]
+    launcher --> listener["scratch bus socket, mode 0600"]
+    broker --> listener
+    daemonBus --> listener
+    commandBus --> listener
+    daemonBus --> storeBus["scratch data/keyrings store"]
+    launcher -. "journal/systemd integration" .-> hostRuntime["host systemd runtime"]
+```
+
+`systemd-socket-activate` is not a fifth long-lived process: the first private
+connection makes it `exec` the launcher without changing PID. The supervisor
+reaps command, daemon, and launcher directly. It holds a pidfd for the exact
+broker child, sends TERM and then KILL only if that identity remains live, and
+requires the still-owned launcher to reap its broker before the supervisor
+terminates and reaps the launcher. Every wait has a deadline. Failure and
+signal tests require all four recorded PIDs to be absent afterward; no
+name-based or process-group-wide kill is used.
 
 ## Lifecycle state model
 
@@ -373,6 +494,12 @@ After readiness, a retained root normally contains:
 - `cleanup.json` — command status, handled signal, and per-child teardown;
 - private XDG directories and any keyring files created during the run.
 
+Broker-mode roots additionally contain `bus.conf`, the mode-0600 `bus` socket
+while live, `broker-launcher.stdout.log`, and
+`broker-launcher.stderr.log`. The maintained smoke command writes
+`private-bus-probe.json` containing booleans and the public interface name,
+never a session secret or password.
+
 Earlier failures may leave only the artifacts opened or written by that
 lifecycle state. `cleanup.json` is attempted whenever a root was allocated,
 and a failure writing it is itself a harness failure.
@@ -386,6 +513,9 @@ and scans retained logs and JSON for both values and complete request frames
 before reporting success. The behavior probe scans every regular file in each
 retained scenario root. Eventual product tests must use `gmellon`'s zeroizing
 secret types, and the lifecycle itself remains unaware of password values.
+The broker failure test passes a synthetic sensitive marker into a failing
+command, then scans every retained regular artifact and requires that value to
+be absent.
 
 ## Using the lifecycle in tests
 
@@ -399,6 +529,14 @@ A test command should:
 4. avoid detached descendants;
 5. avoid GUI prompts and Secret Service calls in the control-only layer; and
 6. never emit passwords or password-bearing frames.
+
+A private-broker command should additionally use the exported explicit
+`DBUS_SESSION_BUS_ADDRESS` (or `GMELL_HARNESS_BUS_SOCKET`) and must not invoke
+service activation as a substitute for the manually owned daemon. Capability
+probes may open a plain session and introspect the private interface. Product
+behavior tests may eventually call password methods only with disposable
+fixtures and reviewed redaction; they must never lock an already-unlocked
+collection as password verification.
 
 The lifecycle command interface still starts one daemon per invocation. A
 command must not simulate a restart by killing it: every pre-teardown daemon
@@ -484,14 +622,34 @@ The maintained explicit command is:
 dev/harness/check python
 ```
 
-It compiles all harness Python, runs the focused lifecycle/behavior tests, then
-runs the installed behavior matrix and smoke proof. `dev/harness/check all`
-runs the nextest real-daemon path followed by those checks. The wrapper
+It compiles the control-only harness Python, runs the focused
+lifecycle/behavior tests, then runs the installed behavior matrix and smoke
+proof. The wrapper
 preflights external tools before calling existing executables; it does not
 duplicate lifecycle orchestration. The focused Python tests retain their
 convenient unittest skip annotations for direct development invocation, but an
 explicit `dev/harness/check` mode fails before unittest if the daemon is
 missing. A skip from direct unittest is not evidence of real-daemon coverage.
+
+### Private-broker workflow
+
+The maintained product-relevant D-Bus checkpoint is:
+
+```sh
+dev/harness/check broker
+```
+
+It hard-preflights the installed broker, socket activator, `gdbus`, daemon,
+host journal socket, and systemd runtime; compiles the three broker Python
+files; runs five focused lifecycle tests; and then runs the plain-session and
+private-interface smoke proof. The tests cover strict environment export,
+absence of external activatable names, exact listener-FD and bus-name
+ownership, command-failure retention/redaction, signal teardown, and parallel
+instances. Direct unittest invocation may skip on a host without the required
+facilities, but the explicit wrapper always classifies that as setup failure.
+
+`dev/harness/check all` runs explicit Rust real-daemon tests, the control-only
+Python workflow, and this private-broker workflow.
 
 ### Complete static and Rust checks
 
@@ -501,14 +659,19 @@ python3 -m py_compile \
   dev/harness/smoke.py \
   dev/harness/behavior.py \
   dev/harness/lifecycle.py \
+  dev/harness/broker.py \
+  dev/harness/private_bus_probe.py \
   dev/harness/tests/test_behavior.py \
-  dev/harness/tests/test_lifecycle.py
+  dev/harness/tests/test_lifecycle.py \
+  dev/harness/tests/test_broker.py
 
 python3 -m unittest -v \
   dev/harness/tests/test_behavior.py \
-  dev/harness/tests/test_lifecycle.py
+  dev/harness/tests/test_lifecycle.py \
+  dev/harness/tests/test_broker.py
 dev/harness/behavior.py
 dev/harness/smoke.py
+dev/harness/broker.py -- dev/harness/private_bus_probe.py
 
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
@@ -538,6 +701,29 @@ lifecycle does not search a user-controlled `PATH`.
 This diagnostic is expected in the control-only harness: both bus addresses
 are intentionally dead. It is a failure only if the daemon exits or the
 control socket never becomes ready.
+
+In `broker.py` this diagnostic is a failure: inspect
+`broker-launcher.stderr.log`, `daemon.stderr.log`, and `evidence.json` in the
+retained root. Never respond by unsetting the explicit address or substituting
+the caller's session bus.
+
+### `No medium found` from `dbus-broker-launch --scope=user`
+
+This host returns `ENOMEDIUM` (`-123`) when the isolated inherited-listener
+composition selects user scope. The maintained profile deliberately uses the
+observed working `--scope=system` mode with zero service definitions and both
+launcher bus-address variables redirected to the private listener. Do not
+change scope without re-establishing the complete isolation, activation, and
+process-ownership evidence.
+
+### Host journal or systemd prerequisite failure
+
+The launcher logs through `/run/systemd/journal/socket` and its scope/activation
+model is systemd-specific. `broker.py` and `dev/harness/check broker` fail
+clearly when the journal socket or `/run/systemd/system` is absent. This is an
+intentional refusal to overstate portability: the mode isolates configuration,
+session bus, storage selection, and service activation, but is not independent
+of the host service manager and journal.
 
 ### Readiness timeout
 
@@ -573,6 +759,8 @@ one kind of truth:
 | --- | --- |
 | This guide and `lifecycle.py --help` | Current operator-facing lifecycle contract |
 | [`dev/harness/lifecycle.py`](/dev/harness/lifecycle.py) | Executable mechanics; the final authority on what the current revision actually does |
+| [`dev/harness/broker.py`](/dev/harness/broker.py) and its [focused tests](/dev/harness/tests/test_broker.py) | Executable private-broker mechanics, command contract, exact process/FD ownership, and acceptance coverage |
+| [`dev/harness/private_bus_probe.py`](/dev/harness/private_bus_probe.py) | Non-password plain-session and private-interface capability proof |
 | [`dev/harness/check`](/dev/harness/check) | Maintained explicit prerequisite and check composition; delegates lifecycle/process orchestration |
 | [`tests/harness/real_daemon.rs`](/tests/harness/real_daemon.rs) | Ignored Rust integration boundary and real `SyncClient` assertions |
 | [`dev/harness/tests/test_lifecycle.py`](/dev/harness/tests/test_lifecycle.py) | Executable acceptance coverage for lifecycle invariants and races |
@@ -581,6 +769,7 @@ one kind of truth:
 | [`lifecycle0.gpt6a.md`](/doc/harness/lifecycle0.gpt6a.md) | Version-scoped lifecycle, signal-race, environment, retention, and test evidence; evidence, not timeless daemon promises |
 | [`behavior0.gpt6a.md`](/doc/harness/behavior0.gpt6a.md) | Version-scoped UNLOCK, CHANGE, restart, empty-password, stopped, and unresponsive observations; evidence, not timeless daemon promises |
 | [`integration0.gpt6a.md`](/doc/harness/integration0.gpt6a.md) | Version-scoped durable entry-point, skip/fail, Rust transport, parallel-isolation, and retained-artifact evidence |
+| [`broker0.gpt6a.md`](/doc/harness/broker0.gpt6a.md) | Version-scoped private broker, daemon name ownership, plain-session/interface, host-dependency, failure-retention, and cleanup evidence |
 | [`prompt.md`](/doc/harness/prompt.md) | Epic safety invariants, upstream facts, ticket boundaries, and the original work graph, plus a completion-status section; planned acceptance, not completion evidence |
 | Product [`README.md`](/README.md) | Product contract, private wire protocol, and the unlock-or-create hazard that motivates real-daemon testing; not the harness lifecycle contract |
 | Beads graph | Review and work status; not runtime behavior |
@@ -600,9 +789,9 @@ behavior matrix, durable test integration, and documentation reconciliation —
 is complete and reviewed. The harness deliberately does not implement
 `gmellon unlock` or `change`, use the real session bus temporarily, launch a
 GUI prompter, rename real keyrings, clean unrelated processes or data, or
-make broker mechanics Rust product dependencies. Broker parity branched
-independently after lifecycle and has been promoted to required work for the
-zbus Secret Service product backend; it still must not gate any direct
+make broker mechanics Rust product dependencies. The private-broker profile
+branched independently after lifecycle and has been promoted to required work
+for the zbus Secret Service product backend; it still must not gate any direct
 control-protocol test, and only that branch may make non-prompting Secret
 Service observations.
 
@@ -651,26 +840,33 @@ generalized into timeless upstream guarantees.
   buffers and scanning retained regular artifacts without printing values or
   password-bearing frames.
 
-### Broker parity
+### Private-broker profile
 
-Broker parity is a sibling topology profile, not an upgrade that should make
-the baseline depend on D-Bus. It was planned as optional parity and has been
-promoted to required, in-progress work (`gmell-harness-broker`, P1) because the
-approved product architecture now targets Secret Service collections through
-zbus and GNOME's private internal interface; that promotion does not change
-the control-only contract in this guide or block direct control-socket tests.
-It may add a supervisor-owned listener, broker, and manually launched daemon,
-but it must preserve unique scratch state, empty-based child environments,
-bounded readiness, exact ownership, retained failure evidence, and no
-activation of host services.
+The private broker is a sibling topology profile, not an upgrade that makes
+the control-only baseline depend on D-Bus. It was planned as optional parity
+and was promoted to required P1 infrastructure because the approved product
+architecture targets Secret Service collections through zbus and GNOME's
+private internal interface. That promotion does not change or gate direct
+control-socket tests.
 
-Any broker interface should identify its capability explicitly rather than
-changing the meaning of the control-only variables. Broker readiness must
-add a responsive private bus and proof that the intended daemon owns the
-expected names, while control-socket readiness remains independently
-meaningful. Keep the known `dbus-broker-launch` systemd/controller and
-journal dependencies visible: if they prevent the requested isolation on a
-host, report that limitation rather than silently using the real bus or
-substituting `dbus-daemon` as the delivered topology. Broker mechanics stay
-outside Rust product dependencies and may not gate direct control-protocol
-tests.
+The reusable lifecycle/proof checkpoint is implemented. `broker.py` owns one
+unique listener, the launcher PID, its exact broker child, the manually
+launched daemon, and the command. It preserves private HOME/XDG/storage paths,
+empty-based environments, bounded readiness, exact teardown, retained failure
+evidence, and no external activatable names. It identifies itself with
+`GMELL_HARNESS_MODE=private-broker` rather than changing the meaning of the
+control-only entry point.
+
+Keep the `dbus-broker-launch` systemd and journal dependencies visible. If they
+prevent startup on a host, report that limitation rather than using the real
+bus or substituting `dbus-daemon`. Broker mechanics stay outside Rust product
+dependencies.
+
+The next coherent slice is product-level collection fixture coverage: create
+at least two disposable collections under this private daemon, restart only
+supervisor-owned disposable daemon generations when fixture setup requires it,
+and exercise the product zbus client against stable collection IDs. Ordinary
+unlock must first inspect lock state and return already-unlocked without
+locking, relocking, or pretending to verify the supplied password. Password
+methods should be invoked only for an actually locked fixture, with generated
+values excluded from logs, argv, environment, and retained artifacts.
