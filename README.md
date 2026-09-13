@@ -194,6 +194,41 @@ recv: 00 00 00 08  00 00 00 00
 - Password-bearing request frames must never be logged or hexdumped. Verbose
   diagnostics may report the operation, lengths, socket path, and result only.
 
+## Zsh integration (zimfw module)
+
+The [`zimfw/`](/zimfw) directory is a self-contained zsh module that exports
+a validated `SSH_AUTH_SOCK` in the loading shell. It is shell-local and
+idempotent: **loading it never prompts for a password, never locks or
+unlocks anything, and never invokes `systemctl`** — environment setup stays
+fully separate from unlocking.
+
+Add one line to `~/.zimrc`:
+
+```zsh
+zmodule rektide/gmellon --root zimfw
+# or, for a local checkout zimfw should never install or update:
+zmodule /path/to/gmellon/zimfw
+```
+
+The module's init file is `init.zsh`, zimfw's default discovery name, so no
+`--source` is needed in either form.
+
+Selection priority: an explicit `GMELLON_SSH_AUTH_SOCK` override (must be an
+existing socket, otherwise an actionable error and no change) → an existing
+`SSH_AUTH_SOCK` that still resolves to a socket (never clobbered; repeated
+loads are stable) → discovery of `$XDG_RUNTIME_DIR/gcr/ssh` then
+`$XDG_RUNTIME_DIR/keyring/ssh` → an actionable, non-fatal message when
+nothing validates.
+
+Publishing to the systemd user manager is opt-in and explicit:
+`gmellon-ssh-auth-sock-publish-systemd` reads `systemctl --user
+show-environment` and only sets `SSH_AUTH_SOCK` when absent there,
+preserving any existing value exactly and reporting an unavailable user
+manager without changes.
+
+Tests: `zimfw/test.zsh` (real AF_UNIX fixtures, recording `systemctl` stub).
+Details: [`zimfw/README.md`](/zimfw/README.md).
+
 ## Development (readme-driven)
 
 This README is the spec. Stages land in independently committable and testable

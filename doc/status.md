@@ -5,7 +5,7 @@ description: Current product architecture, validated capabilities, security boun
 resource: /doc/status.md
 tags: [gmellon, gnome-keyring, secret-service, rust, status]
 status: draft
-generated: { by: model:openai/gpt-6, at: 2026-09-13T05:55:00-04:00 }
+generated: { by: model:openai/gpt-6, at: 2026-09-13T06:15:00-04:00 }
 stale_after: 2026-10-13
 sources:
   - id: product-spec
@@ -52,7 +52,10 @@ machinery behind the disabled-by-default `login-control` Cargo feature.
 
 The code remains an MVP in polish terms — no configuration layer, no
 completions, diagnostics are `eprintln`-based — but no release blocker
-remains open.
+remains open. Shell integration ships as the self-contained
+[`zimfw/`](/zimfw) zsh module: it exports a validated `SSH_AUTH_SOCK`
+(override > existing > GNOME/GCR discovery) without ever prompting or
+touching systemctl on load.
 
 ## Current CLI
 
@@ -119,6 +122,7 @@ flowchart LR
 | Historical control backend | [`/src/control/`](/src/control/) | login-only sans-I/O codec, peer validation, and synchronous control-socket exchange behind the disabled-by-default `login-control` feature |
 | Executable harness | [`/dev/harness/`](/dev/harness/) | control-only and private-broker daemon lifecycles, checks, cleanup, and retained evidence |
 | Rust proofs | [`/tests/harness/`](/tests/harness/) | opt-in real-daemon transport, collection, binary CLI, encrypted-session wire, and redaction proofs |
+| Zsh integration | [`/zimfw/`](/zimfw/) | zimfw module: idempotent SSH_AUTH_SOCK selection (override > existing > gcr/keyring discovery) with an opt-in systemd user-environment publisher; never prompts, never unlocks, never runs systemctl on load |
 
 The zbus declarations generate blocking and asynchronous proxies from the same
 interfaces. The product exposes `BlockingClient` today; a future Tokio adapter
@@ -269,6 +273,19 @@ cargo nextest run
 79 passed, 2 skipped
 ```
 
+The zsh module suite reports independently:
+
+```text
+zimfw/test.zsh
+49 assertions passed, 0 failed
+```
+
+The suite uses real AF_UNIX socket fixtures and a recording `systemctl`
+stub; the module was additionally installed and loaded end-to-end through
+the real zimfw from the archived upstream checkout (absolute-path `zmodule`
+form; the generated `init.zsh` sources `zimfw/init.zsh` by default
+discovery, no `--source` needed).
+
 The login control backend is omitted entirely from default builds (its
 unit tests and the `real_daemon` target compile only with the feature), so
 the default baseline dropped from the earlier 106 passed / 4 skipped; the
@@ -331,16 +348,14 @@ No release blocker remains open.
 - **`gmell-polish` (P3):** needs rescoping from its obsolete offline-control
   status language to collection display, redacted diagnostics, completions,
   and final help.
-- **`gmell-zimfw-plugin` (P3):** optional shell integration; must never prompt
-  merely because a shell module loads.
 - **`gmell-stretch` (P4):** needs rescoping now that zbus is the default and
   lock/relock is a sensitive explicit operation rather than basic symmetry.
 - **`gmell-firmament-config` (P4, deferred):** Firmament is under active
   rebuild and no current configuration domain justifies adoption. The fixed
   default remains `login`; explicit collection IDs remain command arguments.
 
-The parent `gmell-unlock-cli` epic now awaits only the agreed polish boundary
-items.
+The parent `gmell-unlock-cli` epic now awaits only the agreed polish and
+stretch rescoping items.
 
 ## Durable decisions
 
@@ -371,3 +386,6 @@ items.
 - [`session0.gpt6a.md`](/doc/harness/session0.gpt6a.md) establishes the
   encrypted-session implementation, first-live-run interop facts, and the
   body-scan monitor proof that passwords travel only as ciphertext.
+- [`/zimfw/README.md`](/zimfw/README.md) is the maintained guide for the
+  zsh module: install line, selection policy, and the opt-in systemd
+  publisher.
