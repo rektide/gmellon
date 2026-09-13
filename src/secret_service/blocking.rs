@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt::{self, Display, Formatter};
 
@@ -6,7 +7,8 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use super::proxies::{
     COLLECTION_PATH_PREFIX, GnomeInternalProxyBlocking, INTERNAL_INTERFACE_NAME, SERVICE_NAME,
-    SERVICE_OBJECT_PATH, SecretCollectionProxyBlocking, SecretServiceProxyBlocking,
+    SERVICE_OBJECT_PATH, SecretCollectionProxyBlocking, SecretItemProxyBlocking,
+    SecretServiceProxyBlocking,
 };
 use super::session::{self, ClientKeypair, CryptoError, SessionKey};
 
@@ -62,6 +64,41 @@ pub struct Collection {
     pub path: OwnedObjectPath,
     pub label: String,
     pub locked: bool,
+}
+
+/// The attribute gcr-ssh-agent matches key passphrases by (verified against
+/// gcr-ssh-agent-interaction.c: the generic schema with one `unique` field).
+pub const UNIQUE_ATTRIBUTE: &str = "unique";
+/// Prefix of the `unique` attribute value for stored SSH key passphrases.
+pub const SSH_STORE_PREFIX: &str = "ssh-store:";
+/// The schema attribute libsecret records on items stored under a dotted
+/// schema name; gcr's lookup includes it, so stored items must carry it.
+pub const GENERIC_SCHEMA_ATTRIBUTE: (&str, &str) = ("xdg:schema", "org.freedesktop.Secret.Generic");
+
+/// Public metadata for one item inside a collection. Metadata only —
+/// item secrets are never read by gmellon.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Item {
+    pub label: String,
+    pub locked: bool,
+    /// Deterministically sorted attribute pairs.
+    pub attributes: BTreeMap<String, String>,
+    pub path: OwnedObjectPath,
+}
+
+impl Item {
+    /// The SSH key path this item stores a passphrase for, when it carries
+    /// the gcr `ssh-store:` unique attribute.
+    pub fn ssh_key_path(&self) -> Option<&str> {
+        self.attributes
+            .get(UNIQUE_ATTRIBUTE)?
+            .strip_prefix(SSH_STORE_PREFIX)
+    }
+}
+
+/// The final path component of a key path, used for the human label.
+fn ssh_key_basename(key_path: &str) -> &str {
+    key_path.rsplit('/').next().unwrap_or(key_path)
 }
 
 /// Result of an ordinary unlock request.
@@ -126,6 +163,22 @@ pub enum Error {
     LockIncomplete {
         id: CollectionId,
     },
+    /// No stored passphrase item exists for the SSH key.
+    SshKeyItemNotFound {
+        key: String,
+    },
+    /// Multiple passphrase items claim the same key; nothing was changed.
+    SshKeyItemsAmbiguous {
+        key: String,
+        count: usize,
+    },
+    /// The target collection is locked; storing requires unlocking first.
+    CollectionLocked {
+        id: CollectionId,
+    },
+    /// The service has no `default` alias; gcr-ssh-agent's lookup goes
+    /// there, so stored keys would be unreachable.
+    NoDefaultCollection,
     Bus(zbus::Error),
 }
 
@@ -164,6 +217,27 @@ impl Display for Error {
                 write!(
                     formatter,
                     "the service did not report collection {id} locked"
+                )
+            }
+            Self::CollectionLocked { id } => {
+                write!(
+                    formatter,
+                    "collection {id} is locked; run gmellon unlock {id} first"
+                )
+            }
+            Self::NoDefaultCollection => formatter.write_str(
+                "the Secret Service has no default collection alias; gcr-ssh-agent \
+                 looks there for stored key passphrases, so gmellon refuses to \
+                 store where it could not be found",
+            ),
+            Self::SshKeyItemNotFound { key } => {
+                write!(formatter, "no stored passphrase for SSH key {key}")
+            }
+            Self::SshKeyItemsAmbiguous { key, count } => {
+                write!(
+                    formatter,
+                    "{count} stored passphrase items claim SSH key {key}; \
+                     gmellon ssh-list shows them; nothing was changed"
                 )
             }
             Self::Bus(error) => write!(formatter, "Secret Service D-Bus error: {error}"),
@@ -406,6 +480,179 @@ impl BlockingClient {
         Ok(LockOutcome::Locked)
     }
 
+    /// List the metadata of every item in a collection. Metadata only:
+    /// labels, lock state, and attributes — no secret is read.
+    pub fn items(&self, id: &CollectionId) -> Result<Vec<Item>, Error> {
+        let proxy = self.collection_proxy(&self.find_path(id)?)?;
+        let mut items = proxy
+            .items()
+            .map_err(classify_service_error)?
+            .into_iter()
+            .map(|path| self.inspect_item(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        items.sort_by(|left, right| {
+            (&left.label, &left.attributes).cmp(&(&right.label, &right.attributes))
+        });
+        Ok(items)
+    }
+
+    /// Every stored SSH key passphrase item across all collections: items
+    /// whose `unique` attribute carries the gcr-ssh-agent `ssh-store:`
+    /// prefix, paired with the owning collection's ID.
+    pub fn ssh_key_items(&self) -> Result<Vec<(CollectionId, Item)>, Error> {
+        let mut found = Vec::new();
+        for collection in self.collections()? {
+            let proxy = self.collection_proxy(&collection.path)?;
+            for path in proxy.items().map_err(classify_service_error)? {
+                let item = self.inspect_item(path)?;
+                if item
+                    .attributes
+                    .get(UNIQUE_ATTRIBUTE)
+                    .is_some_and(|value| value.starts_with(SSH_STORE_PREFIX))
+                {
+                    found.push((collection.id.clone(), item));
+                }
+            }
+        }
+        found.sort_by(|left, right| {
+            let left_key = left.1.ssh_key_path().unwrap_or_default();
+            let right_key = right.1.ssh_key_path().unwrap_or_default();
+            (&left_key, &left.0, &left.1.label).cmp(&(&right_key, &right.0, &right.1.label))
+        });
+        Ok(found)
+    }
+
+    /// Resolve the service's `default` alias — where libsecret-based
+    /// consumers such as gcr-ssh-agent look first — to its collection.
+    pub fn default_collection(&self) -> Result<Collection, Error> {
+        let service = SecretServiceProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
+        let path = service
+            .read_alias("default")
+            .map_err(classify_service_error)?;
+        if path.as_str().is_empty() || path.as_str() == "/" {
+            return Err(Error::NoDefaultCollection);
+        }
+        self.inspect_collection(path)
+    }
+
+    /// Store (or replace, by unique attribute) the passphrase item for an
+    /// SSH key exactly as gcr-ssh-agent expects to find it: the
+    /// `unique=ssh-store:<path>` attribute, the generic schema attribute
+    /// libsecret records for dotted schemas, and a human label.
+    ///
+    /// The caller is responsible for having verified the passphrase against
+    /// the key; this method only stores.
+    pub fn create_ssh_key_item(
+        &self,
+        collection_id: &CollectionId,
+        key_path: &str,
+        passphrase: &[u8],
+    ) -> Result<(), Error> {
+        let collection = self.collection(collection_id)?;
+        if collection.locked {
+            return Err(Error::CollectionLocked {
+                id: collection_id.clone(),
+            });
+        }
+        let proxy = self.collection_proxy(&collection.path)?;
+
+        let label = format!("Unlock password for: {}", ssh_key_basename(key_path));
+        let mut attributes = std::collections::HashMap::new();
+        attributes.insert(
+            UNIQUE_ATTRIBUTE.to_owned(),
+            format!("{SSH_STORE_PREFIX}{key_path}"),
+        );
+        attributes.insert(
+            GENERIC_SCHEMA_ATTRIBUTE.0.to_owned(),
+            GENERIC_SCHEMA_ATTRIBUTE.1.to_owned(),
+        );
+        let mut properties: std::collections::HashMap<&str, Value<'_>> =
+            std::collections::HashMap::new();
+        properties.insert("org.freedesktop.Secret.Item.Label", Value::from(label));
+        properties.insert(
+            "org.freedesktop.Secret.Item.Attributes",
+            Value::Dict(zbus::zvariant::Dict::from(attributes)),
+        );
+
+        let sealed = session::seal(&self.session_key, passphrase).map_err(Error::Session)?;
+        let session: ObjectPath<'_> = self.session_path.as_ref();
+        let content_type = "text/plain";
+        let (item, prompt) = proxy
+            .create_item(
+                &properties,
+                (
+                    &session,
+                    sealed.iv.as_slice(),
+                    sealed.ciphertext.as_slice(),
+                    content_type,
+                ),
+                true,
+            )
+            .map_err(|error| classify_password_error(error, collection_id))?;
+        // An empty path or "/" means no prompt was necessary; gmellon does
+        // not perform prompt objects.
+        if !prompt.as_str().is_empty() && prompt.as_str() != "/" {
+            let _ = item;
+            return Err(Error::LockPromptRequired);
+        }
+        Ok(())
+    }
+
+    fn inspect_item(&self, path: OwnedObjectPath) -> Result<Item, Error> {
+        let proxy = self.item_proxy(path.clone())?;
+        let label = proxy.label().map_err(classify_service_error)?;
+        let locked = proxy.locked().map_err(classify_service_error)?;
+        let attributes: BTreeMap<String, String> = proxy
+            .attributes()
+            .map_err(classify_service_error)?
+            .into_iter()
+            .collect();
+        Ok(Item {
+            label,
+            locked,
+            attributes,
+            path,
+        })
+    }
+
+    /// Delete the stored passphrase item for an SSH key, selected by exact
+    /// `unique` attribute match. Exactly one match must exist: none is an
+    /// error, and duplicates (which gcr cannot disambiguate either) are
+    /// reported without changing anything.
+    pub fn remove_ssh_key_item(&self, key_path: &str) -> Result<CollectionId, Error> {
+        let wanted = format!("{SSH_STORE_PREFIX}{key_path}");
+        let mut matches: Vec<(CollectionId, Item)> = Vec::new();
+        for collection in self.collections()? {
+            let proxy = self.collection_proxy(&collection.path)?;
+            for path in proxy.items().map_err(classify_service_error)? {
+                let item = self.inspect_item(path)?;
+                if item.attributes.get(UNIQUE_ATTRIBUTE) == Some(&wanted) {
+                    matches.push((collection.id.clone(), item));
+                }
+            }
+        }
+        match matches.len() {
+            0 => Err(Error::SshKeyItemNotFound {
+                key: key_path.to_owned(),
+            }),
+            1 => {
+                let (collection_id, item) = matches.pop().expect("one match");
+                let proxy = self.item_proxy(item.path)?;
+                let prompt = proxy.delete().map_err(classify_service_error)?;
+                // An empty path or "/" means no prompt was necessary;
+                // gmellon does not perform prompt objects.
+                if !prompt.as_str().is_empty() && prompt.as_str() != "/" {
+                    return Err(Error::LockPromptRequired);
+                }
+                Ok(collection_id)
+            }
+            count => Err(Error::SshKeyItemsAmbiguous {
+                key: key_path.to_owned(),
+                count,
+            }),
+        }
+    }
+
     fn find_path(&self, id: &CollectionId) -> Result<OwnedObjectPath, Error> {
         let service = SecretServiceProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
         service
@@ -423,13 +670,7 @@ impl BlockingClient {
 
     fn inspect_collection(&self, path: OwnedObjectPath) -> Result<Collection, Error> {
         let id = CollectionId::from_path(&path)?;
-        let proxy = SecretCollectionProxyBlocking::builder(&self.connection)
-            .destination(SERVICE_NAME)
-            .map_err(Error::Bus)?
-            .path(path.clone())
-            .map_err(Error::Bus)?
-            .build()
-            .map_err(Error::Bus)?;
+        let proxy = self.collection_proxy(&path)?;
         let label = proxy.label().map_err(classify_service_error)?;
         let locked = proxy.locked().map_err(classify_service_error)?;
         Ok(Collection {
@@ -438,6 +679,29 @@ impl BlockingClient {
             label,
             locked,
         })
+    }
+
+    fn collection_proxy(
+        &self,
+        path: &OwnedObjectPath,
+    ) -> Result<SecretCollectionProxyBlocking<'_>, Error> {
+        SecretCollectionProxyBlocking::builder(&self.connection)
+            .destination(SERVICE_NAME)
+            .map_err(Error::Bus)?
+            .path(path.clone())
+            .map_err(Error::Bus)?
+            .build()
+            .map_err(Error::Bus)
+    }
+
+    fn item_proxy(&self, path: OwnedObjectPath) -> Result<SecretItemProxyBlocking<'_>, Error> {
+        SecretItemProxyBlocking::builder(&self.connection)
+            .destination(SERVICE_NAME)
+            .map_err(Error::Bus)?
+            .path(path)
+            .map_err(Error::Bus)?
+            .build()
+            .map_err(Error::Bus)
     }
 }
 

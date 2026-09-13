@@ -10,6 +10,6 @@ mod blocking;
 mod proxies;
 
 pub use blocking::{
-    BlockingClient, Collection, CollectionId, Error, InterfaceProbe, LockOutcome, UnlockOutcome,
-    decode_open_session_output,
+    BlockingClient, Collection, CollectionId, Error, InterfaceProbe, Item, LockOutcome,
+    UnlockOutcome, decode_open_session_output,
 };

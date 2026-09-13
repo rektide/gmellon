@@ -4,3 +4,4 @@
 pub mod control;
 pub mod secret_input;
 pub mod secret_service;
+pub mod ssh;

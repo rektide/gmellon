@@ -1,5 +1,6 @@
 use std::io;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -7,9 +8,10 @@ use clap_complete::Shell;
 use gmellon::secret_input::{self, Secret, SecretError};
 use gmellon::secret_service::session;
 use gmellon::secret_service::{
-    BlockingClient, Collection, CollectionId, Error as ServiceError, InterfaceProbe, LockOutcome,
-    UnlockOutcome,
+    BlockingClient, Collection, CollectionId, Error as ServiceError, InterfaceProbe, Item,
+    LockOutcome, UnlockOutcome,
 };
+use gmellon::ssh::{self, Verdict};
 
 const EXIT_OK: u8 = 0;
 const EXIT_ERROR: u8 = 1;
@@ -93,6 +95,54 @@ pub enum Command {
         collection: String,
     },
 
+    /// List items inside a collection: labels, lock state, attributes.
+    ///
+    /// Metadata only — no secret is ever read. Deterministic tab-separated
+    /// LABEL, LOCKED, and sorted k=v ATTRIBUTES columns, sorted by label
+    /// then attributes. Control characters in labels are escaped.
+    Items {
+        /// Stable collection ID; defaults to login.
+        #[arg(value_name = "COLLECTION", default_value = DEFAULT_COLLECTION)]
+        collection: String,
+    },
+
+    /// List stored SSH key passphrases.
+    ///
+    /// Every item across all collections whose unique attribute carries
+    /// the gcr-ssh-agent ssh-store: prefix, with its owning collection and
+    /// lock state. Metadata only; the passphrases are not read.
+    SshList,
+
+    /// Store an SSH key passphrase, verified against the key first.
+    ///
+    /// Prompts for the KEY's passphrase (not the keyring password), checks
+    /// it actually decrypts KEY with ssh-keygen, and only then stores it
+    /// the way gcr-ssh-agent finds it — in the default collection, keyed by
+    /// the key's absolute path. A wrong passphrase stores nothing; an
+    /// unencrypted key has nothing to store. Replaces any previously
+    /// stored passphrase for the same key.
+    SshAdd {
+        /// Path to the SSH private key.
+        #[arg(value_name = "KEY")]
+        key: PathBuf,
+
+        /// Read one passphrase line from stdin instead of prompting on the TTY.
+        #[arg(long)]
+        stdin: bool,
+    },
+
+    /// Remove a stored SSH key passphrase.
+    ///
+    /// Deletes the item gcr-ssh-agent would read for KEY (exact key-path
+    /// match). The key file itself may already be gone — removing a stale
+    /// stored passphrase is the point. Exactly one stored item must match;
+    /// duplicates are listed by ssh-list and change nothing here.
+    SshRemove {
+        /// Path to the SSH private key the passphrase was stored for.
+        #[arg(value_name = "KEY")]
+        key: PathBuf,
+    },
+
     /// Change an existing collection's password.
     ///
     /// Prompts for the current password, then the new password twice on the
@@ -134,6 +184,10 @@ pub fn run(cli: Cli) -> ExitCode {
     let code = match cli.command {
         Command::List => list(),
         Command::Status => status(),
+        Command::Items { collection } => items(&collection),
+        Command::SshList => ssh_list(),
+        Command::SshAdd { key, stdin } => ssh_add(&key, stdin),
+        Command::SshRemove { key } => ssh_remove(&key),
         Command::Unlock { collection, stdin } => unlock(&collection, stdin),
         Command::Lock { collection } => lock(&collection),
         Command::Change { collection, stdin } => change(&collection, stdin),
@@ -348,6 +402,195 @@ fn denied_wording(error: &ServiceError) -> &'static str {
 
 /// Emit the completion script for one shell. Buffered and written once so
 /// a broken pipe reports an exit-1 diagnostic instead of a panic.
+/// List a collection's items: metadata only, no secret is read.
+fn items(collection: &str) -> u8 {
+    let id = match CollectionId::new(collection) {
+        Ok(id) => id,
+        Err(error) => return report_service_error(error),
+    };
+    let span = tracing::info_span!("operation", operation = "items", collection = %id);
+    span.in_scope(|| {
+        let client = match BlockingClient::session() {
+            Ok(client) => client,
+            Err(error) => return report_service_error(error),
+        };
+        match client.items(&id) {
+            Ok(items) => {
+                print!("{}", render_items(&items));
+                tracing::info!(count = items.len(), "items listed");
+                EXIT_OK
+            }
+            Err(error) => report_service_error(error),
+        }
+    })
+}
+
+/// List stored SSH key passphrases across all collections.
+fn ssh_list() -> u8 {
+    let span = tracing::info_span!("operation", operation = "ssh-list");
+    span.in_scope(|| {
+        let client = match BlockingClient::session() {
+            Ok(client) => client,
+            Err(error) => return report_service_error(error),
+        };
+        match client.ssh_key_items() {
+            Ok(entries) => {
+                print!("{}", render_ssh_items(&entries));
+                tracing::info!(count = entries.len(), "ssh key items listed");
+                EXIT_OK
+            }
+            Err(error) => report_service_error(error),
+        }
+    })
+}
+
+/// Verify a key's passphrase and store it the way gcr-ssh-agent finds it.
+fn ssh_add(key: &Path, stdin: bool) -> u8 {
+    let span = tracing::info_span!("operation", operation = "ssh-add", key = %key.display());
+    span.in_scope(|| {
+        // The absolute path is the storage key (the unique attribute), so
+        // resolve symlinks and relative paths once, up front.
+        let canonical = match std::fs::canonicalize(key) {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                eprintln!(
+                    "gmellon: cannot resolve key path {}: {error}",
+                    key.display()
+                );
+                return EXIT_ERROR;
+            }
+        };
+
+        let secret = if stdin {
+            secret_input::read_stdin_line(&mut io::stdin().lock())
+        } else {
+            secret_input::prompt(&format!(
+                "SSH key passphrase for {} (the KEY's passphrase, not the keyring password): ",
+                canonical.display()
+            ))
+        };
+        let secret = match secret {
+            Ok(secret) => secret,
+            Err(error) => {
+                eprintln!("gmellon: {error}");
+                return EXIT_ERROR;
+            }
+        };
+
+        match ssh::verify_passphrase(&canonical, secret.as_bytes()) {
+            Verdict::Verified => {
+                tracing::info!(verdict = "Verified", "key passphrase verified");
+            }
+            Verdict::Rejected => {
+                eprintln!(
+                    "gmellon: WRONG — that does not unlock {}, nothing stored",
+                    canonical.display()
+                );
+                return EXIT_DENIED;
+            }
+            Verdict::NotEncrypted => {
+                eprintln!(
+                    "gmellon: {} is not passphrase-protected; there is nothing to store",
+                    canonical.display()
+                );
+                return EXIT_ERROR;
+            }
+            Verdict::Unavailable(reason) => {
+                eprintln!("gmellon: {reason}");
+                return EXIT_ERROR;
+            }
+        }
+
+        let client = match BlockingClient::session() {
+            Ok(client) => client,
+            Err(error) => return report_service_error(error),
+        };
+        // gcr-ssh-agent's libsecret lookup goes to the default-alias
+        // collection; store exactly there and say where.
+        let target = match client.default_collection() {
+            Ok(collection) => collection,
+            Err(error) => return report_service_error(error),
+        };
+        match client.create_ssh_key_item(&target.id, &canonical.display().to_string(), secret.as_bytes())
+        {
+            Ok(()) => {
+                println!(
+                    "stored in collection {} & verified against the key",
+                    target.id
+                );
+                tracing::info!(outcome = "Stored", collection = %target.id, "ssh key passphrase stored");
+                EXIT_OK
+            }
+            Err(error) => report_service_error(error),
+        }
+    })
+}
+
+/// Remove the stored passphrase item for an SSH key. The key file may no
+/// longer exist — stale stored passphrases are the point — so the path is
+/// only canonicalized when present, and otherwise made absolute verbatim.
+fn ssh_remove(key: &Path) -> u8 {
+    let span = tracing::info_span!("operation", operation = "ssh-remove", key = %key.display());
+    span.in_scope(|| {
+        let absolute = match std::fs::canonicalize(key) {
+            Ok(canonical) => canonical,
+            Err(_) => std::path::absolute(key).unwrap_or_else(|_| key.to_path_buf()),
+        };
+        let client = match BlockingClient::session() {
+            Ok(client) => client,
+            Err(error) => return report_service_error(error),
+        };
+        match client.remove_ssh_key_item(&absolute.display().to_string()) {
+            Ok(collection) => {
+                println!(
+                    "removed stored passphrase for {} from collection {collection}",
+                    absolute.display()
+                );
+                tracing::info!(outcome = "Removed", collection = %collection, "ssh key passphrase removed");
+                EXIT_OK
+            }
+            Err(error) => report_service_error(error),
+        }
+    })
+}
+
+fn render_items(items: &[Item]) -> String {
+    let mut output = String::from("LABEL\tLOCKED\tATTRIBUTES\n");
+    for item in items {
+        let locked = if item.locked { "yes" } else { "no" };
+        output.extend(item.label.escape_debug());
+        output.push('\t');
+        output.push_str(locked);
+        output.push('\t');
+        let mut first = true;
+        for (key, value) in &item.attributes {
+            if !first {
+                output.push(',');
+            }
+            first = false;
+            output.push_str(key);
+            output.push('=');
+            output.extend(value.escape_debug());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn render_ssh_items(entries: &[(CollectionId, Item)]) -> String {
+    let mut output = String::from("KEY\tCOLLECTION\tLOCKED\n");
+    for (collection, item) in entries {
+        let locked = if item.locked { "yes" } else { "no" };
+        output.extend(item.ssh_key_path().unwrap_or_default().escape_debug());
+        output.push('\t');
+        output.push_str(collection.as_str());
+        output.push('\t');
+        output.push_str(locked);
+        output.push('\n');
+    }
+    output
+}
+
 fn completions(shell: Shell) -> u8 {
     let span = tracing::info_span!("operation", operation = "completions", shell = %shell);
     span.in_scope(|| {
@@ -412,6 +655,10 @@ fn service_error_exit(error: &ServiceError) -> u8 {
         | ServiceError::Session(_)
         | ServiceError::LockPromptRequired
         | ServiceError::LockIncomplete { .. }
+        | ServiceError::CollectionLocked { .. }
+        | ServiceError::NoDefaultCollection
+        | ServiceError::SshKeyItemNotFound { .. }
+        | ServiceError::SshKeyItemsAmbiguous { .. }
         | ServiceError::Bus(_) => EXIT_ERROR,
     }
 }

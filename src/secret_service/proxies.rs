@@ -28,6 +28,10 @@ pub(super) trait SecretService {
         &self,
         collections: &[ObjectPath<'_>],
     ) -> zbus::Result<(Vec<OwnedObjectPath>, OwnedObjectPath)>;
+
+    /// Resolve an alias such as "default" to its collection path. An empty
+    /// path means the alias is unset.
+    fn read_alias(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
 }
 
 #[zbus::proxy(
@@ -40,6 +44,38 @@ pub(super) trait SecretCollection {
 
     #[zbus(property)]
     fn locked(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn items(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+
+    fn create_item(
+        &self,
+        properties: &std::collections::HashMap<&str, Value<'_>>,
+        secret: Secret<'_>,
+        replace: bool,
+    ) -> zbus::Result<(OwnedObjectPath, OwnedObjectPath)>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.Secret.Item",
+    default_service = "org.freedesktop.secrets"
+)]
+pub(super) trait SecretItem {
+    #[zbus(property)]
+    fn label(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
+    fn locked(&self) -> zbus::Result<bool>;
+
+    /// Item attributes as a string-to-string dictionary; the
+    /// `unique` attribute is how gcr-ssh-agent finds key passphrases.
+    #[zbus(property)]
+    fn attributes(&self) -> zbus::Result<std::collections::HashMap<String, String>>;
+
+    /// Delete this item. The reply is the prompt object path; an empty
+    /// path or "/" means no prompt was necessary (the daemon completes
+    /// plain deletions with "/").
+    fn delete(&self) -> zbus::Result<OwnedObjectPath>;
 }
 
 #[zbus::proxy(

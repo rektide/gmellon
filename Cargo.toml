@@ -30,6 +30,9 @@ zeroize = "1.9.0"
 login-control = ["rustix/net", "rustix/process"]
 
 [dev-dependencies]
+aes = "0.9.3"
+cbc = "0.2.1"
+nix = { version = "0.31.3", features = ["process", "term"] }
 tempfile = "3.27.0"
 
 [[test]]
