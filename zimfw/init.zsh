@@ -1,9 +1,19 @@
-# gmellon SSH agent socket selection — zimfw module.
+# gmellon SSH agent socket selection + zsh completions — zimfw module.
 #
-# Exports a validated SSH_AUTH_SOCK in the loading shell, and nothing else.
-# Loading never prompts for a password, never locks or unlocks anything, and
-# never invokes systemctl. Publishing to the systemd user manager is a
-# separate, explicit, opt-in function.
+# Two independently guarded behaviors:
+#
+#   1. Exports a validated SSH_AUTH_SOCK in the loading shell. Loading
+#      never prompts for a password, never locks or unlocks anything, and
+#      never invokes systemctl. Publishing to the systemd user manager is a
+#      separate, explicit, opt-in function. None of this depends on the
+#      gmellon binary being installed.
+#   2. Installs gmellon's zsh completions: when the gmellon binary is on
+#      PATH and newer than <module>/functions/_gmellon (or the file is
+#      missing), regenerates it with `gmellon completions zsh` and prints
+#      one note on stderr. zimfw's default module wiring already puts
+#      <module>/functions on fpath for a zmodule line without
+#      --fpath/--autoload/--cmd (src/functions/30_zmodule.zsh.erb), so
+#      compinit picks the file up with no fpath code of our own.
 #
 # Selection priority (one code path, shared with the opt-in publisher):
 #   1. GMELLON_SSH_AUTH_SOCK override — must validate, otherwise an
@@ -163,6 +173,24 @@ gmellon-ssh-auth-sock-publish-systemd() {
 }
 
 _gmellon_ssh_auth_sock_initialize
+
+# --- completions ------------------------------------------------------------
+# Separately guarded from the SSH block above: when gmellon is not on PATH
+# this returns before the completion work and the SSH environment work
+# above has already run (it never depended on the binary). `return 0`
+# keeps loading non-fatal in that case too, matching the module contract.
+(( ${+commands[gmellon]} )) || return 0
+
+local _zim_gmellon_dir=${0:h}
+
+() {
+  local command=${commands[gmellon]}
+  local compfile=$1/functions/_gmellon
+  if [[ ! -e $compfile || $compfile -ot $command ]]; then
+    ${command} completions zsh >| $compfile
+    print -u2 -PR "* Detected a new version of 'gmellon'. Regenerated completions."
+  fi
+} "${_zim_gmellon_dir}"
 
 # Loading is never fatal: a missing socket is a reported condition, not an
 # error exit for the shell.

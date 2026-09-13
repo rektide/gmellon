@@ -72,8 +72,21 @@ module, only on machines where systemd user services should see the agent.
 | file | role |
 |---|---|
 | `init.zsh` | the module (zimfw default init file) |
+| `functions/_gmellon` | zsh completion for the `gmellon` binary (auto-fpath'd by zimfw) |
 | `test.zsh` | zsh test suite — run directly: `./test.zsh` |
 | `socket-holder.zsh` | test fixture: holds a real AF_UNIX listening socket (`zsh/net/socket`) |
+
+## Completions
+
+Loading the module with a `gmellon` binary on `PATH` keeps
+`functions/_gmellon` current: when the binary is newer than the file (or
+the file is missing), the module regenerates it via
+`gmellon completions zsh` and notes the regeneration on stderr. zimfw puts
+the module's `functions/` directory on `fpath` automatically, so `compinit`
+picks the completion up with no extra wiring. This block is guarded
+independently of the SSH environment work: no binary means no completions
+and a one-line skip, while `SSH_AUTH_SOCK` selection proceeds exactly as
+above. Loading never prompts and never invokes `systemctl` either way.
 
 ## Tests
 

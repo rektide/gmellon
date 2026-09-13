@@ -1,0 +1,207 @@
+#compdef gmellon
+
+autoload -U is-at-least
+
+_gmellon() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_gmellon_commands" \
+"*::: :->gmellon" \
+&& ret=0
+    case $state in
+    (gmellon)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:gmellon-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(unlock)
+_arguments "${_arguments_options[@]}" : \
+'--stdin[Read one password line from stdin instead of prompting on the TTY]' \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::collection -- Stable collection ID; defaults to login:_default' \
+&& ret=0
+;;
+(change)
+_arguments "${_arguments_options[@]}" : \
+'--stdin[Read current, new, and confirmation lines from stdin]' \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::collection -- Stable collection ID; defaults to login:_default' \
+&& ret=0
+;;
+(completions)
+_arguments "${_arguments_options[@]}" : \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':shell -- Shell to generate completions for:(bash elvish fish powershell zsh)' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_gmellon__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:gmellon-help-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(unlock)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(change)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(completions)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_gmellon_commands] )) ||
+_gmellon_commands() {
+    local commands; commands=(
+'list:List collection IDs, labels, and lock state' \
+'status:Report service capabilities and collection lock state' \
+'unlock:Unlock an existing collection' \
+'change:Change an existing collection'\''s password' \
+'completions:Generate shell completions' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'gmellon commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__change_commands] )) ||
+_gmellon__subcmd__change_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon change commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__completions_commands] )) ||
+_gmellon__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon completions commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help_commands] )) ||
+_gmellon__subcmd__help_commands() {
+    local commands; commands=(
+'list:List collection IDs, labels, and lock state' \
+'status:Report service capabilities and collection lock state' \
+'unlock:Unlock an existing collection' \
+'change:Change an existing collection'\''s password' \
+'completions:Generate shell completions' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'gmellon help commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__change_commands] )) ||
+_gmellon__subcmd__help__subcmd__change_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help change commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__completions_commands] )) ||
+_gmellon__subcmd__help__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help completions commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__help_commands] )) ||
+_gmellon__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help help commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__list_commands] )) ||
+_gmellon__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help list commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__status_commands] )) ||
+_gmellon__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help status commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__unlock_commands] )) ||
+_gmellon__subcmd__help__subcmd__unlock_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help unlock commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__list_commands] )) ||
+_gmellon__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon list commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__status_commands] )) ||
+_gmellon__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon status commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__unlock_commands] )) ||
+_gmellon__subcmd__unlock_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon unlock commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_gmellon" ]; then
+    _gmellon "$@"
+else
+    compdef _gmellon gmellon
+fi

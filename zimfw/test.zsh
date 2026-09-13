@@ -11,6 +11,9 @@
 #       empty    — show-environment: OK, no SSH_AUTH_SOCK; set-environment: OK
 #       present  — show-environment: OK, includes SSH_AUTH_SOCK=/existing/systemd/agent
 #       fail     — exits 1 (user manager unavailable)
+#   - a stub gmellon binary emitting known completion text (completion
+#     regeneration cases), run against a writable copy of the module so the
+#     checkout is never mutated
 #
 # Exits nonzero with a failure count summary if any assertion fails.
 
@@ -25,7 +28,13 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/gmellon-zimfw-tests.XXXXXX")
 STUB_BIN="${WORK}/stub-bin"
 STUB_LOG="${WORK}/systemctl.log"
 STUB_MODE='unused'
+GMELLON_STUB="${WORK}/gmellon-stub"
+MODULE_COPY="${WORK}/module-copy"
+STUB_COMPLETIONS=$'#compdef gmellon\n# STUB gmellon completions output'
 CASE_ENVS=()
+# Defaults every existing case relies on; the completion cases override.
+CASE_MODULE="${MODULE_DIR}/init.zsh"
+CASE_PATH="${STUB_BIN}:${PATH}"
 socket_pids=()
 
 cleanup() {
@@ -85,16 +94,46 @@ STUB
   chmod +x "${STUB_BIN}/systemctl"
 }
 
+# A stub gmellon binary: emits known completion text for exactly the
+# `completions zsh` invocation the module makes, fails loudly otherwise.
+make_gmellon_stub() {
+  mkdir -p "${GMELLON_STUB}"
+  cat > "${GMELLON_STUB}/gmellon" <<'STUB'
+#!/usr/bin/env zsh
+if [[ $1 == completions && $2 == zsh ]]; then
+  print -r -- '#compdef gmellon'
+  print -r -- '# STUB gmellon completions output'
+  exit 0
+fi
+print -u2 -- "stub gmellon: unexpected invocation: $*"
+exit 1
+STUB
+  chmod +x "${GMELLON_STUB}/gmellon"
+}
+
+# A writable copy of the module for completion tests, so regeneration
+# writes into the copy and never mutates this checkout. functions/ exists
+# (as it does in the shipped module) but no compfile: tests create or
+# preload it per case.
+copy_module() {
+  rm -rf "${MODULE_COPY}"
+  mkdir -p "${MODULE_COPY}/functions"
+  cp "${MODULE_DIR}/init.zsh" "${MODULE_COPY}/init.zsh"
+}
+
 # Run a probe in a clean `zsh -f` with the module available as
 # $GMELLON_TEST_MODULE, the stub systemctl first in PATH, SSH_AUTH_SOCK,
 # GMELLON_SSH_AUTH_SOCK, and XDG_RUNTIME_DIR stripped, then CASE_ENVS applied.
-# Captures stdout -> REPLY_OUT, stderr -> REPLY_ERR, status -> REPLY_RC.
+# CASE_MODULE overrides which init.zsh is sourced (the completion tests use
+# a writable module copy); CASE_PATH overrides the probe PATH (the
+# completion tests compose a stub gmellon in or out). Captures stdout ->
+# REPLY_OUT, stderr -> REPLY_ERR, status -> REPLY_RC.
 run_module() {
   local probe=$1
   : > "${WORK}/err"
   REPLY_OUT=$(env -u SSH_AUTH_SOCK -u GMELLON_SSH_AUTH_SOCK -u XDG_RUNTIME_DIR \
-    GMELLON_TEST_MODULE="${MODULE_DIR}/init.zsh" \
-    PATH="${STUB_BIN}:${PATH}" \
+    GMELLON_TEST_MODULE="${CASE_MODULE}" \
+    PATH="${CASE_PATH}" \
     GMELLON_TEST_STUB_LOG="${STUB_LOG}" \
     GMELLON_TEST_STUB_MODE="${STUB_MODE}" \
     ${CASE_ENVS[@]} \
@@ -313,6 +352,75 @@ probe_rc; assert_eq "systemd-invalid-override: publisher exit status 1" "RC=1" "
 stub_calls
 assert_eq "systemd-invalid-override: systemctl never invoked" "" "${REPLY_STUB}"
 assert_contains "systemd-invalid-override: actionable error shown" "${REPLY_ERR}" "not an existing unix socket"
+
+# --------------------------------------------------- completions (gmellon) --
+# The module's second, independently guarded behavior: regenerate
+# <module>/functions/_gmellon from the gmellon binary when the binary is
+# newer than the compfile (or the compfile is missing). Fixtures: a stub
+# gmellon emitting known completion text, and a writable module copy so
+# regeneration never touches this checkout.
+make_gmellon_stub
+
+# 16. binary present, compfile missing -> regenerated from the stub
+: > "${STUB_LOG}"
+STUB_MODE='unused'
+copy_module
+CASE_MODULE="${MODULE_COPY}/init.zsh"
+CASE_PATH="${STUB_BIN}:${GMELLON_STUB}:/usr/bin:/bin"
+touch -d '2020-01-01 00:00:00' "${GMELLON_STUB}/gmellon"
+CASE_ENVS=(XDG_RUNTIME_DIR=${FX_GCR})
+run_module 'source "$GMELLON_TEST_MODULE"; rc=$?; print -r -- "SRCRC=${rc} VALUE=${SSH_AUTH_SOCK-unset}"'
+assert_eq "completions-missing: load exit status 0" 0 ${REPLY_RC}
+assert_contains "completions-missing: sourcing is non-fatal" "${REPLY_OUT}" "SRCRC=0"
+assert_contains "completions-missing: SSH env still initialized" "${REPLY_OUT}" "VALUE=${GCR_SOCK}"
+assert_eq "completions-missing: compfile created" "yes" "$([[ -e ${MODULE_COPY}/functions/_gmellon ]] && print yes || print no)"
+REPLY_COMP=$(<"${MODULE_COPY}/functions/_gmellon")
+assert_eq "completions-missing: regenerated content is the stub output" "${STUB_COMPLETIONS}" "${REPLY_COMP}"
+assert_contains "completions-missing: one-time regeneration note" "${REPLY_ERR}" "Regenerated completions"
+
+# 17. compfile newer than the binary -> untouched
+copy_module
+print -r -- 'SENTINEL: compfile is fresh' >| "${MODULE_COPY}/functions/_gmellon"
+touch -d '2021-01-01 00:00:00' "${MODULE_COPY}/functions/_gmellon"
+touch -d '2020-01-01 00:00:00' "${GMELLON_STUB}/gmellon"
+CASE_ENVS=(XDG_RUNTIME_DIR=${FX_GCR})
+run_module 'source "$GMELLON_TEST_MODULE"; rc=$?; print -r -- "SRCRC=${rc} VALUE=${SSH_AUTH_SOCK-unset}"'
+assert_contains "completions-fresh: sourcing is non-fatal" "${REPLY_OUT}" "SRCRC=0"
+REPLY_COMP=$(<"${MODULE_COPY}/functions/_gmellon")
+assert_eq "completions-fresh: fresh compfile untouched" "SENTINEL: compfile is fresh" "${REPLY_COMP}"
+assert_not_contains "completions-fresh: no regeneration note" "${REPLY_ERR}" "Regenerated completions"
+
+# 18. binary newer than the compfile -> regenerated
+copy_module
+print -r -- 'SENTINEL: compfile is stale' >| "${MODULE_COPY}/functions/_gmellon"
+touch -d '2019-01-01 00:00:00' "${MODULE_COPY}/functions/_gmellon"
+touch -d '2020-01-01 00:00:00' "${GMELLON_STUB}/gmellon"
+CASE_ENVS=(XDG_RUNTIME_DIR=${FX_GCR})
+run_module 'source "$GMELLON_TEST_MODULE"; rc=$?; print -r -- "SRCRC=${rc} VALUE=${SSH_AUTH_SOCK-unset}"'
+assert_contains "completions-stale: sourcing is non-fatal" "${REPLY_OUT}" "SRCRC=0"
+REPLY_COMP=$(<"${MODULE_COPY}/functions/_gmellon")
+assert_eq "completions-stale: stale compfile regenerated" "${STUB_COMPLETIONS}" "${REPLY_COMP}"
+assert_contains "completions-stale: regeneration note shown" "${REPLY_ERR}" "Regenerated completions"
+
+# 19. no gmellon on PATH -> no regeneration, SSH env init still runs
+copy_module
+CASE_PATH="${STUB_BIN}:/usr/bin:/bin"
+CASE_ENVS=(XDG_RUNTIME_DIR=${FX_GCR})
+run_module 'source "$GMELLON_TEST_MODULE"; rc=$?; print -r -- "SRCRC=${rc} VALUE=${SSH_AUTH_SOCK-unset}"'
+assert_eq "completions-absent: load exit status 0" 0 ${REPLY_RC}
+assert_contains "completions-absent: sourcing is non-fatal" "${REPLY_OUT}" "SRCRC=0"
+assert_contains "completions-absent: SSH env init still ran" "${REPLY_OUT}" "VALUE=${GCR_SOCK}"
+assert_contains "completions-absent: discovery still reported" "${REPLY_OUT}" "(discovered gcr/ssh)"
+assert_eq "completions-absent: no compfile created" "no" "$([[ -e ${MODULE_COPY}/functions/_gmellon ]] && print yes || print no)"
+assert_not_contains "completions-absent: silent skip (no note)" "${REPLY_ERR}" "Regenerated completions"
+
+# 20. loading in every completion case never invokes systemctl
+stub_calls
+assert_eq "completions-never-systemctl: zero systemctl calls" "" "${REPLY_STUB}"
+
+# Restore the shared defaults for any appended cases.
+CASE_MODULE="${MODULE_DIR}/init.zsh"
+CASE_PATH="${STUB_BIN}:${PATH}"
 
 # ----------------------------------------------------------------- summary --
 
