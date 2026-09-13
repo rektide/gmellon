@@ -9,4 +9,6 @@ pub mod session;
 mod blocking;
 mod proxies;
 
-pub use blocking::{BlockingClient, Collection, CollectionId, Error, UnlockOutcome};
+pub use blocking::{
+    BlockingClient, Collection, CollectionId, Error, UnlockOutcome, decode_open_session_output,
+};

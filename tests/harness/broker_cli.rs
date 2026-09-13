@@ -42,8 +42,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use broker_common::{
-    Fixture, LOGIN_LABEL, MethodMonitor, ProofSecrets, expected_collection_id, run_broker_isolated,
-    validated_harness_environment,
+    BodyMonitor, Fixture, LOGIN_LABEL, MethodMonitor, ProofSecrets, expected_collection_id,
+    run_broker_isolated, validated_harness_environment,
 };
 use common::{contains, required_path};
 use zeroize::Zeroizing;
@@ -118,9 +118,17 @@ fn run_proof(secrets: &ProofSecrets) {
     // disk in any form.
     let change_monitor = MethodMonitor::change_calls(&bus.address, &bus.root);
 
+    // The encrypted-session wire evidence: every password-method body is
+    // captured and scanned for the generated passwords, and every OpenSession
+    // negotiation is checked for the encrypted algorithm. Streamed through
+    // pipes; decoded bodies never touch disk.
+    let password_monitor = BodyMonitor::password_methods(&bus.address, &bus.root, secrets);
+    let negotiation_monitor = BodyMonitor::open_sessions(&bus.address, &bus.root, secrets);
+
     // Fixture connection: separate D-Bus unique name from the product binary,
-    // so every observed Lock call can be attributed to a sender.
-    let mut fixture = Fixture::connect(&bus.address).expect("fixture plain session");
+    // so every observed Lock call can be attributed to a sender. The fixture
+    // negotiates the same encrypted session the product binary does.
+    let mut fixture = Fixture::connect(&bus.address).expect("fixture encrypted session");
     let fixture_sender = fixture.unique_name();
 
     let label_second = format!("gmellon-cli-second-{}", secrets.run_tag);
@@ -640,6 +648,64 @@ fn run_proof(secrets: &ProofSecrets) {
             .iter()
             .all(|sender| sender != &fixture_sender),
         "every private change call must come from a CLI connection, not the fixture"
+    );
+
+    // --- encrypted-session wire evidence -------------------------------------
+    // Absence was asserted inside the monitor: any generated password seen
+    // in any captured body — line bytes, hex, or a decoded ay run — fails
+    // the proof. Presence is asserted here: exactly the expected
+    // password-method calls were captured, every one in the encrypted shape
+    // (a plain secret's empty IV array would fail the shape verdict), and
+    // one encrypted OpenSession per CLI invocation plus the fixture's own.
+    let bodies = password_monitor.finish(secrets);
+    assert_eq!(
+        bodies.messages_of("CreateWithMasterPassword").len(),
+        2,
+        "exactly the fixture's two creations must be captured"
+    );
+    assert_eq!(
+        bodies.messages_of("UnlockWithMasterPassword").len(),
+        11,
+        "exactly the eleven binary unlock calls that reached the daemon must be captured"
+    );
+    let observed_change_bodies = bodies.messages_of("ChangeWithMasterPassword").len();
+    assert_eq!(
+        observed_change_bodies, 3,
+        "the body monitor must see the same three change calls as the header monitor"
+    );
+    for member in [
+        "CreateWithMasterPassword",
+        "UnlockWithMasterPassword",
+        "ChangeWithMasterPassword",
+    ] {
+        assert!(
+            bodies.all_encrypted(member),
+            "every captured {member} body must carry well-formed encrypted secrets"
+        );
+    }
+
+    let negotiations = negotiation_monitor.finish(secrets);
+    assert_eq!(
+        negotiations.messages.len(),
+        INVOCATIONS.load(Ordering::Relaxed) + 1,
+        "one encrypted OpenSession per CLI invocation (every invocation constructs the \
+         client) plus the fixture's own negotiation must be captured"
+    );
+    assert!(
+        negotiations
+            .messages
+            .iter()
+            .all(|message| message.dh_algorithm),
+        "every captured OpenSession must negotiate the encrypted-session algorithm"
+    );
+    assert_eq!(
+        negotiations
+            .messages
+            .iter()
+            .filter(|message| message.sender == fixture_sender)
+            .count(),
+        1,
+        "exactly one negotiation must belong to the fixture connection"
     );
 }
 

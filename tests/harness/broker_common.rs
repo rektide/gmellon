@@ -24,7 +24,9 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::error::Error as StdError;
 use std::ffi::OsStr;
+use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -34,6 +36,9 @@ use std::time::{Duration, Instant};
 
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 use zeroize::Zeroizing;
+
+use gmellon::secret_service::decode_open_session_output;
+use gmellon::secret_service::session::{self, ClientKeypair};
 
 use super::common;
 
@@ -62,6 +67,22 @@ pub const LOCK_MATCH: &str = "interface='org.freedesktop.Secret.Service',member=
 /// line buffer only: no raw change-monitor output ever exists on disk, in
 /// any form, on success, failure, or abrupt teardown.
 pub const CHANGE_MATCH: &str = "interface='org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface',member='ChangeWithMasterPassword'";
+/// The body monitor sees every member of GNOME's private password
+/// interface. Its bodies are password-bearing by design, so like the change
+/// rule its stdout is a pipe streamed through an owned reader that never
+/// writes bodies to disk; the reader additionally reconstructs each `ay`
+/// array in memory to prove the passwords travel only as ciphertext.
+pub const PASSWORD_INTERFACE_MATCH: &str =
+    "interface='org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface'";
+/// The negotiation monitor sees Secret Service OpenSession method calls.
+/// Bodies carry the algorithm string and DH public keys only — never
+/// passwords — but the monitor streams through a pipe and retains only
+/// header- and algorithm-derived facts all the same.
+pub const OPEN_SESSION_MATCH: &str =
+    "interface='org.freedesktop.Secret.Service',member='OpenSession'";
+/// The exact body line the installed busctl renders for the encrypted
+/// session algorithm string inside an OpenSession call.
+pub const DH_ALGORITHM_LINE: &str = "STRING \"dh-ietf1024-sha256-aes128-cbc-pkcs7\";";
 pub const MONITOR_BANNER: &str = "Monitoring bus message stream.";
 
 /// Harness environment contract: proofs run inside `broker.py`, never on a
@@ -136,13 +157,38 @@ pub fn validated_harness_environment() -> BusEnvironment {
     BusEnvironment { address, root }
 }
 
+/// Fixture setup failure: transport or encrypted-session negotiation. The
+/// fixture is test scaffolding, so any failure aborts the proof.
+#[derive(Debug)]
+pub enum FixtureError {
+    Transport(zbus::Error),
+    Session(gmellon::secret_service::Error),
+}
+
+impl Display for FixtureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(formatter, "fixture D-Bus failure: {error}"),
+            Self::Session(error) => write!(formatter, "fixture session failure: {error}"),
+        }
+    }
+}
+
+impl StdError for FixtureError {}
+
 /// Disposable fixture: the only facility permitted to create collections and
 /// to call the standard `Lock` method. It owns a separate D-Bus connection so
 /// monitor evidence can attribute every Lock call to it alone. Product code
 /// must never lock or relock a collection as part of ordinary unlock.
+///
+/// The fixture negotiates the same encrypted session the product client uses
+/// (via the shared sans-I/O [`session`] core), so fixture-created collections
+/// are also protected by sealed passwords and no password-method body on the
+/// proof bus ever carries plaintext.
 pub struct Fixture {
     connection: zbus::blocking::Connection,
     session_path: OwnedObjectPath,
+    session_key: session::SessionKey,
     lock_calls: usize,
 }
 
@@ -186,14 +232,30 @@ trait FixtureGnomeInternal {
 }
 
 impl Fixture {
-    pub fn connect(address: &str) -> zbus::Result<Self> {
-        let connection = zbus::blocking::connection::Builder::address(address)?.build()?;
-        let service = FixtureServiceProxyBlocking::new(&connection)?;
-        let input = Value::from("");
-        let (_output, session_path) = service.open_session("plain", &input)?;
+    pub fn connect(address: &str) -> Result<Self, FixtureError> {
+        let connection = zbus::blocking::connection::Builder::address(address)
+            .and_then(|builder| builder.build())
+            .map_err(FixtureError::Transport)?;
+        let service =
+            FixtureServiceProxyBlocking::new(&connection).map_err(FixtureError::Transport)?;
+        // Same negotiation the product client performs, reusing the shared
+        // crypto core and decode step so the fixture's session is exactly as
+        // encrypted as the product's.
+        let keypair = ClientKeypair::generate().map_err(|error| {
+            FixtureError::Session(gmellon::secret_service::Error::Session(error))
+        })?;
+        let input = Value::from(keypair.public_key());
+        let (output, session_path) = service
+            .open_session(session::ALGORITHM, &input)
+            .map_err(FixtureError::Transport)?;
+        let server_public = decode_open_session_output(&output).map_err(FixtureError::Session)?;
+        let session_key = keypair.derive_aes_key(&server_public).map_err(|error| {
+            FixtureError::Session(gmellon::secret_service::Error::Session(error))
+        })?;
         Ok(Self {
             connection,
             session_path,
+            session_key,
             lock_calls: 0,
         })
     }
@@ -210,10 +272,13 @@ impl Fixture {
     }
 
     /// Test-fixture setup only: standard Lock on one disposable collection.
-    pub fn lock(&mut self, collection: &OwnedObjectPath) -> zbus::Result<()> {
-        let service = FixtureServiceProxyBlocking::new(&self.connection)?;
+    pub fn lock(&mut self, collection: &OwnedObjectPath) -> Result<(), FixtureError> {
+        let service =
+            FixtureServiceProxyBlocking::new(&self.connection).map_err(FixtureError::Transport)?;
         let path: ObjectPath<'_> = collection.as_ref();
-        let (locked, prompt) = service.lock(std::slice::from_ref(&path))?;
+        let (locked, prompt) = service
+            .lock(std::slice::from_ref(&path))
+            .map_err(FixtureError::Transport)?;
         assert_eq!(
             prompt.as_str(),
             "/",
@@ -230,20 +295,32 @@ impl Fixture {
 
     /// Test-fixture setup only: private CreateWithMasterPassword. The label
     /// property key is interface-qualified because the daemon parses the
-    /// dictionary against `org.freedesktop.Secret.Collection`.
-    pub fn create(&self, label: &str, password: &[u8]) -> zbus::Result<OwnedObjectPath> {
-        let internal = FixtureGnomeInternalProxyBlocking::new(&self.connection)?;
+    /// dictionary against `org.freedesktop.Secret.Collection`. The master
+    /// password is sealed under the fixture's encrypted session, exactly as
+    /// the product seals its passwords.
+    pub fn create(&self, label: &str, password: &[u8]) -> Result<OwnedObjectPath, FixtureError> {
+        let sealed = session::seal(&self.session_key, password).map_err(|error| {
+            FixtureError::Session(gmellon::secret_service::Error::Session(error))
+        })?;
+        let internal = FixtureGnomeInternalProxyBlocking::new(&self.connection)
+            .map_err(FixtureError::Transport)?;
         let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
         properties.insert(
             "org.freedesktop.Secret.Collection.Label",
             Value::from(label),
         );
         let session: ObjectPath<'_> = self.session_path.as_ref();
-        let empty_parameters: &[u8] = &[];
-        internal.create_with_master_password(
-            &properties,
-            (&session, empty_parameters, password, "text/plain"),
-        )
+        internal
+            .create_with_master_password(
+                &properties,
+                (
+                    &session,
+                    sealed.iv.as_slice(),
+                    sealed.ciphertext.as_slice(),
+                    "text/plain",
+                ),
+            )
+            .map_err(FixtureError::Transport)
     }
 }
 
@@ -453,6 +530,57 @@ fn spawn_header_reader(stdout: ChildStdout, member: &'static str) -> JoinHandle<
         .unwrap_or_else(|error| panic!("spawn the {member} monitor reader thread: {error}"))
 }
 
+/// Build the line-buffered `busctl monitor` command for one match rule with
+/// stdin detached. Callers decide where stdout and stderr go.
+fn busctl_monitor_command(address: &str, match_rule: &str) -> Command {
+    let mut command = Command::new(STDBUF);
+    command
+        .arg("-oL")
+        .arg(BUSCTL)
+        .arg(format!("--address={address}"))
+        .arg("monitor")
+        .arg(format!("--match={match_rule}"))
+        .stdin(Stdio::null());
+    command
+}
+
+/// Wait until the monitor's readiness log carries its banner. BecomeMonitor
+/// applies only after the bus replies; the tool prints its banner then, so
+/// waiting for the banner closes the startup race without guessing a delay.
+fn wait_for_monitor_ready(ready_path: &Path, stem: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if fs::read_to_string(ready_path)
+            .map(|log| log.contains(MONITOR_BANNER))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("{stem} monitor did not reach monitoring state before the deadline");
+}
+
+/// Give the line-buffered monitor a moment to flush any in-flight line, then
+/// stop it. `Child::kill` sends SIGKILL immediately on Unix — there is
+/// deliberately no TERM-first grace period — and the pipe lives in the
+/// kernel, so every line the monitor already wrote survives for its reader;
+/// the settle delay plus the proofs' closed-count assertions guard against a
+/// truncated last line. The deadline only bounds reaping.
+fn stop_monitor_child(child: &mut Child, stem: &str) {
+    thread::sleep(Duration::from_millis(200));
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => panic!("{stem} monitor did not exit after SIGKILL"),
+            Err(error) => panic!("{stem} monitor wait failed: {error}"),
+        }
+    }
+}
+
 pub struct MonitorSummary {
     /// Observed method calls of [`MonitorSpec::member`].
     pub calls: usize,
@@ -507,15 +635,8 @@ impl MethodMonitor {
         // carry bodies; finish still secret-scans it as proof.
         let ready = File::create(&ready_path)
             .unwrap_or_else(|error| panic!("create {} log: {error}", spec.stem));
-        let mut command = Command::new(STDBUF);
-        command
-            .arg("-oL")
-            .arg(BUSCTL)
-            .arg(format!("--address={address}"))
-            .arg("monitor")
-            .arg(format!("--match={}", spec.match_rule))
-            .stdin(Stdio::null())
-            .stderr(ready);
+        let mut command = busctl_monitor_command(address, spec.match_rule);
+        command.stderr(ready);
         let monitor = if spec.password_bearing {
             // Password-bearing bodies must never exist on disk in any form,
             // not even transiently: stdout is a pipe drained by the owned
@@ -555,23 +676,8 @@ impl MethodMonitor {
                 spec,
             }
         };
-        // BecomeMonitor applies only after the bus replies; the tool prints
-        // its banner then, so waiting for the banner closes the startup race
-        // without guessing a delay.
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            if fs::read_to_string(&monitor.ready_path)
-                .map(|log| log.contains(MONITOR_BANNER))
-                .unwrap_or(false)
-            {
-                return monitor;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!(
-            "{} monitor did not reach monitoring state before the deadline",
-            monitor.spec.stem
-        );
+        wait_for_monitor_ready(&monitor.ready_path, monitor.spec.stem);
+        monitor
     }
 
     /// Stop the monitor, extract the header-derived evidence, retain a
@@ -734,24 +840,9 @@ impl MethodMonitor {
     }
 
     /// Give the line-buffered monitor a moment to flush any in-flight line,
-    /// then stop it. `Child::kill` sends SIGKILL immediately on Unix — there
-    /// is deliberately no TERM-first grace period, and the old TERM-then-
-    /// KILL comment was wrong — and the pipe lives in the kernel, so every
-    /// line the monitor already wrote survives for its reader; the settle
-    /// delay plus the proof's closed-count assertions guard against a
-    /// truncated last line. The deadline only bounds reaping.
+    /// then stop it with the shared child-stop semantics.
     fn stop(&mut self) {
-        thread::sleep(Duration::from_millis(200));
-        let _ = self.child.kill();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-                Ok(None) => panic!("{} monitor did not exit after SIGKILL", self.spec.stem),
-                Err(error) => panic!("{} monitor wait failed: {error}", self.spec.stem),
-            }
-        }
+        stop_monitor_child(&mut self.child, self.spec.stem);
     }
 
     /// Body-excluding monitor shutdown: stop the process and read its raw
@@ -784,6 +875,587 @@ impl Drop for MethodMonitor {
         if self.spec.password_bearing {
             let _ = fs::remove_file(&self.ready_path);
         }
+    }
+}
+
+/// What one [`BodyMonitor`] instance watches and how it verdicts bodies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BodyMode {
+    /// Every member of GNOME's private password interface. Verdicts assert
+    /// that each Secret in each call traveled encrypted: a 16-byte IV array
+    /// plus a non-empty 16-multiple ciphertext array, per member arity.
+    PasswordMethods,
+    /// Secret Service OpenSession calls. Verdicts assert the negotiated
+    /// algorithm is the encrypted-session one and that a 1..=128-byte DH
+    /// public key array traveled.
+    OpenSessions,
+}
+
+/// Header- and length-derived facts for one captured method call. Never
+/// carries body bytes.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CapturedBodyMessage {
+    pub member: String,
+    pub sender: String,
+    /// Lengths of every `ay` array in the body, in capture order.
+    pub array_lengths: Vec<usize>,
+    /// Password-method verdict: every Secret in the call had a 16-byte IV
+    /// array and a non-empty 16-multiple ciphertext array.
+    pub encrypted_secrets: bool,
+    /// OpenSession verdict: the body carried the encrypted-session
+    /// algorithm string.
+    pub dh_algorithm: bool,
+}
+
+/// Final facts from the streaming body reader thread.
+pub struct BodyScanOutcome {
+    pub messages: Vec<CapturedBodyMessage>,
+    /// Leak descriptions naming the member, field kind, and the generated
+    /// secret's proof name — never the bytes.
+    pub leaks: Vec<String>,
+    /// Fail-closed parser failures; any entry fails the proof.
+    pub failures: Vec<String>,
+}
+
+/// Incremental one-line-at-a-time scanner for the body monitor's stdout,
+/// pinned against the installed busctl 261 monitor rendering captured under
+/// the private broker (`.test-agent/session-monitor-probe/`):
+///
+/// ```text
+/// ‣ Type=method_call  Endian=l  Flags=4  Version=1  Cookie=2  Timestamp="..."
+///   Sender=:1.7  Destination=...  Interface=...  Member=UnlockWithMasterPassword
+///   UniqueName=:1.7
+///   MESSAGE "o(oayays)" {
+///           OBJECT_PATH "/org/freedesktop/secrets/collection/x";
+///           STRUCT "oayays" {
+///                   OBJECT_PATH "/org/freedesktop/secrets/session/1";
+///                   ARRAY "y" {
+///                           BYTE 65;
+///                   };
+///                   ARRAY "y" {
+///                           BYTE 68;
+///                           BYTE 69;
+///                   };
+///                   STRING "text/plain";
+///           };
+///   };
+/// ```
+///
+/// An empty `ay` renders as an `ARRAY "y" {` line with no `BYTE` lines (a
+/// plain-session secret's empty parameters), so run lengths distinguish
+/// encrypted from plain secrets. Each line is scanned against every
+/// generated secret (literal and hex) before it is dropped, and every
+/// reconstructed `ay` run is scanned before it is dropped: decoded bodies
+/// transit the pipe, one line buffer, and one zeroized run buffer only, and
+/// are never accumulated or written to disk.
+pub struct BodyScanner {
+    mode: BodyMode,
+    secrets: Vec<(&'static str, Zeroizing<Vec<u8>>)>,
+    current: Option<CapturedBodyMessage>,
+    current_array: Option<Zeroizing<Vec<u8>>>,
+    pub messages: Vec<CapturedBodyMessage>,
+    pub leaks: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+impl BodyScanner {
+    pub fn new(mode: BodyMode, secrets: Vec<(&'static str, Zeroizing<Vec<u8>>)>) -> Self {
+        Self {
+            mode,
+            secrets,
+            current: None,
+            current_array: None,
+            messages: Vec::new(),
+            leaks: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+
+    /// Examine one raw stdout line, record facts, and drop its content.
+    /// Failures and leaks are sticky and merely accumulate; the proof fails
+    /// closed on them at finish.
+    pub fn absorb_line(&mut self, line: &str) {
+        for (name, secret) in &self.secrets {
+            if common::contains(line.as_bytes(), secret) {
+                self.leaks.push(format!(
+                    "field=raw-line member={} secret={name}",
+                    self.member()
+                ));
+            } else if common::contains_encoded(line.as_bytes(), secret) {
+                self.leaks.push(format!(
+                    "field=raw-line-hex member={} secret={name}",
+                    self.member()
+                ));
+            }
+        }
+
+        let mut tokens = line.split_whitespace();
+        match tokens.next() {
+            Some(token) if token.starts_with("Sender=") => self.absorb_header_line(line),
+            Some("ARRAY") if tokens.next().is_some_and(|token| token == "\"y\"") => {
+                self.open_array();
+            }
+            Some("BYTE") => {
+                let value = tokens
+                    .next()
+                    .and_then(|token| token.strip_suffix(';'))
+                    .and_then(|digits| digits.parse::<u8>().ok());
+                match (value, self.current_array.as_mut()) {
+                    (Some(byte), Some(run)) => run.push(byte),
+                    (Some(_), None) => self
+                        .failures
+                        .push(format!("BYTE outside an ARRAY \"y\" block: {line:?}")),
+                    (None, _) => self.failures.push(format!("malformed BYTE line: {line:?}")),
+                }
+            }
+            _ => self.absorb_other_line(line),
+        }
+    }
+
+    /// The target header line: it must carry both the `Sender` and `Member`
+    /// tokens, and the sender must be a unique bus name, or the output
+    /// cannot be attributed and the proof fails closed.
+    fn absorb_header_line(&mut self, line: &str) {
+        let mut sender: Option<&str> = None;
+        let mut member: Option<&str> = None;
+        for token in line.split_whitespace() {
+            if let Some(value) = token.strip_prefix("Sender=") {
+                if sender.is_some() {
+                    self.failures.push(format!(
+                        "header line carries more than one Sender token: {line:?}"
+                    ));
+                    return;
+                }
+                sender = Some(value);
+            } else if let Some(value) = token.strip_prefix("Member=") {
+                member = Some(value);
+            }
+        }
+        let (Some(sender), Some(member)) = (sender, member) else {
+            self.failures.push(format!(
+                "header-shaped line lacks Sender or Member; the installed busctl \
+                 shape cannot be attributed: {line:?}"
+            ));
+            return;
+        };
+        if !is_unique_bus_name(sender) {
+            self.failures.push(format!(
+                "target header Sender value is not a unique bus name: {sender:?}"
+            ));
+            return;
+        }
+        if matches!(self.mode, BodyMode::OpenSessions) && member != "OpenSession" {
+            self.failures.push(format!(
+                "OpenSession monitor captured unexpected member {member:?}"
+            ));
+            return;
+        }
+        self.finalize_message();
+        self.current = Some(CapturedBodyMessage {
+            member: member.to_owned(),
+            sender: sender.to_owned(),
+            array_lengths: Vec::new(),
+            encrypted_secrets: false,
+            dh_algorithm: false,
+        });
+    }
+
+    /// Lines that are not headers, array opens, or BYTE dumps: the algorithm
+    /// string is a fact for the OpenSession verdict; a Member-bearing line
+    /// without a Sender is an unattributable header shape and fails closed;
+    /// everything else is ignored and dropped.
+    fn absorb_other_line(&mut self, line: &str) {
+        let mut member_token = false;
+        for token in line.split_whitespace() {
+            if token.starts_with("Member=") {
+                member_token = true;
+            }
+        }
+        if member_token {
+            self.failures.push(format!(
+                "header-shaped line without a Sender token; the call cannot \
+                 be attributed: {line:?}"
+            ));
+            return;
+        }
+        if matches!(self.mode, BodyMode::OpenSessions) {
+            let trimmed = line.trim();
+            // The pinned rendering of the encrypted algorithm line drives
+            // the verdict, so the scanner cannot drift from the installed
+            // busctl shape.
+            if trimmed == DH_ALGORITHM_LINE {
+                if let Some(message) = &mut self.current {
+                    message.dh_algorithm = true;
+                }
+                return;
+            }
+            if let Some(rest) = trimmed.strip_prefix("STRING \"") {
+                let Some(name) = rest.strip_suffix("\";") else {
+                    return;
+                };
+                if let Some(message) = &mut self.current {
+                    message.dh_algorithm |= name == session::ALGORITHM;
+                    if name == "plain" {
+                        self.failures.push(
+                            "plain-session OpenSession negotiation captured; the product \
+                             must never negotiate plain"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn member(&self) -> &str {
+        self.current
+            .as_ref()
+            .map(|message| message.member.as_str())
+            .unwrap_or("<no-message>")
+    }
+
+    fn open_array(&mut self) {
+        self.close_array();
+        if self.current.is_none() {
+            self.failures
+                .push("ARRAY \"y\" block before any captured header line".to_owned());
+            return;
+        }
+        self.current_array = Some(Zeroizing::new(Vec::new()));
+    }
+
+    fn close_array(&mut self) {
+        if let Some(run) = self.current_array.take() {
+            // The core absence check: a password traveling in the clear
+            // inside an `ay` body renders as one `BYTE <decimal>;` line per
+            // element, so only the reconstructed run can contain it. The
+            // run is zeroized on drop; only the leak description (member
+            // and proof-secret name) is retained.
+            for (name, secret) in &self.secrets {
+                if common::contains(run.as_slice(), secret) {
+                    self.leaks.push(format!(
+                        "field=ay-run member={} secret={name}",
+                        self.member()
+                    ));
+                }
+            }
+            if let Some(message) = &mut self.current {
+                message.array_lengths.push(run.len());
+            }
+        }
+    }
+
+    /// Evaluate the completed message's verdicts and retain only facts.
+    fn finalize_message(&mut self) {
+        self.close_array();
+        let Some(mut message) = self.current.take() else {
+            return;
+        };
+        match self.mode {
+            BodyMode::PasswordMethods => {
+                match encrypted_secret_shape(&message.member, &message.array_lengths) {
+                    Ok(shape) => message.encrypted_secrets = shape,
+                    Err(reason) => self.failures.push(reason),
+                }
+            }
+            BodyMode::OpenSessions => {
+                if let Err(reason) = open_session_shape(&message.array_lengths) {
+                    self.failures.push(reason);
+                }
+            }
+        }
+        self.messages.push(message);
+    }
+
+    /// The retained facts, consuming the scanner and finalizing any
+    /// in-flight message.
+    pub fn into_outcome(mut self) -> BodyScanOutcome {
+        self.finalize_message();
+        BodyScanOutcome {
+            messages: self.messages,
+            leaks: self.leaks,
+            failures: self.failures,
+        }
+    }
+}
+
+/// Whether every Secret in one captured password-method call traveled in
+/// the encrypted shape: per member arity, each Secret's `parameters` array
+/// is exactly the 16-byte IV and its `value` array is a non-empty 16
+/// multiple (PKCS#7 ciphertext). A plain-session secret (empty parameters)
+/// or an absent body therefore fails instead of passing vacuously.
+fn encrypted_secret_shape(member: &str, array_lengths: &[usize]) -> Result<bool, String> {
+    let one_secret = |pair: &[usize]| -> bool {
+        pair.len() == 2 && pair[0] == 16 && pair[1] >= 16 && pair[1].is_multiple_of(16)
+    };
+    let shape = match member {
+        "UnlockWithMasterPassword" => one_secret(array_lengths),
+        "ChangeWithMasterPassword" => {
+            array_lengths.len() == 4
+                && one_secret(&array_lengths[..2])
+                && one_secret(&array_lengths[2..])
+        }
+        "CreateWithMasterPassword" => {
+            // The properties dictionary precedes the master Secret; only the
+            // trailing pair is the Secret.
+            array_lengths.len() >= 2 && one_secret(&array_lengths[array_lengths.len() - 2..])
+        }
+        other => {
+            return Err(format!(
+                "password-interface monitor captured unexpected member {other:?}"
+            ));
+        }
+    };
+    Ok(shape)
+}
+
+/// Whether one captured OpenSession call carried a plausible DH public key:
+/// at least one `ay` array of 1..=128 bytes.
+fn open_session_shape(array_lengths: &[usize]) -> Result<bool, String> {
+    Ok(array_lengths
+        .iter()
+        .any(|length| (1..=128).contains(length)))
+}
+
+/// Spawn the owned reader thread that drains the body monitor's piped
+/// stdout. One line buffer is reused and one zeroized run buffer exists at
+/// a time; each is scanned and dropped before the next, so no accumulation
+/// of raw stdout — in a String, Vec, or file — ever exists.
+fn spawn_body_reader(
+    stdout: ChildStdout,
+    mode: BodyMode,
+    secrets: Vec<(&'static str, Zeroizing<Vec<u8>>)>,
+) -> JoinHandle<BodyScanOutcome> {
+    thread::Builder::new()
+        .name("body-monitor-scanner".to_owned())
+        .spawn(move || {
+            let mut scanner = BodyScanner::new(mode, secrets);
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => scanner.absorb_line(&line),
+                    Err(error) => {
+                        let mut outcome = scanner.into_outcome();
+                        outcome
+                            .failures
+                            .push(format!("reading body monitor stdout failed: {error}"));
+                        return outcome;
+                    }
+                }
+            }
+            scanner.into_outcome()
+        })
+        .unwrap_or_else(|error| panic!("spawn the body monitor reader thread: {error}"))
+}
+
+/// Match-filtered streaming bus monitor that verdicts message *bodies* for
+/// the encrypted-session proofs.
+///
+/// Unlike [`MethodMonitor`], which retains only header-derived facts, this
+/// monitor reconstructs each captured body's `ay` arrays in memory — through
+/// a pipe, one line and one zeroized run at a time — to prove two things at
+/// once:
+///
+/// - absence: no generated password appears in any password-method body,
+///   neither as literal or hex-encoded line bytes (string fields) nor inside
+///   a decoded `ay` run;
+/// - presence: every captured password-method call carries well-formed
+///   encrypted Secrets (16-byte IV, non-empty 16-multiple ciphertext), and
+///   every captured OpenSession negotiated the encrypted algorithm, so a
+///   plain secret or negotiation fails the proof instead of passing
+///   vacuously from a blind monitor.
+///
+/// Nothing body-shaped is ever written to disk. Finish retains only the
+/// header-, length-, and verdict-derived summary.
+pub struct BodyMonitor {
+    child: Child,
+    ready_path: PathBuf,
+    summary_path: PathBuf,
+    /// Owned streaming reader; Finish and Drop kill and reap the child
+    /// first, so joining always observes the pipe's end-of-file and the
+    /// thread never outlives the monitor (including through a panic
+    /// unwind).
+    reader: Option<JoinHandle<BodyScanOutcome>>,
+    mode: BodyMode,
+    stem: &'static str,
+}
+
+impl BodyMonitor {
+    /// Monitor every member of GNOME's private password interface, scanning
+    /// bodies against the generated proof secrets.
+    pub fn password_methods(address: &str, root: &Path, secrets: &ProofSecrets) -> Self {
+        Self::start(
+            BodyMode::PasswordMethods,
+            PASSWORD_INTERFACE_MATCH,
+            "password-body-monitor",
+            address,
+            root,
+            secrets.named().to_vec(),
+        )
+    }
+
+    /// Monitor Secret Service OpenSession negotiations. Bodies carry the
+    /// algorithm string and public keys only, but the same streaming and
+    /// scanning discipline applies.
+    pub fn open_sessions(address: &str, root: &Path, secrets: &ProofSecrets) -> Self {
+        Self::start(
+            BodyMode::OpenSessions,
+            OPEN_SESSION_MATCH,
+            "open-session-monitor",
+            address,
+            root,
+            secrets.named().to_vec(),
+        )
+    }
+
+    fn start(
+        mode: BodyMode,
+        match_rule: &str,
+        stem: &'static str,
+        address: &str,
+        root: &Path,
+        secrets: Vec<(&'static str, &[u8])>,
+    ) -> Self {
+        let ready_path = root.join(format!("{stem}.ready.log"));
+        let summary_path = root.join(format!("{stem}.txt"));
+        let ready =
+            File::create(&ready_path).unwrap_or_else(|error| panic!("create {stem} log: {error}"));
+        let mut command = busctl_monitor_command(address, match_rule);
+        command.stderr(ready);
+        let mut child = command
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn {BUSCTL} monitor: {error}"));
+        let stdout = child
+            .stdout
+            .take()
+            .expect("piped monitor stdout must be takeable right after spawn");
+        let owned_secrets: Vec<(&'static str, Zeroizing<Vec<u8>>)> = secrets
+            .iter()
+            .map(|(name, secret)| (*name, Zeroizing::new(secret.to_vec())))
+            .collect();
+        let reader = Some(spawn_body_reader(stdout, mode, owned_secrets));
+        let monitor = Self {
+            child,
+            ready_path,
+            summary_path,
+            reader,
+            mode,
+            stem,
+        };
+        wait_for_monitor_ready(&monitor.ready_path, stem);
+        monitor
+    }
+
+    /// Stop the monitor, join the reader, fail closed on any parser failure
+    /// or leaked secret, retain the redacted fact summary, and delete the
+    /// banner-only readiness log. There is no raw log to delete because none
+    /// was ever created.
+    pub fn finish(mut self, secrets: &ProofSecrets) -> BodyMonitorSummary {
+        let handle = self.reader.take().expect("body monitor owns its reader");
+        stop_monitor_child(&mut self.child, self.stem);
+        let outcome = handle
+            .join()
+            .unwrap_or_else(|_| panic!("the {} reader thread panicked", self.stem));
+
+        let ready = fs::read_to_string(&self.ready_path)
+            .unwrap_or_else(|error| panic!("read {} readiness log: {error}", self.stem));
+        assert!(
+            ready.contains(MONITOR_BANNER),
+            "{} monitor log lost its readiness banner",
+            self.stem
+        );
+        for (name, secret) in secrets.named() {
+            common::assert_secret_absent(
+                ready.as_bytes(),
+                secret,
+                &format!(
+                    "the {} monitor readiness log (generated {name} password)",
+                    self.stem
+                ),
+            );
+        }
+
+        if !outcome.failures.is_empty() {
+            panic!(
+                "the {} body monitor failed closed: {}",
+                self.stem,
+                outcome.failures.join("; ")
+            );
+        }
+        if !outcome.leaks.is_empty() {
+            panic!(
+                "the {} body monitor observed generated passwords in captured bodies: {}",
+                self.stem,
+                outcome.leaks.join("; ")
+            );
+        }
+
+        let mut summary = format!(
+            "tool={BUSCTL} monitor\nmatch-mode={:?}\nmessages={}\n",
+            self.mode,
+            outcome.messages.len()
+        );
+        for message in &outcome.messages {
+            summary.push_str(&format!(
+                "message member={} sender={} arrays={:?} encrypted_secrets={} dh_algorithm={}\n",
+                message.member,
+                message.sender,
+                message.array_lengths,
+                message.encrypted_secrets,
+                message.dh_algorithm
+            ));
+        }
+        summary.push_str("leaks=0\n");
+        fs::write(&self.summary_path, summary)
+            .unwrap_or_else(|error| panic!("write redacted {} summary: {error}", self.stem));
+        fs::remove_file(&self.ready_path)
+            .unwrap_or_else(|error| panic!("delete {} readiness log: {error}", self.stem));
+
+        BodyMonitorSummary {
+            messages: outcome.messages,
+        }
+    }
+}
+
+impl Drop for BodyMonitor {
+    fn drop(&mut self) {
+        // Same never-leak semantics as MethodMonitor: kill and reap the
+        // child (closing the pipe), then join the reader, which at worst
+        // drains and drops the remaining body lines. No raw output ever
+        // exists on disk; failure paths remove the banner-only readiness
+        // log.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+        let _ = fs::remove_file(&self.ready_path);
+    }
+}
+
+/// Retained facts from one body monitor run.
+pub struct BodyMonitorSummary {
+    pub messages: Vec<CapturedBodyMessage>,
+}
+
+impl BodyMonitorSummary {
+    /// Captured calls of one member, in arrival order.
+    pub fn messages_of(&self, member: &str) -> Vec<&CapturedBodyMessage> {
+        self.messages
+            .iter()
+            .filter(|message| message.member == member)
+            .collect()
+    }
+
+    /// Whether every captured message of one member passed the mode's
+    /// encrypted verdict.
+    pub fn all_encrypted(&self, member: &str) -> bool {
+        let messages = self.messages_of(member);
+        !messages.is_empty() && messages.iter().all(|message| message.encrypted_secrets)
     }
 }
 

@@ -172,7 +172,7 @@ impl BlockingClient {
         let (output, session_path) = service
             .open_session(session::ALGORITHM, &input)
             .map_err(classify_session_error)?;
-        let server_public = server_public_key_bytes(&output)?;
+        let server_public = decode_open_session_output(&output)?;
         let session_key = keypair
             .derive_aes_key(&server_public)
             .map_err(Error::Session)?;
@@ -312,12 +312,13 @@ fn classify_session_error(error: zbus::Error) -> Error {
     }
 }
 
-/// Decode the daemon's OpenSession reply into its Diffie-Hellman public key
+/// Decode a peer's OpenSession reply into its Diffie-Hellman public key
 /// bytes. The reply payload is the `ay` variant the daemon builds for this
 /// algorithm (g_variant_new_fixed_array in gkd-secret-session.c); a
 /// byte-array answer arrives as a u8 array, and anything else is treated as
-/// an unreadable peer key, failing closed.
-fn server_public_key_bytes(output: &OwnedValue) -> Result<Vec<u8>, Error> {
+/// an unreadable peer key, failing closed. Public so test fixtures and a
+/// future async adapter share one decode step for the same wire shape.
+pub fn decode_open_session_output(output: &OwnedValue) -> Result<Vec<u8>, Error> {
     let bytes = match &**output {
         Value::Array(array) => {
             let mut bytes = Vec::with_capacity(array.len());
@@ -455,7 +456,7 @@ mod tests {
         let bytes = Value::from(vec![0x01u8, 0x02, 0x7f]);
         let owned = OwnedValue::try_from(bytes).expect("byte array converts");
         assert_eq!(
-            server_public_key_bytes(&owned).expect("byte array decodes"),
+            decode_open_session_output(&owned).expect("byte array decodes"),
             vec![0x01, 0x02, 0x7f]
         );
 
@@ -463,7 +464,7 @@ mod tests {
             let owned = OwnedValue::try_from(other).expect("value converts");
             assert!(
                 matches!(
-                    server_public_key_bytes(&owned),
+                    decode_open_session_output(&owned),
                     Err(Error::Session(CryptoError::PeerPublicKeyLength {
                         length: 0
                     }))

@@ -24,8 +24,8 @@ mod common;
 use std::env;
 
 use broker_common::{
-    BusEnvironment, Fixture, LOGIN_LABEL, MethodMonitor, ProofSecrets, expected_collection_id,
-    run_broker_isolated, validated_harness_environment,
+    BodyMonitor, BusEnvironment, Fixture, LOGIN_LABEL, MethodMonitor, ProofSecrets,
+    expected_collection_id, run_broker_isolated, validated_harness_environment,
 };
 use common::required_path;
 use gmellon::secret_service::{BlockingClient, CollectionId, Error, UnlockOutcome};
@@ -58,9 +58,18 @@ fn run_proof(secrets: &ProofSecrets) {
     // count is exhaustive; readiness is proven by its banner, not a sleep.
     let monitor = MethodMonitor::lock(&bus.address, &bus.root);
 
+    // The encrypted-session wire evidence is armed just as early so it is
+    // exhaustive over the whole run: every password-method body is captured
+    // and scanned for the generated passwords, and every OpenSession
+    // negotiation is checked for the encrypted algorithm. Both monitors
+    // stream through pipes; decoded bodies never touch disk.
+    let password_monitor = BodyMonitor::password_methods(&bus.address, &bus.root, secrets);
+    let negotiation_monitor = BodyMonitor::open_sessions(&bus.address, &bus.root, secrets);
+
     // Fixture connection: separate D-Bus unique name from the product client,
-    // so every observed Lock call can be attributed to a sender.
-    let mut fixture = Fixture::connect(&bus.address).expect("fixture plain session");
+    // so every observed Lock call can be attributed to a sender. The fixture
+    // negotiates the same encrypted session the product client does.
+    let mut fixture = Fixture::connect(&bus.address).expect("fixture encrypted session");
     let fixture_sender = fixture.unique_name();
 
     let label_second = format!("gmellon-proof-second-{}", secrets.run_tag);
@@ -247,6 +256,78 @@ fn run_proof(secrets: &ProofSecrets) {
     assert!(
         observed.senders_match_fixture,
         "every observed Service.Lock call must come from the fixture connection"
+    );
+
+    // --- encrypted-session wire evidence ------------------------------------
+    // Absence was already asserted inside the monitor (any generated
+    // password found in any captured body, as line bytes, hex, or a decoded
+    // ay run, fails the proof). Presence is asserted here so a blind
+    // monitor cannot pass vacuously: exactly the expected password-method
+    // calls were captured, every one in the encrypted shape (16-byte IV
+    // array plus non-empty 16-multiple ciphertext per Secret — a plain
+    // secret's empty parameters would fail the shape), and exactly the two
+    // expected OpenSession negotiations (fixture and product client), both
+    // for the encrypted algorithm.
+    let bodies = password_monitor.finish(secrets);
+    assert_eq!(
+        bodies.messages_of("CreateWithMasterPassword").len(),
+        2,
+        "exactly the fixture's two creations must be captured"
+    );
+    assert_eq!(
+        bodies.messages_of("UnlockWithMasterPassword").len(),
+        6,
+        "exactly the six product unlock calls must be captured (denied, cross, \
+         two successful, former-password denial, changed-password unlock)"
+    );
+    assert_eq!(
+        bodies.messages_of("ChangeWithMasterPassword").len(),
+        1,
+        "exactly the one product change call must be captured"
+    );
+    for member in [
+        "CreateWithMasterPassword",
+        "UnlockWithMasterPassword",
+        "ChangeWithMasterPassword",
+    ] {
+        assert!(
+            bodies.all_encrypted(member),
+            "every captured {member} body must carry well-formed encrypted secrets"
+        );
+    }
+    let fixture_creates = bodies
+        .messages_of("CreateWithMasterPassword")
+        .iter()
+        .filter(|message| message.sender == fixture_sender)
+        .count();
+    assert_eq!(
+        fixture_creates, 2,
+        "both creations must come from the fixture connection"
+    );
+
+    let negotiations = negotiation_monitor.finish(secrets);
+    assert_eq!(
+        negotiations.messages.len(),
+        2,
+        "exactly the fixture and product-client OpenSession calls must be captured"
+    );
+    assert!(
+        negotiations
+            .messages
+            .iter()
+            .all(|message| message.dh_algorithm),
+        "every captured OpenSession must negotiate the encrypted-session algorithm"
+    );
+    assert!(
+        negotiations
+            .messages
+            .iter()
+            .any(|message| message.sender == fixture_sender)
+            && negotiations
+                .messages
+                .iter()
+                .any(|message| message.sender != fixture_sender),
+        "one negotiation must belong to the fixture and one to the product client"
     );
 }
 
