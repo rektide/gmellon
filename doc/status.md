@@ -64,6 +64,7 @@ gmellon list
 gmellon status
 gmellon unlock [COLLECTION]
 gmellon unlock [COLLECTION] --stdin
+gmellon lock [COLLECTION]
 gmellon change [COLLECTION]
 gmellon change [COLLECTION] --stdin
 gmellon completions SHELL
@@ -78,6 +79,10 @@ gmellon -v [COMMAND]   # redacted diagnostics on stderr
   never a password method), and a lock summary consistent with `list`. It
   never prompts, unlocks, or locks.
 - `unlock --stdin` reads one LF/CRLF-terminated UTF-8 line.
+- `lock` is an explicit state change through the standard `Service.Lock`
+  API: already-locked is a successful no-op that makes no Lock call, and a
+  demanded interactive prompt object fails closed rather than being
+  performed. No other command ever locks.
 - `change --stdin` reads current, new, and confirmation lines in that order.
 - `-v` installs a stderr-only tracing subscriber emitting operation, result,
   and length events; scalar fields only, never secret bytes or key material.
@@ -354,22 +359,15 @@ rustdoc.
 
 ## Open work
 
-No release blocker remains open. The packaging boundary (`gmell-polish`) is
-complete: status report, redacted `-v` diagnostics, completions (including
-the zimfw module's automatic regeneration), and the help-text pass all
-landed with proof coverage.
+No release blocker remains open, and the epic's declared boundary — release
+security plus packaging/polish — is complete. The stretch items (explicit
+`lock`, login-hook documentation) have also landed.
 
 ### Product follow-ups
 
-- **`gmell-stretch` (P4):** explicit `lock` subcommand (standard
-  `Service.Lock`, fail-closed on prompt objects) and the opt-in zsh
-  login-hook documentation pattern.
 - **`gmell-firmament-config` (P4, deferred):** Firmament is under active
   rebuild and no current configuration domain justifies adoption. The fixed
   default remains `login`; explicit collection IDs remain command arguments.
-
-The parent `gmell-unlock-cli` epic's declared boundary — release security
-plus packaging/polish — is complete.
 
 ## Durable decisions
 

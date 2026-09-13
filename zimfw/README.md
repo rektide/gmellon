@@ -88,6 +88,14 @@ independently of the SSH environment work: no binary means no completions
 and a one-line skip, while `SSH_AUTH_SOCK` selection proceeds exactly as
 above. Loading never prompts and never invokes `systemctl` either way.
 
+## Unlocking stays opt-in
+
+This module never unlocks anything — prompting at shell load would be
+hostile. The opt-in login-hook pattern lives in the repository README:
+`gmellon unlock` in an interactive-shell guard, which prompts only when the
+login collection is actually locked (already-unlocked collections exit 0
+without reading a password).
+
 ## Tests
 
 ```sh

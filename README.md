@@ -247,6 +247,26 @@ the SSH environment work is unaffected. Loading still never prompts and
 never invokes `systemctl`.
 Details: [`zimfw/README.md`](/zimfw/README.md).
 
+### Opt-in: unlock at shell login
+
+The module above deliberately handles only the environment. Unlocking is a
+password operation and stays fully opt-in — if you want your login keyring
+unlocked from your first interactive shell, add this to `~/.zshrc`:
+
+```zsh
+# prompt only when the login keyring is actually locked
+if [[ -o interactive ]] && (( $+commands[gmellon] )); then
+  gmellon unlock
+fi
+```
+
+This is safe unconditionally: `gmellon unlock` on an already-unlocked
+collection exits 0 **without reading a password** (proven in the private
+broker harness), so the first shell after login prompts once and every later
+shell is a silent no-op. A wrong password exits 2 and the next shell simply
+tries again. The `[[ -o interactive ]]` guard keeps non-interactive shells
+(scp, CI, hooks) away from the TTY prompt entirely.
+
 ## Development (readme-driven)
 
 This README is the spec. Stages land in independently committable and testable
