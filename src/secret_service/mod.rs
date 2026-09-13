@@ -4,6 +4,8 @@
 //! password operations use GNOME Keyring's private
 //! `InternalUnsupportedGuiltRiddenInterface`; capability errors are explicit.
 
+pub mod session;
+
 mod blocking;
 mod proxies;
 
