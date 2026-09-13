@@ -5,8 +5,8 @@ description: Current product architecture, validated capabilities, security boun
 resource: /doc/status.md
 tags: [gmellon, gnome-keyring, secret-service, rust, status]
 status: draft
-generated: { by: model:openai/gpt-6, at: 2026-09-12T04:07:40-04:00 }
-stale_after: 2026-10-12
+generated: { by: model:openai/gpt-6, at: 2026-09-13T05:42:00-04:00 }
+stale_after: 2026-10-13
 sources:
   - id: product-spec
     resource: /README.md
@@ -23,27 +23,34 @@ sources:
   - id: change-proof
     resource: /doc/harness/change0.glm53max.md
     title: Collection CLI change proof
+  - id: session-proof
+    resource: /doc/harness/session0.gpt6a.md
+    title: Encrypted Secret Service session implementation and body-scan monitor proof
 ---
 
 # gmellon implementation status
 
 ## Snapshot
 
-As of 2026-09-12, `gmellon` is a working Rust CLI for headless GNOME Keyring
+As of 2026-09-13, `gmellon` is a working Rust CLI for headless GNOME Keyring
 collection discovery, unlock, and password change. The default product backend
 uses zbus to combine the standard Secret Service discovery API with GNOME's
 private `org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface` password
-methods.
+methods, and every connection negotiates the standard encrypted Secret
+Service session (`dh-ietf1024-sha256-aes128-cbc-pkcs7`) — passwords never
+cross the bus in the clear, with no plain-session fallback. The
+`gmell-encrypted-session` release blocker is closed with body-scan monitor
+evidence.
 
 The CLI and backend have been exercised through the actual compiled binary
 against a manually launched `gnome-keyring-daemon` on a private
 `dbus-broker`. Tests use an exact `login` collection plus a second collection
 with a distinct password. The integration harness epic and the `list`,
-`unlock`, and `change` implementation tickets are closed.
+`unlock`, `change`, and encrypted-session implementation tickets are closed.
 
-The code is an MVP, not release-ready: password bodies currently use a plain
-Secret Service session. `gmell-encrypted-session` is an explicit P1 release
-blocker.
+The code remains an MVP in polish terms — no configuration layer, no
+completions, diagnostics are `eprintln`-based — but no release blocker
+remains open.
 
 ## Current CLI
 
@@ -71,10 +78,17 @@ gmellon change [COLLECTION] --stdin
 | Code | Meaning |
 | ---: | --- |
 | 0 | Success, including an already-unlocked collection |
-| 1 | Usage, input, missing collection, malformed reply, or unexpected local/D-Bus error |
+| 1 | Usage, input, missing collection, malformed reply, encrypted-session failure, or unexpected local/D-Bus error |
 | 2 | Collection password denied |
 | 3 | GNOME's private password interface is unavailable |
 | 4 | Session bus or GNOME Secret Service is unavailable |
+
+The encrypted-session failures stay in the exit-1 family with distinct
+messages: a service that rejects the DH algorithm reports
+`EncryptedSessionUnsupported` ("does not support encrypted sessions …
+refusing to fall back to a plain session"), and cryptography failures
+(randomness, peer key, derivation, sealing) report
+`Session(CryptoError)`. The 0–4 table itself is unchanged.
 
 ## Product architecture
 
@@ -85,6 +99,9 @@ flowchart LR
     Cli --> Client[secret_service::BlockingClient]
     Input --> Secret[zeroizing Secret]
     Secret --> Client
+    Client --> Session[sans-I/O session crypto core]
+    Session --> Key[negotiated AES session key]
+    Key --> Client
     Client --> Standard[Standard Secret Service discovery]
     Client --> Private[GNOME private password interface]
     Standard --> Daemon[gnome-keyring-daemon]
@@ -95,14 +112,16 @@ flowchart LR
 | --- | --- | --- |
 | CLI | [`/src/cli/mod.rs`](/src/cli/mod.rs) | clap parsing, pre-input collection resolution, output, and exit mapping |
 | Secret input | [`/src/secret_input/mod.rs`](/src/secret_input/mod.rs) | rpassword TTY prompts, bounded stdin records, confirmation, and zeroizing ownership |
-| Collection client | [`/src/secret_service/`](/src/secret_service/) | collection IDs/metadata, generated zbus proxies, list/unlock/change, and remote-error classification |
+| Session crypto core | [`/src/secret_service/session.rs`](/src/secret_service/session.rs) | sans-I/O encrypted-session cryptography: DH keypair, peer-key validation, HKDF-SHA256 key derivation, AES-128-CBC/PKCS#7 sealing, zeroized key material |
+| Collection client | [`/src/secret_service/`](/src/secret_service/) | encrypted-session negotiation, collection IDs/metadata, generated zbus proxies, list/unlock/change, and remote-error classification |
 | Historical control backend | [`/src/control/`](/src/control/) | login-only sans-I/O codec, peer validation, and synchronous control-socket exchange |
 | Executable harness | [`/dev/harness/`](/dev/harness/) | control-only and private-broker daemon lifecycles, checks, cleanup, and retained evidence |
-| Rust proofs | [`/tests/harness/`](/tests/harness/) | opt-in real-daemon transport, collection, binary CLI, and redaction proofs |
+| Rust proofs | [`/tests/harness/`](/tests/harness/) | opt-in real-daemon transport, collection, binary CLI, encrypted-session wire, and redaction proofs |
 
 The zbus declarations generate blocking and asynchronous proxies from the same
 interfaces. The product exposes `BlockingClient` today; a future Tokio adapter
-can reuse the collection model and generated async proxies rather than wrapping
+can reuse the collection model, the generated async proxies, and the sans-I/O
+session crypto core (which contains no zbus or I/O types) rather than wrapping
 blocking I/O.
 
 ## Backend policy
@@ -137,6 +156,49 @@ The maintained private-broker proof demonstrates:
 
 See [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md).
 
+### Encrypted session
+
+Every `BlockingClient` connection negotiates the standard encrypted Secret
+Service session `dh-ietf1024-sha256-aes128-cbc-pkcs7`
+([`src/secret_service/session.rs`](/src/secret_service/session.rs)):
+
+- a fresh 1024-bit MODP (RFC 2409) Diffie-Hellman keypair per connection,
+  private exponent below `p/2` and zeroized on drop, public key sent as the
+  minimal unsigned big-endian `ay` OpenSession variant;
+- the daemon's public key is validated (`1 < y < p-1`, at most the prime's
+  byte length) before a constant-time Montgomery-ladder modpow;
+- the shared secret is left-padded to the 128-byte prime length before
+  HKDF-SHA256 (empty salt and info) derives the AES-128 key — the
+  normalization both peers require;
+- each password is sealed with a fresh random IV and PKCS#7 padding (a full
+  block on 16-byte multiples), traveling as the Secret tuple's
+  `parameters`/`value` fields.
+
+The first live handshake against the manually launched daemon succeeded
+without adjustment: the variant shape, minimal encoding, normalization,
+HKDF configuration, and seal were all correct as implemented, and the
+existing unlock/change proofs passed unchanged over the encrypted session.
+The daemon performs no client-public-key validation of its own (it answered
+a probe with a 3-byte "public key"); gmellon's validator stays strict.
+
+Wire evidence is a body-scanning bus monitor
+([`tests/harness/broker_common.rs`](/tests/harness/broker_common.rs)) that
+captures every member of the private password interface plus every
+OpenSession negotiation: it scans each raw line and each reconstructed `ay`
+run (through a pipe, one zeroized run at a time, never on disk) for the
+generated passwords — none appear in any body — and verdicts each captured
+call's encrypted shape (16-byte IV plus non-empty 16-multiple ciphertext
+per Secret, by member arity) and each negotiation's DH algorithm string,
+so a plain secret or plain negotiation fails instead of passing vacuously.
+Both broker proofs assert exact counts: the collection proof pins two
+encrypted fixture creations, six product unlocks, one change, and the
+fixture-plus-client negotiations; the CLI proof pins eleven binary
+unlocks, three changes (cross-checked against the header monitor), and one
+encrypted OpenSession per CLI invocation. The test fixture negotiates the
+same encrypted session, so even fixture creations never carry plaintext.
+
+See [`session0.gpt6a.md`](/doc/harness/session0.gpt6a.md).
+
 ### Compiled CLI
 
 The Rust proof invokes `env!("CARGO_BIN_EXE_gmellon")` inside the private
@@ -163,14 +225,18 @@ the committed early-return code and by successful `--stdin` execution with
 - Owned CLI secrets use `Zeroizing<String>` and expose only borrowed bytes.
 - Password-bearing control frames use zeroizing allocations.
 - Secret types do not implement `Debug`, `Clone`, or `Display`.
+- Session key material — DH private exponent, shared secret, padded IKM,
+  AES key, per-Secret IV, and padded plaintext — lives in zeroizing
+  allocations in the session core.
 - Stdin buffers preallocate their bounded 64 KiB capacity, avoiding abandoned
   prefix allocations in that reader.
 - Input errors retain redacted kind/errno metadata rather than reader-provided
   text.
 - Binary streams and retained regular artifacts are scanned for generated
   secrets; symlinks fail closed.
-- The password-method proof monitor streams stdout through a pipe, retains only
-  parsed header facts, and never writes decoded password bodies to disk.
+- The password-method proof monitors stream stdout through pipes, retain only
+  parsed header/length/verdict facts, and never write decoded password
+  bodies to disk.
 
 These are best-effort process-memory guarantees. Dependency and allocator
 copies cannot all be erased.
@@ -197,7 +263,7 @@ Ordinary development checks currently report:
 
 ```text
 cargo nextest run
-85 passed, 4 skipped
+106 passed, 4 skipped
 ```
 
 The four ignored tests are explicit external-daemon proofs rather than silent
@@ -206,26 +272,33 @@ prerequisites are absent:
 
 ```sh
 dev/harness/check rust-nextest # control backend against real daemon
-dev/harness/check rust-broker  # collection BlockingClient proof
-dev/harness/check rust-cli     # compiled list/unlock/change proof
+dev/harness/check rust-broker  # collection BlockingClient proof, encrypted-session wire evidence
+dev/harness/check rust-cli     # compiled list/unlock/change proof, encrypted-session wire evidence
 dev/harness/check broker       # private-broker lifecycle/interface suite
 dev/harness/check all          # all maintained external checks
 ```
 
-The completed wave also passed rustfmt, clippy with warnings denied, rustdoc,
-Python compilation and focused suites, repeated private-broker runs, and the
-aggregate harness check.
+The encrypted-session wave's maintained results: `rust-nextest` 2/2,
+`rust-broker` 1/1, `rust-cli` 1/1, `broker` 7/7 plus the private-bus probe,
+the control-only Python suites, and the aggregate `dev/harness/check all` —
+all passing, with the ordinary suite's four baseline skips unchanged. The
+wave also passed rustfmt, clippy with warnings denied, and warning-free
+rustdoc.
 
 ## Security and compatibility limits
 
 1. **Unsupported GNOME API.** Collection password methods are deliberately
    internal and may change or disappear. The client reports missing private
    capability distinctly (exit 3).
-2. **Plain MVP session.** Password bytes cross the user's D-Bus connection
-   without Secret Service encryption; zbus, broker, and daemon copies are
-   outside gmellon's zeroization control. `gmell-encrypted-session` blocks
-   release and must implement/prove the standard
-   `dh-ietf1024-sha256-aes128-cbc-pkcs7` session without silent plain fallback.
+2. **Residual exposure of encrypted transport.** Passwords cross the bus as
+   ciphertext only, but the D-Bus daemon and broker still see message
+   metadata (paths, algorithm, lengths) and handle the ciphertext itself;
+   their copies are outside gmellon's control. The spec-mandated
+   `dh-ietf1024-sha256-aes128-cbc-pkcs7` session uses the dated RFC 2409
+   1024-bit MODP group and AES-128-CBC rather than an AEAD — fresh
+   per-connection exponents and per-Secret IVs are the mitigations the
+   protocol offers, and gmellon adds strict peer-public-key validation the
+   daemon itself lacks.
 3. **Version-scoped daemon behavior.** Locked-collection password change and
    several fixture details are observed against `gnome-keyring-daemon` 48.0,
    not promised by the unsupported interface.
@@ -237,11 +310,7 @@ aggregate harness check.
 
 ## Open work
 
-### Release blocker
-
-- **`gmell-encrypted-session` (P1):** encrypted Secret Service password
-  transport and private-broker proof. Plain CLI operation may continue, but the
-  crate must not be published before this closes.
+No release blocker remains open.
 
 ### Product follow-ups
 
@@ -258,8 +327,8 @@ aggregate harness check.
   rebuild and no current configuration domain justifies adoption. The fixed
   default remains `login`; explicit collection IDs remain command arguments.
 
-The parent `gmell-unlock-cli` epic remains open until release security and the
-agreed packaging/polish boundary are complete.
+The parent `gmell-unlock-cli` epic now awaits only the agreed packaging and
+polish boundary items.
 
 ## Durable decisions
 
@@ -268,9 +337,12 @@ agreed packaging/polish boundary are complete.
 - Never accept passwords through argv, environment, config, or retained
   evidence.
 - Never lock/relock during ordinary unlock.
+- Negotiate the encrypted Secret Service session on every connection and
+  never fall back to a plain session; an algorithm-rejecting service fails
+  distinctly.
 - Never silently fall back from zbus to the create-capable login control path.
-- Keep sync product APIs today while preserving generated async zbus proxies
-  and a future Tokio sibling implementation.
+- Keep sync product APIs today while preserving generated async zbus proxies,
+  the sans-I/O session crypto core, and a future Tokio sibling implementation.
 
 ## Cross-references
 
@@ -284,3 +356,6 @@ agreed packaging/polish boundary are complete.
   `list` and `unlock` behavior.
 - [`change0.glm53max.md`](/doc/harness/change0.glm53max.md) establishes compiled
   `change` behavior and never-on-disk password-method monitoring.
+- [`session0.gpt6a.md`](/doc/harness/session0.gpt6a.md) establishes the
+  encrypted-session implementation, first-live-run interop facts, and the
+  body-scan monitor proof that passwords travel only as ciphertext.

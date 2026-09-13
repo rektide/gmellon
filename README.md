@@ -32,12 +32,15 @@ Treat it exactly as GNOME names it: an internal, **unsupported** interface
 that may change or vanish without notice. The standard Secret Service API
 still offers no supported headless password entry.
 
-The CLI MVP uses a `plain` Secret Service session, so password bytes cross the
-user's D-Bus connection without Secret Service encryption and zbus/broker
-message copies are outside gmellon's zeroization control. This accepts the
-same-user bus boundary temporarily. The `gmell-encrypted-session` ticket tracks
-encrypted DH/AES sessions as a release blocker; publishing must wait for that
-proof.
+Password transport uses the standard encrypted Secret Service session
+(`dh-ietf1024-sha256-aes128-cbc-pkcs7`), negotiated on every connection
+with a fresh Diffie-Hellman keypair; each password is sealed with a fresh
+random IV and never crosses the bus in the clear. There is deliberately no
+plain-session fallback: a Secret Service that lacks that algorithm fails
+with a clear error rather than downgrading. The isolated private-broker
+harness proves it with a bus monitor that scans every password-method
+message body for the generated passwords and finds only ciphertext
+([`doc/harness/session0.gpt6a.md`](/doc/harness/session0.gpt6a.md)).
 
 Current implementation, verification, security boundaries, and remaining work
 are summarized in [`doc/status.md`](/doc/status.md).
@@ -282,6 +285,10 @@ hook remain optional.
 | zeroize | clear password and request buffers after use |
 | rustix | effective and peer UID checks |
 | zbus | Secret Service discovery and GNOME private password methods |
+| crypto-bigint | 1024-bit DH modpow (Montgomery ladder, zeroized exponents) |
+| sha2 + hkdf | HKDF-SHA256 session-key derivation |
+| aes + cbc | AES-128-CBC sealing with PKCS#7 padding |
+| getrandom | DH private exponents and per-Secret IVs |
 | tracing (optional, Stage 5) | redacted `-v` operation diagnostics |
 
 Publishing: `cargo bump` + `jj commit` + `cargo publish` when it earns it.
@@ -302,6 +309,9 @@ Upstream source (canonical, version-observed: gnome-keyring 48.0 / gcr
 - [GNOME/gnome-keyring `daemon/gkd-main.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/gkd-main.c) — why bare `--unlock` doesn't forward to a running daemon
 - [GNOME/gnome-keyring private D-Bus interface](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/dbus/org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface.xml) — collection-targeted password methods
 - [GNOME/gnome-keyring `daemon/dbus/gkd-secret-service.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/dbus/gkd-secret-service.c) — private method dispatch and collection lookup
+- [GNOME/gnome-keyring `daemon/dbus/gkd-secret-session.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/dbus/gkd-secret-session.c) — encrypted-session negotiation, HKDF key derivation, `NotSupported` algorithm rejection
+- [GNOME/gnome-keyring `egg/egg-dh.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/egg/egg-dh.c) — RFC 2409 1024-bit MODP group parameters and the prime-length shared-secret normalization
+- [GNOME/gnome-keyring `egg/egg-hkdf.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/egg/egg-hkdf.c) — the HKDF both peers use (empty salt = HashLen zeros)
 - [GNOME/gnome-keyring `daemon/dbus/gkd-secret-unlock.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/dbus/gkd-secret-unlock.c) — collection credential attachment and already-unlocked shortcut
 - [GNOME/gcr `gcr/gcr-ssh-agent-service.c`](https://gitlab.gnome.org/GNOME/gcr/-/blob/main/gcr/gcr-ssh-agent-service.c) — the `unique=ssh-store:<path>` passphrase-item convention (why unlocking matters for ssh)
 
