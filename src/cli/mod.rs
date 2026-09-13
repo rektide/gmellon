@@ -631,6 +631,26 @@ mod tests {
     }
 
     #[test]
+    fn lock_defaults_to_login() {
+        let cli = Cli::try_parse_from(["gmellon", "lock"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Lock { collection } if collection == "login"
+        ));
+    }
+
+    #[test]
+    fn lock_accepts_an_explicit_collection() {
+        let cli = Cli::try_parse_from(["gmellon", "lock", "work"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Lock { collection } if collection == "work"
+        ));
+    }
+
+    #[test]
     fn change_defaults_to_login() {
         let cli = Cli::try_parse_from(["gmellon", "change"]).unwrap();
 
