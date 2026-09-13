@@ -73,6 +73,15 @@ pub enum UnlockOutcome {
     AlreadyUnlocked,
 }
 
+/// Result of an explicit lock request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LockOutcome {
+    /// The selected collection was locked by this request.
+    Locked,
+    /// The collection was already locked; no Lock call was made.
+    AlreadyLocked,
+}
+
 /// Outcome of the read-only probe for GNOME Keyring's private password
 /// interface.
 ///
@@ -109,6 +118,14 @@ pub enum Error {
     /// The encrypted session's cryptography failed (randomness, peer key,
     /// key derivation, or sealing).
     Session(CryptoError),
+    /// The service demanded an interactive prompt object to lock; gmellon
+    /// does not perform prompt objects.
+    LockPromptRequired,
+    /// The service answered the Lock call without reporting the collection
+    /// locked.
+    LockIncomplete {
+        id: CollectionId,
+    },
     Bus(zbus::Error),
 }
 
@@ -137,6 +154,16 @@ impl Display for Error {
                 write!(
                     formatter,
                     "encrypted Secret Service session failed: {error}"
+                )
+            }
+            Self::LockPromptRequired => formatter.write_str(
+                "the Secret Service demands an interactive prompt object to lock; \
+                 gmellon does not perform prompt objects",
+            ),
+            Self::LockIncomplete { id } => {
+                write!(
+                    formatter,
+                    "the service did not report collection {id} locked"
                 )
             }
             Self::Bus(error) => write!(formatter, "Secret Service D-Bus error: {error}"),
@@ -346,6 +373,37 @@ impl BlockingClient {
                 ),
             )
             .map_err(|error| classify_password_error(error, id))
+    }
+
+    /// Lock a selected collection through the standard Secret Service API.
+    ///
+    /// Locking is an explicit state change; no other client method ever
+    /// calls it (the never-relock discipline runs both directions). An
+    /// already-locked collection is a successful no-op that makes no Lock
+    /// call. The service is not expected to prompt for a lock, but if it
+    /// demands an interactive prompt object the request fails closed rather
+    /// than performing it.
+    pub fn lock(&self, id: &CollectionId) -> Result<LockOutcome, Error> {
+        let collection = self.collection(id)?;
+        if collection.locked {
+            return Ok(LockOutcome::AlreadyLocked);
+        }
+
+        let service = SecretServiceProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
+        let path: ObjectPath<'_> = collection.path.as_ref();
+        let (locked, prompt) = service.lock(&[path]).map_err(classify_service_error)?;
+        // An empty path or "/" means no prompt was necessary. Anything else
+        // is a prompt object gmellon refuses to perform.
+        if !prompt.as_str().is_empty() && prompt.as_str() != "/" {
+            return Err(Error::LockPromptRequired);
+        }
+        if !locked
+            .iter()
+            .any(|locked_path| locked_path == &collection.path)
+        {
+            return Err(Error::LockIncomplete { id: id.clone() });
+        }
+        Ok(LockOutcome::Locked)
     }
 
     fn find_path(&self, id: &CollectionId) -> Result<OwnedObjectPath, Error> {

@@ -7,7 +7,8 @@ use clap_complete::Shell;
 use gmellon::secret_input::{self, Secret, SecretError};
 use gmellon::secret_service::session;
 use gmellon::secret_service::{
-    BlockingClient, Collection, CollectionId, Error as ServiceError, InterfaceProbe, UnlockOutcome,
+    BlockingClient, Collection, CollectionId, Error as ServiceError, InterfaceProbe, LockOutcome,
+    UnlockOutcome,
 };
 
 const EXIT_OK: u8 = 0;
@@ -79,6 +80,19 @@ pub enum Command {
         stdin: bool,
     },
 
+    /// Lock an existing collection.
+    ///
+    /// An explicit state change through the standard Secret Service Lock
+    /// API: ordinary unlock never locks anything, and lock is never called
+    /// implicitly. Locking is prompt-free; if the service demands an
+    /// interactive prompt object, the command fails instead of performing
+    /// one. An already-locked collection is a successful no-op.
+    Lock {
+        /// Stable collection ID; defaults to login.
+        #[arg(value_name = "COLLECTION", default_value = DEFAULT_COLLECTION)]
+        collection: String,
+    },
+
     /// Change an existing collection's password.
     ///
     /// Prompts for the current password, then the new password twice on the
@@ -121,6 +135,7 @@ pub fn run(cli: Cli) -> ExitCode {
         Command::List => list(),
         Command::Status => status(),
         Command::Unlock { collection, stdin } => unlock(&collection, stdin),
+        Command::Lock { collection } => lock(&collection),
         Command::Change { collection, stdin } => change(&collection, stdin),
         Command::Completions { shell } => completions(shell),
     };
@@ -250,6 +265,38 @@ fn unlock(collection: &str, stdin: bool) -> u8 {
     })
 }
 
+/// Lock a collection: an explicit state change, never implicit, never
+/// prompting. An already-locked collection is a successful no-op.
+fn lock(collection: &str) -> u8 {
+    let id = match CollectionId::new(collection) {
+        Ok(id) => id,
+        Err(error) => return report_service_error(error),
+    };
+    let span = tracing::info_span!("operation", operation = "lock", collection = %id);
+    span.in_scope(|| {
+        let client = match BlockingClient::session() {
+            Ok(client) => client,
+            Err(error) => return report_service_error(error),
+        };
+        match client.lock(&id) {
+            Ok(LockOutcome::Locked) => {
+                println!("locked collection {id}");
+                tracing::info!(outcome = "Locked", "lock outcome");
+                EXIT_OK
+            }
+            Ok(LockOutcome::AlreadyLocked) => {
+                println!("collection {id} is already locked");
+                tracing::info!(outcome = "AlreadyLocked", "lock outcome");
+                EXIT_OK
+            }
+            Err(error) => {
+                tracing::info!(outcome = denied_wording(&error), "lock outcome");
+                report_service_error(error)
+            }
+        }
+    })
+}
+
 fn change(collection: &str, stdin: bool) -> u8 {
     let id = match CollectionId::new(collection) {
         Ok(id) => id,
@@ -363,6 +410,8 @@ fn service_error_exit(error: &ServiceError) -> u8 {
         | ServiceError::CollectionNotFound { .. }
         | ServiceError::EncryptedSessionUnsupported
         | ServiceError::Session(_)
+        | ServiceError::LockPromptRequired
+        | ServiceError::LockIncomplete { .. }
         | ServiceError::Bus(_) => EXIT_ERROR,
     }
 }
@@ -653,6 +702,16 @@ mod tests {
         );
         assert_eq!(
             service_error_exit(&ServiceError::Session(CryptoError::Randomness)),
+            1
+        );
+        // Lock stays in the unexpected-error family too: a demanded prompt
+        // object or an incomplete lock is a clear stderr message, never a
+        // new exit code.
+        assert_eq!(service_error_exit(&ServiceError::LockPromptRequired), 1);
+        assert_eq!(
+            service_error_exit(&ServiceError::LockIncomplete {
+                id: CollectionId::new("work").unwrap()
+            }),
             1
         );
     }

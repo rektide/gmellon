@@ -23,6 +23,11 @@ pub(super) trait SecretService {
         algorithm: &str,
         input: &Value<'_>,
     ) -> zbus::Result<(OwnedValue, OwnedObjectPath)>;
+
+    fn lock(
+        &self,
+        collections: &[ObjectPath<'_>],
+    ) -> zbus::Result<(Vec<OwnedObjectPath>, OwnedObjectPath)>;
 }
 
 #[zbus::proxy(
