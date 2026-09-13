@@ -1,7 +1,9 @@
 use std::io;
+use std::io::Write;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use gmellon::secret_input::{self, Secret, SecretError};
 use gmellon::secret_service::session;
 use gmellon::secret_service::{
@@ -16,8 +18,20 @@ const EXIT_NO_DAEMON: u8 = 4;
 const DEFAULT_COLLECTION: &str = "login";
 
 /// List, unlock, and re-key GNOME keyring collections without a GUI or PAM.
+///
+/// Discovery uses the standard Secret Service API; unlocking and re-keying
+/// use GNOME Keyring's private, unsupported password interface. Every
+/// connection negotiates the encrypted Secret Service session, and
+/// passwords are read only from a TTY prompt or stdin — never argv.
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about,
+    after_help = "unlock and change speak \
+                  org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface, a deliberately \
+                  undocumented GNOME interface that may change or vanish without notice. \
+                  Compatibility limits and verification evidence: doc/status.md"
+)]
 pub struct Cli {
     /// Print redacted diagnostic events on stderr (operations, results,
     /// lengths). Password bytes and key material are never printed.
@@ -31,17 +45,30 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// List collection IDs, labels, and lock state.
+    ///
+    /// Deterministic tab-separated ID, LOCKED, and LABEL columns, sorted by
+    /// stable collection ID. Control characters in labels are escaped.
     List,
 
     /// Report service capabilities and collection lock state.
     ///
     /// A prompt-free health report, distinct from `list`'s deterministic
     /// column output: it never prompts, never unlocks or locks anything,
-    /// and never calls a password method. Per-collection lines carry the
-    /// stable ID and lock state only; labels belong to `list`.
+    /// and never calls a password method — the private-interface fact comes
+    /// from a read-only D-Bus Introspect probe. Per-collection lines carry
+    /// the stable ID and lock state only; labels belong to `list`.
+    ///
+    /// Exits nonzero only through the existing table: 4 when the Secret
+    /// Service is unavailable, 1 when the encrypted session is refused.
     Status,
 
     /// Unlock an existing collection.
+    ///
+    /// Prompts for the collection password on the TTY with echo disabled,
+    /// or reads one password line from stdin with --stdin. An
+    /// already-unlocked collection returns success without reading or
+    /// checking a password, and unlocking never locks or relocks a
+    /// collection to verify one.
     Unlock {
         /// Stable collection ID; defaults to login.
         #[arg(value_name = "COLLECTION", default_value = DEFAULT_COLLECTION)]
@@ -53,14 +80,33 @@ pub enum Command {
     },
 
     /// Change an existing collection's password.
+    ///
+    /// Prompts for the current password, then the new password twice on the
+    /// TTY; with --stdin reads current, new, and confirmation lines in that
+    /// order. A denied current password leaves the old password valid.
     Change {
         /// Stable collection ID; defaults to login.
         #[arg(value_name = "COLLECTION", default_value = DEFAULT_COLLECTION)]
         collection: String,
 
-        /// Read old, new, and confirmation lines from stdin.
+        /// Read current, new, and confirmation lines from stdin.
         #[arg(long)]
         stdin: bool,
+    },
+
+    /// Generate shell completions.
+    ///
+    /// Writes the completion script for SHELL to standard output; redirect
+    /// it wherever your shell looks. For zsh:
+    ///
+    ///   gmellon completions zsh > ~/.zfunc/_gmellon
+    ///
+    /// with ~/.zfunc on fpath before compinit — or use the bundled zimfw
+    /// module, which installs and regenerates the file automatically.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: Shell,
     },
 }
 
@@ -76,6 +122,7 @@ pub fn run(cli: Cli) -> ExitCode {
         Command::Status => status(),
         Command::Unlock { collection, stdin } => unlock(&collection, stdin),
         Command::Change { collection, stdin } => change(&collection, stdin),
+        Command::Completions { shell } => completions(shell),
     };
     tracing::info!(exit = code, "exit classified");
     ExitCode::from(code)
@@ -252,6 +299,26 @@ fn denied_wording(error: &ServiceError) -> &'static str {
     }
 }
 
+/// Emit the completion script for one shell. Buffered and written once so
+/// a broken pipe reports an exit-1 diagnostic instead of a panic.
+fn completions(shell: Shell) -> u8 {
+    let span = tracing::info_span!("operation", operation = "completions", shell = %shell);
+    span.in_scope(|| {
+        let mut command = Cli::command();
+        let name = command.get_name().to_owned();
+        let mut buffer = Vec::new();
+        clap_complete::generate(shell, &mut command, name, &mut buffer);
+        tracing::info!(bytes = buffer.len(), "completions generated");
+        match io::stdout().write_all(&buffer) {
+            Ok(()) => EXIT_OK,
+            Err(error) => {
+                eprintln!("gmellon: writing completions failed: {error}");
+                EXIT_ERROR
+            }
+        }
+    })
+}
+
 fn private_interface_wording(probe: InterfaceProbe) -> &'static str {
     match probe {
         InterfaceProbe::Available => "available",
@@ -349,7 +416,7 @@ fn render_lock_summary(collections: &[Collection]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use clap::{CommandFactory, Parser};
+    use clap::{CommandFactory, Parser, ValueEnum};
     use gmellon::secret_service::session::CryptoError;
     use zbus::zvariant::OwnedObjectPath;
 
@@ -383,11 +450,63 @@ mod tests {
     fn help_exposes_collection_commands() {
         let help = Cli::command().render_long_help().to_string();
 
-        for command in ["list", "status", "unlock", "change"] {
+        for command in ["list", "status", "unlock", "change", "completions"] {
             assert!(help.contains(command), "help omitted {command}");
         }
         assert!(!help.contains("control-dir"));
         assert!(!help.contains("allow-create"));
+    }
+
+    #[test]
+    fn help_names_the_unsupported_interface_caveat() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(
+            help.contains("InternalUnsupportedGuiltRiddenInterface"),
+            "after_help must name the unsupported private interface"
+        );
+        assert!(
+            help.contains("doc/status.md"),
+            "after_help must point at the compatibility document"
+        );
+        assert!(
+            help.contains("may change or vanish"),
+            "after_help must stay honest about upstream volatility"
+        );
+    }
+
+    #[test]
+    fn completions_parse_every_advertised_shell_and_reject_others() {
+        for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+            let cli = Cli::try_parse_from(["gmellon", "completions", shell]).unwrap();
+            assert!(
+                matches!(cli.command, Command::Completions { .. }),
+                "{shell} must parse"
+            );
+        }
+        assert!(Cli::try_parse_from(["gmellon", "completions", "tcsh"]).is_err());
+    }
+
+    #[test]
+    fn completions_render_subcommands_for_every_supported_shell() {
+        for shell in Shell::value_variants() {
+            let mut buffer = Vec::new();
+            clap_complete::generate(*shell, &mut Cli::command(), "gmellon", &mut buffer);
+            assert!(
+                !buffer.is_empty(),
+                "completions for {shell:?} must not be empty"
+            );
+        }
+
+        let mut zsh = Vec::new();
+        clap_complete::generate(Shell::Zsh, &mut Cli::command(), "gmellon", &mut zsh);
+        let text = String::from_utf8(zsh).expect("zsh completions are UTF-8");
+        for subcommand in ["list", "status", "unlock", "change", "completions"] {
+            assert!(
+                text.contains(subcommand),
+                "zsh completions must name the {subcommand} subcommand"
+            );
+        }
     }
 
     #[test]
