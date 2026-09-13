@@ -173,12 +173,23 @@ impl BlockingClient {
     /// Connect to the caller's D-Bus session and negotiate the encrypted
     /// Secret Service session.
     pub fn session() -> Result<Self, Error> {
-        Self::new(Connection::session().map_err(|_| Error::ServiceUnavailable)?)
+        let span = tracing::info_span!("connection");
+        let connection = span.in_scope(|| {
+            let connection = Connection::session().map_err(|_| Error::ServiceUnavailable)?;
+            tracing::info!("connected to the session bus");
+            Ok(connection)
+        })?;
+        Self::new(connection)
     }
 
     /// Use an existing connection, such as an isolated test-bus connection,
     /// and negotiate the encrypted Secret Service session over it.
     pub fn new(connection: Connection) -> Result<Self, Error> {
+        // The span name and every event in this client are diagnostics
+        // surface: fields are scalars (algorithm names, IDs, lengths,
+        // outcomes) — never password bytes, key material, IVs, ciphertext,
+        // or secret-bearing structs.
+        let _negotiation = tracing::info_span!("session-negotiation").entered();
         let service = SecretServiceProxyBlocking::new(&connection).map_err(Error::Bus)?;
         let keypair = ClientKeypair::generate().map_err(Error::Session)?;
         // The daemon unwraps the outer variant itself and requires the inner
@@ -193,6 +204,7 @@ impl BlockingClient {
         let session_key = keypair
             .derive_aes_key(&server_public)
             .map_err(Error::Session)?;
+        tracing::info!(algorithm = session::ALGORITHM, "session negotiated");
         Ok(Self {
             connection,
             session_path,
@@ -202,6 +214,7 @@ impl BlockingClient {
 
     /// List all collections with stable IDs, mutable labels, and lock state.
     pub fn collections(&self) -> Result<Vec<Collection>, Error> {
+        let _resolution = tracing::info_span!("collection-resolution").entered();
         let service = SecretServiceProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
         let mut collections = service
             .collections()
@@ -210,12 +223,16 @@ impl BlockingClient {
             .map(|path| self.inspect_collection(path))
             .collect::<Result<Vec<_>, _>>()?;
         collections.sort_by(|left, right| left.id.cmp(&right.id));
+        tracing::info!(collections = collections.len(), "collections resolved");
         Ok(collections)
     }
 
     /// Resolve one collection by its stable ID.
     pub fn collection(&self, id: &CollectionId) -> Result<Collection, Error> {
-        self.inspect_collection(self.find_path(id)?)
+        let _resolution = tracing::info_span!("collection-resolution", collection = %id).entered();
+        let collection = self.inspect_collection(self.find_path(id)?)?;
+        tracing::info!(locked = collection.locked, "collection resolved");
+        Ok(collection)
     }
 
     /// Probe whether the service exposes GNOME Keyring's private password
@@ -259,6 +276,14 @@ impl BlockingClient {
 
         let internal = GnomeInternalProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
         let sealed = session::seal(&self.session_key, password).map_err(Error::Session)?;
+        // Lengths only: the plaintext and ciphertext bytes never enter an
+        // event, and the IV is never logged.
+        tracing::info!(
+            input = "password",
+            plaintext_length = password.len(),
+            ciphertext_length = sealed.ciphertext.len(),
+            "seal performed"
+        );
         let content_type = "text/plain";
         let session: ObjectPath<'_> = self.session_path.as_ref();
         let path: ObjectPath<'_> = collection.path.as_ref();
@@ -287,7 +312,20 @@ impl BlockingClient {
         let internal = GnomeInternalProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
         let sealed_original =
             session::seal(&self.session_key, original_password).map_err(Error::Session)?;
+        // Lengths only, one event per sealed input: no bytes, no IVs.
+        tracing::info!(
+            input = "original",
+            plaintext_length = original_password.len(),
+            ciphertext_length = sealed_original.ciphertext.len(),
+            "seal performed"
+        );
         let sealed_new = session::seal(&self.session_key, new_password).map_err(Error::Session)?;
+        tracing::info!(
+            input = "new",
+            plaintext_length = new_password.len(),
+            ciphertext_length = sealed_new.ciphertext.len(),
+            "seal performed"
+        );
         let content_type = "text/plain";
         let session: ObjectPath<'_> = self.session_path.as_ref();
         let path: ObjectPath<'_> = collection.path.as_ref();

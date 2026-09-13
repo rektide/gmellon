@@ -15,6 +15,10 @@ rpassword = "7.5.4"
 # the control backend's net/process surfaces are activated by `login-control`.
 rustix = "1.1.4"
 sha2 = "0.11.0"
+# Redacted diagnostics: spans/events carry operations, results, and lengths
+# only — never password bytes, key material, IVs, or ciphertext bodies.
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "std"] }
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 zeroize = "1.9.0"
 

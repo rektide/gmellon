@@ -5,10 +5,10 @@ use clap::{Parser, Subcommand};
 use gmellon::secret_input::{self, Secret, SecretError};
 use gmellon::secret_service::session;
 use gmellon::secret_service::{
-    BlockingClient, Collection, CollectionId, Error as ServiceError, InterfaceProbe,
-    UnlockOutcome,
+    BlockingClient, Collection, CollectionId, Error as ServiceError, InterfaceProbe, UnlockOutcome,
 };
 
+const EXIT_OK: u8 = 0;
 const EXIT_ERROR: u8 = 1;
 const EXIT_DENIED: u8 = 2;
 const EXIT_FAILED: u8 = 3;
@@ -19,6 +19,11 @@ const DEFAULT_COLLECTION: &str = "login";
 #[derive(Debug, Parser)]
 #[command(version, about)]
 pub struct Cli {
+    /// Print redacted diagnostic events on stderr (operations, results,
+    /// lengths). Password bytes and key material are never printed.
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -60,57 +65,190 @@ pub enum Command {
 }
 
 pub fn run(cli: Cli) -> ExitCode {
-    match cli.command {
+    // The tracing subscriber exists only under -v: without the flag no
+    // event is ever emitted (or formatted), and RUST_LOG never activates
+    // one either.
+    if cli.verbose {
+        install_verbose_subscriber();
+    }
+    let code = match cli.command {
         Command::List => list(),
         Command::Status => status(),
         Command::Unlock { collection, stdin } => unlock(&collection, stdin),
         Command::Change { collection, stdin } => change(&collection, stdin),
-    }
+    };
+    tracing::info!(exit = code, "exit classified");
+    ExitCode::from(code)
 }
 
-fn list() -> ExitCode {
-    let client = match BlockingClient::session() {
-        Ok(client) => client,
+/// Install the -v diagnostics subscriber on stderr. Every event the code
+/// emits carries explicit scalar fields — operation names, results,
+/// lengths, outcomes, exit codes — and never password bytes, key material,
+/// IV values, ciphertext bodies, or secret-bearing structs.
+fn install_verbose_subscriber() {
+    tracing_subscriber::fmt()
+        .with_writer(io::stderr)
+        .with_max_level(tracing::Level::INFO)
+        .try_init()
+        .ok();
+}
+
+fn list() -> u8 {
+    let span = tracing::info_span!("operation", operation = "list");
+    span.in_scope(|| {
+        let client = match BlockingClient::session() {
+            Ok(client) => client,
+            Err(error) => return report_service_error(error),
+        };
+        match client.collections() {
+            Ok(collections) => {
+                print!("{}", render_collections(&collections));
+                EXIT_OK
+            }
+            Err(error) => report_service_error(error),
+        }
+    })
+}
+
+fn status() -> u8 {
+    let span = tracing::info_span!("operation", operation = "status");
+    span.in_scope(|| {
+        let client = match BlockingClient::session() {
+            Ok(client) => client,
+            // A rejecting daemon still answered the OpenSession negotiation, so
+            // the service itself is reachable: the algorithm refusal is a
+            // capability fact, reported as lines before the existing exit-1
+            // mapping. Collections cannot be listed without a client.
+            Err(error @ ServiceError::EncryptedSessionUnsupported) => {
+                println!("secret service: org.freedesktop.secrets (reachable)");
+                println!(
+                    "encrypted session: not negotiated \
+                     (dh-ietf1024-sha256-aes128-cbc-pkcs7 refused; no plain-session fallback)"
+                );
+                return report_service_error(error);
+            }
+            Err(error) => return report_service_error(error),
+        };
+        println!("secret service: org.freedesktop.secrets (reachable)");
+        println!("encrypted session: negotiated ({})", session::ALGORITHM);
+        let probe = client.private_interface_probe();
+        tracing::info!(
+            private_interface = private_interface_wording(probe),
+            "private password interface probed"
+        );
+        println!(
+            "private password interface: {}",
+            private_interface_wording(probe)
+        );
+        match client.collections() {
+            Ok(collections) => {
+                print!("{}", render_lock_summary(&collections));
+                EXIT_OK
+            }
+            Err(error) => report_service_error(error),
+        }
+    })
+}
+
+fn unlock(collection: &str, stdin: bool) -> u8 {
+    let id = match CollectionId::new(collection) {
+        Ok(id) => id,
         Err(error) => return report_service_error(error),
     };
-    match client.collections() {
-        Ok(collections) => {
-            print!("{}", render_collections(&collections));
-            ExitCode::SUCCESS
+    let span = tracing::info_span!("operation", operation = "unlock", collection = %id);
+    span.in_scope(|| {
+        let client = match BlockingClient::session() {
+            Ok(client) => client,
+            Err(error) => return report_service_error(error),
+        };
+        let selected = match client.collection(&id) {
+            Ok(collection) => collection,
+            Err(error) => return report_service_error(error),
+        };
+
+        if !selected.locked {
+            println!("collection {id} is already unlocked; password was not checked");
+            return EXIT_OK;
         }
-        Err(error) => report_service_error(error),
-    }
+
+        let secret = if stdin {
+            secret_input::read_stdin_line(&mut io::stdin().lock())
+        } else {
+            secret_input::prompt(&format!("Password for {id}: "))
+        };
+        let secret = match secret {
+            Ok(secret) => secret,
+            Err(error) => {
+                eprintln!("gmellon: {error}");
+                return EXIT_ERROR;
+            }
+        };
+
+        match client.unlock(&id, secret.as_bytes()) {
+            Ok(UnlockOutcome::Unlocked) => {
+                println!("unlocked collection {id}");
+                tracing::info!(outcome = "Unlocked", "unlock outcome");
+                EXIT_OK
+            }
+            Ok(UnlockOutcome::AlreadyUnlocked) => {
+                println!("collection {id} is already unlocked; password was not checked");
+                tracing::info!(outcome = "AlreadyUnlocked", "unlock outcome");
+                EXIT_OK
+            }
+            Err(error) => {
+                tracing::info!(outcome = denied_wording(&error), "unlock outcome");
+                report_service_error(error)
+            }
+        }
+    })
 }
 
-fn status() -> ExitCode {
-    let client = match BlockingClient::session() {
-        Ok(client) => client,
-        // A rejecting daemon still answered the OpenSession negotiation, so
-        // the service itself is reachable: the algorithm refusal is a
-        // capability fact, reported as lines before the existing exit-1
-        // mapping. Collections cannot be listed without a client.
-        Err(error @ ServiceError::EncryptedSessionUnsupported) => {
-            println!("secret service: org.freedesktop.secrets (reachable)");
-            println!(
-                "encrypted session: not negotiated \
-                 (dh-ietf1024-sha256-aes128-cbc-pkcs7 refused; no plain-session fallback)"
-            );
+fn change(collection: &str, stdin: bool) -> u8 {
+    let id = match CollectionId::new(collection) {
+        Ok(id) => id,
+        Err(error) => return report_service_error(error),
+    };
+    let span = tracing::info_span!("operation", operation = "change", collection = %id);
+    span.in_scope(|| {
+        let client = match BlockingClient::session() {
+            Ok(client) => client,
+            Err(error) => return report_service_error(error),
+        };
+        if let Err(error) = client.collection(&id) {
             return report_service_error(error);
         }
-        Err(error) => return report_service_error(error),
-    };
-    println!("secret service: org.freedesktop.secrets (reachable)");
-    println!("encrypted session: negotiated ({})", session::ALGORITHM);
-    println!(
-        "private password interface: {}",
-        private_interface_wording(client.private_interface_probe())
-    );
-    match client.collections() {
-        Ok(collections) => {
-            print!("{}", render_lock_summary(&collections));
-            ExitCode::SUCCESS
+
+        let secrets = if stdin {
+            read_change_stdin(&mut io::stdin().lock())
+        } else {
+            read_change_tty(&id)
+        };
+        let (original, new) = match secrets {
+            Ok(secrets) => secrets,
+            Err(error) => return report_input_error(error),
+        };
+
+        match client.change_password(&id, original.as_bytes(), new.as_bytes()) {
+            Ok(()) => {
+                println!("changed password for collection {id}");
+                tracing::info!(outcome = "Changed", "change outcome");
+                EXIT_OK
+            }
+            Err(error) => {
+                tracing::info!(outcome = denied_wording(&error), "change outcome");
+                report_service_error(error)
+            }
         }
-        Err(error) => report_service_error(error),
+    })
+}
+
+/// Outcome word for a failed password exchange: `Denied` only for a
+/// password denial, `Failed` for everything else. The distinction is
+/// metadata; the error detail stays on the ordinary stderr line.
+fn denied_wording(error: &ServiceError) -> &'static str {
+    match error {
+        ServiceError::PasswordDenied => "Denied",
+        _ => "Failed",
     }
 }
 
@@ -119,83 +257,6 @@ fn private_interface_wording(probe: InterfaceProbe) -> &'static str {
         InterfaceProbe::Available => "available",
         InterfaceProbe::Unavailable => "unavailable",
         InterfaceProbe::Unknown => "unknown (introspection failed)",
-    }
-}
-
-fn unlock(collection: &str, stdin: bool) -> ExitCode {
-    let id = match CollectionId::new(collection) {
-        Ok(id) => id,
-        Err(error) => return report_service_error(error),
-    };
-    let client = match BlockingClient::session() {
-        Ok(client) => client,
-        Err(error) => return report_service_error(error),
-    };
-    let selected = match client.collection(&id) {
-        Ok(collection) => collection,
-        Err(error) => return report_service_error(error),
-    };
-
-    if !selected.locked {
-        println!("collection {id} is already unlocked; password was not checked");
-        return ExitCode::SUCCESS;
-    }
-
-    let secret = if stdin {
-        secret_input::read_stdin_line(&mut io::stdin().lock())
-    } else {
-        secret_input::prompt(&format!("Password for {id}: "))
-    };
-    let secret = match secret {
-        Ok(secret) => secret,
-        Err(error) => {
-            eprintln!("gmellon: {error}");
-            return ExitCode::from(EXIT_ERROR);
-        }
-    };
-
-    match client.unlock(&id, secret.as_bytes()) {
-        Ok(UnlockOutcome::Unlocked) => {
-            println!("unlocked collection {id}");
-            ExitCode::SUCCESS
-        }
-        Ok(UnlockOutcome::AlreadyUnlocked) => {
-            println!("collection {id} is already unlocked; password was not checked");
-            ExitCode::SUCCESS
-        }
-        Err(error) => report_service_error(error),
-    }
-}
-
-fn change(collection: &str, stdin: bool) -> ExitCode {
-    let id = match CollectionId::new(collection) {
-        Ok(id) => id,
-        Err(error) => return report_service_error(error),
-    };
-    let client = match BlockingClient::session() {
-        Ok(client) => client,
-        Err(error) => return report_service_error(error),
-    };
-    if let Err(error) = client.collection(&id) {
-        return report_service_error(error);
-    }
-
-    let secrets = if stdin {
-        read_change_stdin(&mut io::stdin().lock())
-    } else {
-        read_change_tty(&id)
-    };
-    let (original, new) = match secrets {
-        Ok(secrets) => secrets,
-        Err(error) => return report_input_error(error),
-    };
-
-    match client.change_password(&id, original.as_bytes(), new.as_bytes()) {
-        Ok(()) => {
-            println!("changed password for collection {id}");
-            ExitCode::SUCCESS
-        }
-        Err(error) => report_service_error(error),
     }
 }
 
@@ -214,15 +275,15 @@ fn read_change_tty(id: &CollectionId) -> Result<(Secret, Secret), SecretError> {
     Ok((original, new))
 }
 
-fn report_input_error(error: SecretError) -> ExitCode {
+fn report_input_error(error: SecretError) -> u8 {
     eprintln!("gmellon: {error}");
-    ExitCode::from(EXIT_ERROR)
+    EXIT_ERROR
 }
 
-fn report_service_error(error: ServiceError) -> ExitCode {
+fn report_service_error(error: ServiceError) -> u8 {
     let exit = service_error_exit(&error);
     eprintln!("gmellon: {error}");
-    ExitCode::from(exit)
+    exit
 }
 
 fn service_error_exit(error: &ServiceError) -> u8 {
@@ -300,6 +361,25 @@ mod tests {
     }
 
     #[test]
+    fn verbose_defaults_off() {
+        let cli = Cli::try_parse_from(["gmellon", "list"]).unwrap();
+        assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn verbose_is_a_global_flag_in_both_positions() {
+        for argv in [
+            vec!["gmellon", "-v", "list"],
+            vec!["gmellon", "--verbose", "list"],
+            vec!["gmellon", "list", "-v"],
+            vec!["gmellon", "unlock", "work", "--stdin", "-v"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).unwrap();
+            assert!(cli.verbose, "-v must parse globally for {argv:?}");
+        }
+    }
+
+    #[test]
     fn help_exposes_collection_commands() {
         let help = Cli::command().render_long_help().to_string();
 
@@ -342,7 +422,10 @@ mod tests {
 
     #[test]
     fn private_interface_probe_wording_is_stable() {
-        assert_eq!(private_interface_wording(InterfaceProbe::Available), "available");
+        assert_eq!(
+            private_interface_wording(InterfaceProbe::Available),
+            "available"
+        );
         assert_eq!(
             private_interface_wording(InterfaceProbe::Unavailable),
             "unavailable"
