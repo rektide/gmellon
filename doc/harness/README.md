@@ -57,6 +57,7 @@ for how that authority divides:
 | Run collection-oriented Secret Service tests | [Private-broker interface](#private-broker-interface), [Private-broker profile](#private-broker-profile), [`broker0.gpt6a.md`](/doc/harness/broker0.gpt6a.md), and [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md) |
 | Run or inspect the collection CLI binary proof | [Private-broker workflow](#private-broker-workflow) and [`cli0.glm53max.md`](/doc/harness/cli0.glm53max.md) |
 | Run or inspect the collection change CLI proof | [Private-broker workflow](#private-broker-workflow) and [`change0.glm53max.md`](/doc/harness/change0.glm53max.md) |
+| Run or inspect the encrypted-session wire proof | [Private-broker workflow](#private-broker-workflow) and [`session0.gpt6a.md`](/doc/harness/session0.gpt6a.md) |
 
 The supported reusable surfaces are the two executable command interfaces and
 their exported environments. Importable Python names in `lifecycle.py` and
@@ -523,7 +524,12 @@ Broker-mode roots additionally contain `bus.conf`, the mode-0600 `bus` socket
 while live, `broker-launcher.stdout.log`, and
 `broker-launcher.stderr.log`. The maintained smoke command writes
 `private-bus-probe.json` containing booleans and the public interface name,
-never a session secret or password.
+never a session secret or password. The Rust proofs' monitors retain only
+redacted summaries: `lock-monitor.txt` (header facts from a body-excluding
+rule), `change-monitor.txt` (streamed header facts from a password-bearing
+rule), and the body monitors' `password-body-monitor.txt` and
+`open-session-monitor.txt` (member, sender, array-length, and verdict
+facts; their bodies transit pipes only and never exist as files).
 
 Earlier failures may leave only the artifacts opened or written by that
 lifecycle state. `cleanup.json` is attempted whenever a root was allocated,
@@ -686,7 +692,8 @@ dev/harness/check rust-broker
 It additionally preflights `busctl` and `stdbuf`, then runs the ignored
 [`tests/harness/broker_collections.rs`](/tests/harness/broker_collections.rs)
 proof under `broker.py`. The proof's zbus fixture performs the only permitted
-mutation setup — private `CreateWithMasterPassword` (one collection labeled
+mutation setup — private `CreateWithMasterPassword` over the same encrypted
+session the product negotiates (one collection labeled
 exactly `login`, satisfying the parent acceptance's literal login-plus-second
 requirement, plus a second tagged collection) with counted standard `Lock`
 calls — while every assertion runs through the public `BlockingClient`. A
@@ -695,8 +702,10 @@ standard Lock call (that no password method is sent on the already-unlocked
 path is the committed client's early return plus the observed outcome, not a
 monitor claim); generated passwords are zeroized, excluded from monitor
 output by the match rule, and scanned out of every retained regular artifact
-by a walk that fails closed on symlinks. See
-[`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md).
+by a walk that fails closed on symlinks. Body-scanning monitors add the
+encrypted-session wire evidence described under the CLI proof below. See
+[`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md) and
+[`session0.gpt6a.md`](/doc/harness/session0.gpt6a.md).
 
 The maintained Rust CLI binary proof is:
 
@@ -717,6 +726,26 @@ bus or store): `gmellon list` is asserted byte-deterministic with the exact
 with `/dev/null` stdin, which the `--stdin` reader would reject as
 unterminated — so exit 0 plus the not-checked message proves the pre-resolved
 lock state was trusted without reading any secret.
+
+The same proof run also carries the encrypted-session wire evidence, shared
+with the collection proof through the same machinery: body-scanning
+`busctl monitor` instances watch every member of the private password
+interface and every `Service.OpenSession` call, streamed through pipes whose
+reader threads reconstruct each `ay` array one zeroized run at a time —
+never on disk — and scan every raw line and every decoded run for the
+generated passwords. The proof asserts the absence side by construction
+(any hit fails the run) and the presence side by exact counts: eleven
+encrypted unlock bodies, three encrypted change bodies (cross-checked equal
+to the independent header monitor's count), and one encrypted-algorithm
+OpenSession per CLI invocation plus the fixture's own, with every captured
+password-method call verdicted as the encrypted shape (a 16-byte IV array
+plus a non-empty 16-multiple ciphertext array per Secret) so a plain
+secret's empty parameters would fail. The scanner is pinned to the
+installed busctl rendering by ordinary positive controls in
+[`redaction_scan.rs`](/tests/harness/redaction_scan.rs). Retained summaries
+(`password-body-monitor.txt`, `open-session-monitor.txt`) carry member,
+sender, array-length, and verdict facts only. See
+[`session0.gpt6a.md`](/doc/harness/session0.gpt6a.md).
 
 The same proof run also covers `gmellon change` end to end. The three-line
 `--stdin` contract is driven directly: mismatched confirmation and truncated
@@ -883,6 +912,7 @@ one kind of truth:
 | [`collections0.glm53max.md`](/doc/harness/collections0.glm53max.md) | Version-scoped multi-collection `BlockingClient` proof: stable-ID unlock/change, fixture-only locking, no-relock monitor evidence, and secret-handling limits |
 | [`cli0.glm53max.md`](/doc/harness/cli0.glm53max.md) | Version-scoped CLI binary proof: `gmellon list` determinism, default/explicit unlock exit semantics, no-read already-unlocked evidence, and secret scans |
 | [`change0.glm53max.md`](/doc/harness/change0.glm53max.md) | Version-scoped change CLI binary proof: three-line stdin contract, no-private-call wire evidence for input rejections, exit 2/0 rotation semantics, locked-change daemon behavior, and the never-on-disk streaming policy for the password-bearing monitor |
+| [`session0.gpt6a.md`](/doc/harness/session0.gpt6a.md) | Version-scoped encrypted-session implementation and wire proof: pinned DH/HKDF known answers, first-live-run interop facts, body-scan monitor design and positive controls, and exact check results |
 | [`prompt.md`](/doc/harness/prompt.md) | Epic safety invariants, upstream facts, ticket boundaries, and the original work graph, plus a completion-status section; planned acceptance, not completion evidence |
 | Product [`README.md`](/README.md) | Product contract, private wire protocol, and the unlock-or-create hazard that motivates real-daemon testing; not the harness lifecycle contract |
 | Beads graph | Review and work status; not runtime behavior |
