@@ -2,12 +2,13 @@ use std::error::Error as StdError;
 use std::fmt::{self, Display, Formatter};
 
 use zbus::blocking::Connection;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use super::proxies::{
     COLLECTION_PATH_PREFIX, GnomeInternalProxyBlocking, SERVICE_NAME,
     SecretCollectionProxyBlocking, SecretServiceProxyBlocking,
 };
+use super::session::{self, ClientKeypair, CryptoError, SessionKey};
 
 const DENIED_ERROR: &str = "org.gnome.keyring.Error.Denied";
 const NO_SUCH_OBJECT_ERROR: &str = "org.freedesktop.Secret.Error.NoSuchObject";
@@ -15,6 +16,7 @@ const NAME_HAS_NO_OWNER_ERROR: &str = "org.freedesktop.DBus.Error.NameHasNoOwner
 const SERVICE_UNKNOWN_ERROR: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
 const UNKNOWN_INTERFACE_ERROR: &str = "org.freedesktop.DBus.Error.UnknownInterface";
 const UNKNOWN_METHOD_ERROR: &str = "org.freedesktop.DBus.Error.UnknownMethod";
+const NOT_SUPPORTED_ERROR: &str = "org.freedesktop.DBus.Error.NotSupported";
 
 /// Stable identifier derived from a Secret Service collection object path.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -75,11 +77,21 @@ pub enum UnlockOutcome {
 #[derive(Debug)]
 pub enum Error {
     InvalidCollectionId,
-    InvalidCollectionPath { path: OwnedObjectPath },
-    CollectionNotFound { id: CollectionId },
+    InvalidCollectionPath {
+        path: OwnedObjectPath,
+    },
+    CollectionNotFound {
+        id: CollectionId,
+    },
     ServiceUnavailable,
     PasswordDenied,
     PrivateInterfaceUnavailable,
+    /// The service rejected the encrypted-session algorithm. There is
+    /// deliberately no plain-session fallback.
+    EncryptedSessionUnsupported,
+    /// The encrypted session's cryptography failed (randomness, peer key,
+    /// key derivation, or sealing).
+    Session(CryptoError),
     Bus(zbus::Error),
 }
 
@@ -100,6 +112,16 @@ impl Display for Error {
             Self::PrivateInterfaceUnavailable => formatter.write_str(
                 "the Secret Service does not provide GNOME Keyring's private password interface",
             ),
+            Self::EncryptedSessionUnsupported => formatter.write_str(
+                "the Secret Service does not support encrypted sessions \
+                 (dh-ietf1024-sha256-aes128-cbc-pkcs7); refusing to fall back to a plain session",
+            ),
+            Self::Session(error) => {
+                write!(
+                    formatter,
+                    "encrypted Secret Service session failed: {error}"
+                )
+            }
             Self::Bus(error) => write!(formatter, "Secret Service D-Bus error: {error}"),
         }
     }
@@ -108,6 +130,7 @@ impl Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
+            Self::Session(error) => Some(error),
             Self::Bus(error) => Some(error),
             _ => None,
         }
@@ -116,31 +139,47 @@ impl StdError for Error {
 
 /// Blocking collection-oriented GNOME Keyring client.
 ///
+/// Every instance negotiates the encrypted Secret Service session
+/// (`dh-ietf1024-sha256-aes128-cbc-pkcs7`) on construction; there is no
+/// plain-session fallback. Passwords are sealed per call with a fresh IV.
+///
 /// The zbus proxy declarations also generate asynchronous proxies. A future
-/// Tokio adapter can reuse those declarations and the collection model rather
-/// than wrapping this blocking client.
+/// Tokio adapter can reuse those declarations, the collection model, and the
+/// sans-I/O [`session`] core rather than wrapping this blocking client.
 pub struct BlockingClient {
     connection: Connection,
     session_path: OwnedObjectPath,
+    session_key: SessionKey,
 }
 
 impl BlockingClient {
-    /// Connect to the caller's D-Bus session and open a plain Secret Service
-    /// session.
+    /// Connect to the caller's D-Bus session and negotiate the encrypted
+    /// Secret Service session.
     pub fn session() -> Result<Self, Error> {
         Self::new(Connection::session().map_err(|_| Error::ServiceUnavailable)?)
     }
 
-    /// Use an existing connection, such as an isolated test-bus connection.
+    /// Use an existing connection, such as an isolated test-bus connection,
+    /// and negotiate the encrypted Secret Service session over it.
     pub fn new(connection: Connection) -> Result<Self, Error> {
         let service = SecretServiceProxyBlocking::new(&connection).map_err(Error::Bus)?;
-        let input = Value::from("");
-        let (_output, session_path) = service
-            .open_session("plain", &input)
-            .map_err(classify_service_error)?;
+        let keypair = ClientKeypair::generate().map_err(Error::Session)?;
+        // The daemon unwraps the outer variant itself and requires the inner
+        // type to be `ay` (G_VARIANT_TYPE_BYTESTRING in
+        // gkd_secret_session_handle_open), so the public key travels as a
+        // byte-array variant.
+        let input = Value::from(keypair.public_key());
+        let (output, session_path) = service
+            .open_session(session::ALGORITHM, &input)
+            .map_err(classify_session_error)?;
+        let server_public = server_public_key_bytes(&output)?;
+        let session_key = keypair
+            .derive_aes_key(&server_public)
+            .map_err(Error::Session)?;
         Ok(Self {
             connection,
             session_path,
+            session_key,
         })
     }
 
@@ -171,14 +210,19 @@ impl BlockingClient {
         }
 
         let internal = GnomeInternalProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
-        let empty_parameters: &[u8] = &[];
+        let sealed = session::seal(&self.session_key, password).map_err(Error::Session)?;
         let content_type = "text/plain";
         let session: ObjectPath<'_> = self.session_path.as_ref();
         let path: ObjectPath<'_> = collection.path.as_ref();
         internal
             .unlock_with_master_password(
                 &path,
-                (&session, empty_parameters, password, content_type),
+                (
+                    &session,
+                    sealed.iv.as_slice(),
+                    sealed.ciphertext.as_slice(),
+                    content_type,
+                ),
             )
             .map_err(|error| classify_password_error(error, id))?;
         Ok(UnlockOutcome::Unlocked)
@@ -193,15 +237,27 @@ impl BlockingClient {
     ) -> Result<(), Error> {
         let collection = self.collection(id)?;
         let internal = GnomeInternalProxyBlocking::new(&self.connection).map_err(Error::Bus)?;
-        let empty_parameters: &[u8] = &[];
+        let sealed_original =
+            session::seal(&self.session_key, original_password).map_err(Error::Session)?;
+        let sealed_new = session::seal(&self.session_key, new_password).map_err(Error::Session)?;
         let content_type = "text/plain";
         let session: ObjectPath<'_> = self.session_path.as_ref();
         let path: ObjectPath<'_> = collection.path.as_ref();
         internal
             .change_with_master_password(
                 &path,
-                (&session, empty_parameters, original_password, content_type),
-                (&session, empty_parameters, new_password, content_type),
+                (
+                    &session,
+                    sealed_original.iv.as_slice(),
+                    sealed_original.ciphertext.as_slice(),
+                    content_type,
+                ),
+                (
+                    &session,
+                    sealed_new.iv.as_slice(),
+                    sealed_new.ciphertext.as_slice(),
+                    content_type,
+                ),
             )
             .map_err(|error| classify_password_error(error, id))
     }
@@ -241,6 +297,47 @@ impl BlockingClient {
     }
 }
 
+fn classify_session_error(error: zbus::Error) -> Error {
+    let zbus::Error::MethodError(name, _, _) = &error else {
+        return Error::Bus(error);
+    };
+    match classify_error_name(name.as_str()) {
+        RemoteError::ServiceUnavailable => Error::ServiceUnavailable,
+        // gkd_secret_session_handle_open raises G_DBUS_ERROR_NOT_SUPPORTED
+        // for an unknown algorithm. An algorithm-rejecting service gets a
+        // distinct failure; there is deliberately no plain-session fallback
+        // (libsecret falls back here; gmellon does not).
+        RemoteError::EncryptedSessionUnsupported => Error::EncryptedSessionUnsupported,
+        _ => Error::Bus(error),
+    }
+}
+
+/// Decode the daemon's OpenSession reply into its Diffie-Hellman public key
+/// bytes. The reply payload is the `ay` variant the daemon builds for this
+/// algorithm (g_variant_new_fixed_array in gkd-secret-session.c); a
+/// byte-array answer arrives as a u8 array, and anything else is treated as
+/// an unreadable peer key, failing closed.
+fn server_public_key_bytes(output: &OwnedValue) -> Result<Vec<u8>, Error> {
+    let bytes = match &**output {
+        Value::Array(array) => {
+            let mut bytes = Vec::with_capacity(array.len());
+            for element in array.iter() {
+                match element {
+                    Value::U8(byte) => bytes.push(*byte),
+                    _ => return Err(unreadable_peer_key()),
+                }
+            }
+            bytes
+        }
+        _ => return Err(unreadable_peer_key()),
+    };
+    Ok(bytes)
+}
+
+fn unreadable_peer_key() -> Error {
+    Error::Session(CryptoError::PeerPublicKeyLength { length: 0 })
+}
+
 fn classify_password_error(error: zbus::Error, id: &CollectionId) -> Error {
     let zbus::Error::MethodError(name, _, _) = &error else {
         return Error::Bus(error);
@@ -251,7 +348,7 @@ fn classify_password_error(error: zbus::Error, id: &CollectionId) -> Error {
         RemoteError::NoSuchObject => Error::CollectionNotFound { id: id.clone() },
         RemoteError::PrivateInterfaceUnavailable => Error::PrivateInterfaceUnavailable,
         RemoteError::ServiceUnavailable => Error::ServiceUnavailable,
-        RemoteError::Other => Error::Bus(error),
+        RemoteError::EncryptedSessionUnsupported | RemoteError::Other => Error::Bus(error),
     }
 }
 
@@ -272,6 +369,7 @@ enum RemoteError {
     NoSuchObject,
     PrivateInterfaceUnavailable,
     ServiceUnavailable,
+    EncryptedSessionUnsupported,
     Other,
 }
 
@@ -281,6 +379,7 @@ fn classify_error_name(name: &str) -> RemoteError {
         NO_SUCH_OBJECT_ERROR => RemoteError::NoSuchObject,
         UNKNOWN_INTERFACE_ERROR | UNKNOWN_METHOD_ERROR => RemoteError::PrivateInterfaceUnavailable,
         NAME_HAS_NO_OWNER_ERROR | SERVICE_UNKNOWN_ERROR => RemoteError::ServiceUnavailable,
+        NOT_SUPPORTED_ERROR => RemoteError::EncryptedSessionUnsupported,
         _ => RemoteError::Other,
     }
 }
@@ -344,7 +443,45 @@ mod tests {
             classify_error_name(NAME_HAS_NO_OWNER_ERROR),
             RemoteError::ServiceUnavailable
         );
+        assert_eq!(
+            classify_error_name(NOT_SUPPORTED_ERROR),
+            RemoteError::EncryptedSessionUnsupported
+        );
         assert_eq!(classify_error_name("org.example.Other"), RemoteError::Other);
+    }
+
+    #[test]
+    fn open_session_output_decodes_only_byte_arrays() {
+        let bytes = Value::from(vec![0x01u8, 0x02, 0x7f]);
+        let owned = OwnedValue::try_from(bytes).expect("byte array converts");
+        assert_eq!(
+            server_public_key_bytes(&owned).expect("byte array decodes"),
+            vec![0x01, 0x02, 0x7f]
+        );
+
+        for other in [Value::from("not a key"), Value::from(128u32)] {
+            let owned = OwnedValue::try_from(other).expect("value converts");
+            assert!(
+                matches!(
+                    server_public_key_bytes(&owned),
+                    Err(Error::Session(CryptoError::PeerPublicKeyLength {
+                        length: 0
+                    }))
+                ),
+                "non-array OpenSession replies must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn session_error_display_names_the_algorithm_and_refuses_fallback() {
+        let message = Error::EncryptedSessionUnsupported.to_string();
+        assert!(message.contains("does not support encrypted sessions"));
+        assert!(message.contains("dh-ietf1024-sha256-aes128-cbc-pkcs7"));
+        assert!(message.contains("refusing to fall back"));
+
+        let wrapped = Error::Session(CryptoError::Randomness).to_string();
+        assert!(wrapped.starts_with("encrypted Secret Service session failed:"));
     }
 
     #[test]

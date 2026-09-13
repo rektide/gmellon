@@ -182,6 +182,8 @@ fn service_error_exit(error: &ServiceError) -> u8 {
         ServiceError::InvalidCollectionId
         | ServiceError::InvalidCollectionPath { .. }
         | ServiceError::CollectionNotFound { .. }
+        | ServiceError::EncryptedSessionUnsupported
+        | ServiceError::Session(_)
         | ServiceError::Bus(_) => EXIT_ERROR,
     }
 }
@@ -203,6 +205,7 @@ fn render_collections(collections: &[Collection]) -> String {
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
+    use gmellon::secret_service::session::CryptoError;
     use zbus::zvariant::OwnedObjectPath;
 
     use super::*;
@@ -311,6 +314,16 @@ mod tests {
             service_error_exit(&ServiceError::CollectionNotFound {
                 id: CollectionId::new("missing").unwrap()
             }),
+            1
+        );
+        // The encrypted-session failures stay in the unexpected-local-error
+        // family: the documented 0-4 exit table gains no new code.
+        assert_eq!(
+            service_error_exit(&ServiceError::EncryptedSessionUnsupported),
+            1
+        );
+        assert_eq!(
+            service_error_exit(&ServiceError::Session(CryptoError::Randomness)),
             1
         );
     }

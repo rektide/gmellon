@@ -65,9 +65,13 @@ mod tests {
     }
 
     #[test]
-    fn gnome_plain_session_input_is_a_string_variant() {
-        let input = zbus::zvariant::Value::from("");
+    fn dh_session_input_is_a_byte_array_variant() {
+        // gkd_secret_session_handle_open unwraps the outer variant itself
+        // and requires the inner value to have G_VARIANT_TYPE_BYTESTRING
+        // ("ay"), so the client's DH public key must travel as a byte-array
+        // variant, not a string like the plain algorithm used.
+        let input = zbus::zvariant::Value::from(vec![0x02u8, 0x00, 0x7f]);
 
-        assert_eq!(input.value_signature().to_string(), "s");
+        assert_eq!(input.value_signature().to_string(), "ay");
     }
 }
