@@ -5,7 +5,7 @@ description: Current product architecture, validated capabilities, security boun
 resource: /doc/status.md
 tags: [gmellon, gnome-keyring, secret-service, rust, status]
 status: draft
-generated: { by: model:openai/gpt-6, at: 2026-09-13T06:15:00-04:00 }
+generated: { by: model:openai/gpt-6, at: 2026-09-13T15:20:00-04:00 }
 stale_after: 2026-10-13
 sources:
   - id: product-spec
@@ -61,17 +61,28 @@ touching systemctl on load.
 
 ```text
 gmellon list
+gmellon status
 gmellon unlock [COLLECTION]
 gmellon unlock [COLLECTION] --stdin
 gmellon change [COLLECTION]
 gmellon change [COLLECTION] --stdin
+gmellon completions SHELL
+gmellon -v [COMMAND]   # redacted diagnostics on stderr
 ```
 
 - Omitted collection IDs default directly to `login`; there is no configuration
   layer or environment-selected default.
 - `list` renders deterministic `ID`, `LOCKED`, and escaped `LABEL` columns.
+- `status` is a prompt-free health report: service reachability, encrypted
+  session capability, private-interface presence (read-only Introspect probe,
+  never a password method), and a lock summary consistent with `list`. It
+  never prompts, unlocks, or locks.
 - `unlock --stdin` reads one LF/CRLF-terminated UTF-8 line.
 - `change --stdin` reads current, new, and confirmation lines in that order.
+- `-v` installs a stderr-only tracing subscriber emitting operation, result,
+  and length events; scalar fields only, never secret bytes or key material.
+- `completions` writes scripts for zsh, bash, elvish, fish, and powershell;
+  the zimfw module regenerates `functions/_gmellon` automatically.
 - TTY mode uses `rpassword` against the controlling terminal with echo
   disabled.
 - Missing collections are rejected before secret input is read.
@@ -270,14 +281,16 @@ Ordinary development checks currently report:
 
 ```text
 cargo nextest run
-79 passed, 2 skipped
+90 passed, 2 skipped
+cargo nextest run --features login-control
+117 passed, 4 skipped
 ```
 
 The zsh module suite reports independently:
 
 ```text
 zimfw/test.zsh
-49 assertions passed, 0 failed
+68 assertions passed, 0 failed
 ```
 
 The suite uses real AF_UNIX socket fixtures and a recording `systemctl`
@@ -341,21 +354,22 @@ rustdoc.
 
 ## Open work
 
-No release blocker remains open.
+No release blocker remains open. The packaging boundary (`gmell-polish`) is
+complete: status report, redacted `-v` diagnostics, completions (including
+the zimfw module's automatic regeneration), and the help-text pass all
+landed with proof coverage.
 
 ### Product follow-ups
 
-- **`gmell-polish` (P3):** needs rescoping from its obsolete offline-control
-  status language to collection display, redacted diagnostics, completions,
-  and final help.
-- **`gmell-stretch` (P4):** needs rescoping now that zbus is the default and
-  lock/relock is a sensitive explicit operation rather than basic symmetry.
+- **`gmell-stretch` (P4):** explicit `lock` subcommand (standard
+  `Service.Lock`, fail-closed on prompt objects) and the opt-in zsh
+  login-hook documentation pattern.
 - **`gmell-firmament-config` (P4, deferred):** Firmament is under active
   rebuild and no current configuration domain justifies adoption. The fixed
   default remains `login`; explicit collection IDs remain command arguments.
 
-The parent `gmell-unlock-cli` epic now awaits only the agreed polish and
-stretch rescoping items.
+The parent `gmell-unlock-cli` epic's declared boundary — release security
+plus packaging/polish — is complete.
 
 ## Durable decisions
 

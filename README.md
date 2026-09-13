@@ -83,6 +83,16 @@ gmellon change work
 # scripting: current, new, and confirmation lines in that order
 gmellon change work --stdin < /dev/shm/password-change
 
+# prompt-free service health report: capabilities and lock states;
+# never prompts, never unlocks or locks, never calls a password method
+gmellon status
+
+# redacted diagnostics on stderr (operations, results, lengths only)
+gmellon -v unlock work
+
+# shell completions (zsh shown; bash, elvish, fish, powershell also built in)
+gmellon completions zsh > ~/.zfunc/_gmellon
+
 # already-unlocked collections return success without checking the password;
 # ordinary unlock never locks or relocks a collection to verify it
 ```
@@ -227,6 +237,14 @@ preserving any existing value exactly and reporting an unavailable user
 manager without changes.
 
 Tests: `zimfw/test.zsh` (real AF_UNIX fixtures, recording `systemctl` stub).
+
+**Completions:** when a `gmellon` binary is on `PATH`, module load also
+keeps `functions/_gmellon` current — regenerating it from
+`gmellon completions zsh` whenever the binary is newer than the file
+(the zimfw convention: the module's `functions/` directory is on `fpath`
+automatically). Without a `gmellon` binary the module skips this silently;
+the SSH environment work is unaffected. Loading still never prompts and
+never invokes `systemctl`.
 Details: [`zimfw/README.md`](/zimfw/README.md).
 
 ## Development (readme-driven)
