@@ -48,13 +48,19 @@ are summarized in [`doc/status.md`](/doc/status.md).
 ### Backend policy
 
 The collection-oriented zbus client is the default product backend. The proven
-login control socket will remain available through the planned Cargo feature
-`login-control`, disabled by default (`gmell-login-control-feature`). That
-backend will be named `LoginControlClient` and expose login-specific methods;
-it will never be an automatic fallback. Its inability to address other
-collections or distinguish an already-unlocked keyring, plus its create-on-
-missing UNLOCK/CHANGE behavior, must remain visible at its API and any explicit
-CLI selection point.
+login control socket is available through the `login-control` Cargo feature,
+disabled by default. Enabling it (for example
+`cargo build --features login-control`, or by adding the feature to the
+`gmellon` dependency) exposes the library-only
+`gmellon::control::LoginControlClient` with `unlock_login` and
+`change_login_password`; no CLI command selects it, and there is no fallback
+path — the control backend is never used automatically or silently.
+
+Its honest limits stay visible at the API: it can address only the special
+`login` collection; UNLOCK and CHANGE can create a missing login keyring
+encrypted with the supplied password; and an OK result cannot distinguish an
+already-unlocked keyring from a newly unlocked one. It is retained machinery
+with different semantics, not an alternative default backend.
 
 ## Usage (spec)
 
@@ -110,8 +116,9 @@ the TTY prompt fails with an actionable error suggesting `--stdin`.
 ## Historical login-only control protocol
 
 The first implementation used GNOME Keyring's private control socket. It is
-retained as tested machinery and will be packaged behind the optional
-`login-control` Rust feature. It can address only the special `login`
+retained as tested machinery behind the optional, disabled-by-default
+`login-control` Rust feature — library-only, with no CLI selection path (see
+[Backend policy](#backend-policy)). It can address only the special `login`
 collection and is not the default collection-oriented product backend.
 
 Transport: `AF_UNIX` `SOCK_STREAM` at `<control-dir>/control`,
@@ -206,7 +213,8 @@ wire format is locked by test before any socket is opened.
 
 ### Stage 1.5 — login control transport (optional-backend foundation)
 `control::sans_io` exposes the pure codec for alternate adapters. The
-Linux-only `SyncClient` opens one connection per operation, validates the
+Linux-only `LoginControlClient` (feature `login-control`, disabled by
+default) opens one connection per operation, validates the
 socket metadata and connected peer UID, writes the credential NUL and
 zeroizing frame, and reads the response under an absolute deadline. Unix
 validation accepts `Metadata` and `AsFd` rather than depending directly on the

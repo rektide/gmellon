@@ -5,7 +5,7 @@ description: Current product architecture, validated capabilities, security boun
 resource: /doc/status.md
 tags: [gmellon, gnome-keyring, secret-service, rust, status]
 status: draft
-generated: { by: model:openai/gpt-6, at: 2026-09-13T05:42:00-04:00 }
+generated: { by: model:openai/gpt-6, at: 2026-09-13T05:55:00-04:00 }
 stale_after: 2026-10-13
 sources:
   - id: product-spec
@@ -47,6 +47,8 @@ against a manually launched `gnome-keyring-daemon` on a private
 `dbus-broker`. Tests use an exact `login` collection plus a second collection
 with a distinct password. The integration harness epic and the `list`,
 `unlock`, `change`, and encrypted-session implementation tickets are closed.
+The historical login-only control backend is retained as library-only
+machinery behind the disabled-by-default `login-control` Cargo feature.
 
 The code remains an MVP in polish terms — no configuration layer, no
 completions, diagnostics are `eprintln`-based — but no release blocker
@@ -114,7 +116,7 @@ flowchart LR
 | Secret input | [`/src/secret_input/mod.rs`](/src/secret_input/mod.rs) | rpassword TTY prompts, bounded stdin records, confirmation, and zeroizing ownership |
 | Session crypto core | [`/src/secret_service/session.rs`](/src/secret_service/session.rs) | sans-I/O encrypted-session cryptography: DH keypair, peer-key validation, HKDF-SHA256 key derivation, AES-128-CBC/PKCS#7 sealing, zeroized key material |
 | Collection client | [`/src/secret_service/`](/src/secret_service/) | encrypted-session negotiation, collection IDs/metadata, generated zbus proxies, list/unlock/change, and remote-error classification |
-| Historical control backend | [`/src/control/`](/src/control/) | login-only sans-I/O codec, peer validation, and synchronous control-socket exchange |
+| Historical control backend | [`/src/control/`](/src/control/) | login-only sans-I/O codec, peer validation, and synchronous control-socket exchange behind the disabled-by-default `login-control` feature |
 | Executable harness | [`/dev/harness/`](/dev/harness/) | control-only and private-broker daemon lifecycles, checks, cleanup, and retained evidence |
 | Rust proofs | [`/tests/harness/`](/tests/harness/) | opt-in real-daemon transport, collection, binary CLI, encrypted-session wire, and redaction proofs |
 
@@ -129,14 +131,15 @@ blocking I/O.
 | Backend | Status | Scope | Selection policy |
 | --- | --- | --- | --- |
 | GNOME private D-Bus collection backend | Implemented; default | Any collection exposed by `gnome-keyring-daemon` | Always used by the current CLI |
-| Login control socket | Implemented but not yet feature-gated | Special `login` collection only | Planned disabled-by-default `login-control` Cargo feature; never automatic fallback |
+| Login control socket | Implemented; feature-gated behind `login-control`, disabled by default, library-only | Special `login` collection only | Opt-in Cargo feature; never automatic fallback |
 
 The login control path has materially different semantics: UNLOCK and CHANGE
 can create a missing login keyring, and an OK response cannot distinguish a
 new unlock from an already-unlocked keyring. `gmell-login-control-feature`
-tracks honest naming (`LoginControlClient`, `unlock_login`,
-`change_login_password`), feature-gated dependencies/tests, and explicit CLI
-selection if CLI access is retained.
+delivered the honest packaging: `LoginControlClient` with `unlock_login` and
+`change_login_password`, `LoginControlError`, feature-gated dependencies and
+tests, and no CLI surface — there is no backend-selection flag and no fallback
+code, so "never automatic fallback" holds structurally.
 
 ## Implemented and validated behavior
 
@@ -263,6 +266,17 @@ Ordinary development checks currently report:
 
 ```text
 cargo nextest run
+79 passed, 2 skipped
+```
+
+The login control backend is omitted entirely from default builds (its
+unit tests and the `real_daemon` target compile only with the feature), so
+the default baseline dropped from the earlier 106 passed / 4 skipped; the
+two remaining skips are the private-broker proofs. The full historical set
+returns with the feature:
+
+```text
+cargo nextest run --features login-control
 106 passed, 4 skipped
 ```
 
@@ -271,7 +285,7 @@ passes. Maintained entry points fail with status 125 when their hard
 prerequisites are absent:
 
 ```sh
-dev/harness/check rust-nextest # control backend against real daemon
+dev/harness/check rust-nextest # control backend against real daemon (passes --features login-control)
 dev/harness/check rust-broker  # collection BlockingClient proof, encrypted-session wire evidence
 dev/harness/check rust-cli     # compiled list/unlock/change proof, encrypted-session wire evidence
 dev/harness/check broker       # private-broker lifecycle/interface suite
@@ -314,8 +328,6 @@ No release blocker remains open.
 
 ### Product follow-ups
 
-- **`gmell-login-control-feature` (P3):** package the login-only control
-  backend as an honest disabled-by-default Rust feature; no automatic fallback.
 - **`gmell-polish` (P3):** needs rescoping from its obsolete offline-control
   status language to collection display, redacted diagnostics, completions,
   and final help.
@@ -327,8 +339,8 @@ No release blocker remains open.
   rebuild and no current configuration domain justifies adoption. The fixed
   default remains `login`; explicit collection IDs remain command arguments.
 
-The parent `gmell-unlock-cli` epic now awaits only the agreed packaging and
-polish boundary items.
+The parent `gmell-unlock-cli` epic now awaits only the agreed polish boundary
+items.
 
 ## Durable decisions
 
