@@ -12,3 +12,6 @@
 # Python harness probes
 __pycache__/
 *.py[cod]
+
+# agent scratch
+.test-agent/
