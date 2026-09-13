@@ -1,7 +1,11 @@
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 pub(super) const SERVICE_NAME: &str = "org.freedesktop.secrets";
+pub(super) const SERVICE_OBJECT_PATH: &str = "/org/freedesktop/secrets";
 pub(super) const COLLECTION_PATH_PREFIX: &str = "/org/freedesktop/secrets/collection/";
+/// GNOME Keyring's deliberately undocumented private password interface.
+pub(super) const INTERNAL_INTERFACE_NAME: &str =
+    "org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface";
 
 pub(super) type Secret<'a> = (&'a ObjectPath<'a>, &'a [u8], &'a [u8], &'a str);
 

@@ -5,8 +5,8 @@ use zbus::blocking::Connection;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use super::proxies::{
-    COLLECTION_PATH_PREFIX, GnomeInternalProxyBlocking, SERVICE_NAME,
-    SecretCollectionProxyBlocking, SecretServiceProxyBlocking,
+    COLLECTION_PATH_PREFIX, GnomeInternalProxyBlocking, INTERNAL_INTERFACE_NAME, SERVICE_NAME,
+    SERVICE_OBJECT_PATH, SecretCollectionProxyBlocking, SecretServiceProxyBlocking,
 };
 use super::session::{self, ClientKeypair, CryptoError, SessionKey};
 
@@ -71,6 +71,23 @@ pub enum UnlockOutcome {
     Unlocked,
     /// The collection was already unlocked; the password was not checked.
     AlreadyUnlocked,
+}
+
+/// Outcome of the read-only probe for GNOME Keyring's private password
+/// interface.
+///
+/// The probe never calls a password method: it issues one standard
+/// `org.freedesktop.DBus.Introspectable.Introspect` request on the service
+/// object — read-only and side-effect-free, answered automatically by GDBus
+/// objects — and searches the returned XML for the interface name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterfaceProbe {
+    /// The service object's introspection XML names the private interface.
+    Available,
+    /// The service answered introspection without naming the interface.
+    Unavailable,
+    /// Introspection itself failed; presence is unknown, not an error.
+    Unknown,
 }
 
 /// A collection discovery or password-operation failure.
@@ -199,6 +216,37 @@ impl BlockingClient {
     /// Resolve one collection by its stable ID.
     pub fn collection(&self, id: &CollectionId) -> Result<Collection, Error> {
         self.inspect_collection(self.find_path(id)?)
+    }
+
+    /// Probe whether the service exposes GNOME Keyring's private password
+    /// interface, without ever calling a password method.
+    ///
+    /// One standard `Introspect` request on `/org/freedesktop/secrets`
+    /// decides it: GDBus daemons answer with the XML of every interface
+    /// registered on the object, so the interface name is either present
+    /// ([`InterfaceProbe::Available`]) or absent
+    /// ([`InterfaceProbe::Unavailable`]). A service that does not answer
+    /// introspection — or any transport failure — reports
+    /// [`InterfaceProbe::Unknown`] rather than an error: `status` may still
+    /// report everything else.
+    pub fn private_interface_probe(&self) -> InterfaceProbe {
+        use zbus::blocking::fdo::IntrospectableProxy;
+
+        let builder = IntrospectableProxy::builder(&self.connection);
+        let Ok(builder) = builder.destination(SERVICE_NAME) else {
+            return InterfaceProbe::Unknown;
+        };
+        let Ok(builder) = builder.path(SERVICE_OBJECT_PATH) else {
+            return InterfaceProbe::Unknown;
+        };
+        let Ok(proxy) = builder.build() else {
+            return InterfaceProbe::Unknown;
+        };
+        match proxy.introspect() {
+            Ok(xml) if xml.contains(INTERNAL_INTERFACE_NAME) => InterfaceProbe::Available,
+            Ok(_) => InterfaceProbe::Unavailable,
+            Err(_) => InterfaceProbe::Unknown,
+        }
     }
 
     /// Unlock a selected collection. Already-unlocked collections are never
@@ -489,5 +537,13 @@ mod tests {
     fn service_constants_match_the_upstream_object() {
         assert_eq!(SERVICE_NAME, "org.freedesktop.secrets");
         assert!(ObjectPath::try_from("/org/freedesktop/secrets").is_ok());
+        assert_eq!(
+            SERVICE_OBJECT_PATH, "/org/freedesktop/secrets",
+            "the probe must introspect the object the private interface lives on"
+        );
+        assert_eq!(
+            INTERNAL_INTERFACE_NAME,
+            "org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface"
+        );
     }
 }
