@@ -408,6 +408,104 @@ fn run_proof(secrets: &ProofSecrets) {
         "second after already-unlocked path",
     );
 
+    // --- `gmellon lock`: explicit, prompt-free state change ----------------
+    // Entering this section both collections are unlocked (second still on
+    // its original password; rotations come later). The lock invocations
+    // never touch a password method, and the exact password-method counts
+    // at the wire-evidence stage prove that. Two CLI Lock calls are made in
+    // total (the flip and the rotation relock); the idempotent re-lock and
+    // the missing-ID rejection must add none.
+    let lock_missing = run_gmellon(
+        &["lock", MISSING_ID],
+        CliStdin::FailIfRead,
+        secrets,
+        "lock a missing collection",
+    );
+    assert_eq!(
+        exit_code(&lock_missing),
+        Some(1),
+        "lock of a missing collection must exit 1"
+    );
+    let lock_missing_stderr = String::from_utf8_lossy(&lock_missing.stderr);
+    assert!(
+        lock_missing_stderr.contains("collection ID does not exist"),
+        "lock of a missing collection must be reported actionably on stderr"
+    );
+    assert!(
+        lock_missing_stderr.contains(MISSING_ID),
+        "the missing-collection lock diagnostic must name the requested ID"
+    );
+
+    // The flip: locking the unlocked second collection changes its state.
+    let locked_second = run_gmellon(
+        &["lock", &second_id],
+        CliStdin::FailIfRead,
+        secrets,
+        "lock the unlocked second collection",
+    );
+    assert_eq!(
+        exit_code(&locked_second),
+        Some(0),
+        "locking an unlocked collection must exit 0"
+    );
+    assert!(
+        String::from_utf8_lossy(&locked_second.stdout)
+            .contains(&format!("locked collection {second_id}")),
+        "a successful lock must name the collection"
+    );
+    assert_listed_locked(secrets, &second_id, true, "second after CLI lock");
+    // The sibling is untouched: login stays unlocked.
+    assert_listed_locked(secrets, LOGIN_LABEL, false, "login after second's CLI lock");
+
+    // Idempotent: an already-locked collection is a no-op success that must
+    // make no Lock call (the exact lock-count assertion below enforces it).
+    let locked_again = run_gmellon(
+        &["lock", &second_id],
+        CliStdin::FailIfRead,
+        secrets,
+        "lock the already-locked second collection",
+    );
+    assert_eq!(
+        exit_code(&locked_again),
+        Some(0),
+        "locking an already-locked collection must exit 0"
+    );
+    assert!(
+        String::from_utf8_lossy(&locked_again.stdout).contains("already locked"),
+        "the already-locked lock must say so"
+    );
+    assert_listed_locked(secrets, &second_id, true, "second after idempotent lock");
+
+    // Rotation: unlock → lock → unlock, ending unlocked as the change
+    // section expects. The wrong password never appears; the original
+    // second password is still current (rotations come later).
+    let rotated_unlock = run_gmellon(
+        &["unlock", &second_id, "--stdin"],
+        CliStdin::Password(password_line(&secrets.second)),
+        secrets,
+        "unlock second inside the lock rotation",
+    );
+    assert_eq!(
+        exit_code(&rotated_unlock),
+        Some(0),
+        "the rotation unlock must succeed with the original password"
+    );
+    let rotated_lock = run_gmellon(
+        &["lock", &second_id],
+        CliStdin::FailIfRead,
+        secrets,
+        "relock second inside the lock rotation",
+    );
+    assert_eq!(exit_code(&rotated_lock), Some(0));
+    let rotated_second_unlock = run_gmellon(
+        &["unlock", &second_id, "--stdin"],
+        CliStdin::Password(password_line(&secrets.second)),
+        secrets,
+        "unlock second to close the lock rotation",
+    );
+    assert_eq!(exit_code(&rotated_second_unlock), Some(0));
+    assert_listed_locked(secrets, &second_id, false, "second after the lock rotation");
+
     // --- missing collection: actionable exit 1 before any password use ----
     let missing = run_gmellon(
         &["unlock", MISSING_ID, "--stdin"],
@@ -719,7 +817,13 @@ fn run_proof(secrets: &ProofSecrets) {
         );
     }
 
-    // --- wire evidence: no CLI path locked or relocked anything -----------
+    // --- wire evidence: the only Lock calls are deliberate -----------------
+    // The fixture's setup locks plus exactly the two legitimate CLI lock
+    // calls (the initial flip and the rotation relock). The idempotent
+    // re-lock and the missing-ID rejection must reach the daemon not at
+    // all — exact counts prove it. Every non-fixture Lock call must come
+    // from a CLI connection, and the fixture's count must match its own
+    // tally exactly.
     let observed = monitor.finish(&fixture_sender, fixture.lock_calls(), secrets);
     assert!(
         observed.calls >= 1,
@@ -727,12 +831,23 @@ fn run_proof(secrets: &ProofSecrets) {
     );
     assert_eq!(
         observed.calls,
+        fixture.lock_calls() + 2,
+        "observed Service.Lock calls must equal the fixture's deliberate calls plus \
+         exactly the two legitimate CLI locks (flip and rotation relock)"
+    );
+    assert_eq!(
+        observed.fixture_calls,
         fixture.lock_calls(),
-        "observed Service.Lock calls must equal the fixture's deliberate calls"
+        "the fixture's Lock tally must match its deliberate calls exactly"
+    );
+    assert_eq!(
+        observed.senders.len() - observed.fixture_calls,
+        2,
+        "exactly two Lock calls must come from CLI connections"
     );
     assert!(
-        observed.senders_match_fixture,
-        "every observed Service.Lock call must come from the fixture connection"
+        !observed.senders_match_fixture,
+        "with legitimate CLI locks, not every Lock sender is the fixture"
     );
 
     // --- wire evidence: exactly the legitimate private change calls --------
@@ -774,8 +889,9 @@ fn run_proof(secrets: &ProofSecrets) {
     );
     assert_eq!(
         bodies.messages_of("UnlockWithMasterPassword").len(),
-        11,
-        "exactly the eleven binary unlock calls that reached the daemon must be captured"
+        13,
+        "exactly the thirteen binary unlock calls that reached the daemon must be captured \
+         (eleven prior plus the two lock-rotation unlocks); lock invocations never appear here"
     );
     let observed_change_bodies = bodies.messages_of("ChangeWithMasterPassword").len();
     assert_eq!(
