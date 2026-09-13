@@ -190,10 +190,108 @@ fn run_proof(secrets: &ProofSecrets) {
         "gmellon list did not present the second collection before login in ID order"
     );
 
+    // --- `gmellon status`: prompt-free capability and lock report ---------
+    // Both collections are locked here, so the summary is fully determined.
+    // stdin is /dev/null (FailIfRead): a successful status proves no secret
+    // was read. The exact password-method counts asserted at the wire
+    // evidence stage are unchanged by these invocations, proving status made
+    // zero password-method calls.
+    let status = run_gmellon(
+        &["status"],
+        CliStdin::FailIfRead,
+        secrets,
+        "status with both collections locked",
+    );
+    assert_eq!(
+        exit_code(&status),
+        Some(0),
+        "status must exit 0 on a healthy service"
+    );
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_text.contains("secret service: org.freedesktop.secrets (reachable)"),
+        "status must report the reachable service: {status_text}"
+    );
+    assert!(
+        status_text.contains("encrypted session: negotiated (dh-ietf1024-sha256-aes128-cbc-pkcs7)"),
+        "status must report the negotiated encrypted session: {status_text}"
+    );
+    assert!(
+        status_text.contains("private password interface: available"),
+        "status must report the private password interface: {status_text}"
+    );
+    // The summary must agree with `list` exactly: the daemon also exposes
+    // its ephemeral `session` collection here, so the counts are derived
+    // from the parsed rows rather than hardcoded.
+    let total = rows.len();
+    let locked_count = rows.iter().filter(|row| row.locked).count();
+    assert!(
+        status_text.contains(&format!(
+            "collections: {total} total, {locked_count} locked"
+        )),
+        "status lock summary must agree with list ({total} rows, {locked_count} locked): {status_text}"
+    );
+    for row in &rows {
+        let state = if row.locked { "locked" } else { "unlocked" };
+        let Some(line) = status_text
+            .lines()
+            .find(|line| line.starts_with("  ") && line.trim_start().starts_with(row.id.as_str()))
+        else {
+            panic!(
+                "status must carry a per-collection line for {}: {status_text}",
+                row.id
+            )
+        };
+        assert!(
+            line.ends_with(state),
+            "status lock line for {} must end with its state: {line}",
+            row.id
+        );
+    }
+    assert!(
+        status.stderr.is_empty(),
+        "plain status must stay quiet on stderr"
+    );
+
+    // `-v` variants: stdout must be byte-identical to the plain run (the
+    // subscriber writes to stderr only) while stderr positively carries the
+    // operation events — a silent `-v` fails. The finish-stage stream scan
+    // proves those events never contain secret bytes in any form.
+    let status_verbose = run_gmellon(
+        &["-v", "status"],
+        CliStdin::FailIfRead,
+        secrets,
+        "status verbose with both collections locked",
+    );
+    assert_eq!(exit_code(&status_verbose), Some(0), "-v status must exit 0");
+    assert_eq!(
+        status_verbose.stdout, status.stdout,
+        "-v must not alter status stdout"
+    );
+    let status_verbose_stderr = String::from_utf8_lossy(&status_verbose.stderr);
+    assert!(
+        status_verbose_stderr.contains("private password interface probed"),
+        "-v status must emit the capability probe event: {status_verbose_stderr}"
+    );
+
+    let list_verbose = run_gmellon(
+        &["-v", "list"],
+        CliStdin::FailIfRead,
+        secrets,
+        "list verbose while both collections are locked",
+    );
+    assert_eq!(exit_code(&list_verbose), Some(0));
+    assert_eq!(
+        list_verbose.stdout, first.stdout,
+        "-v must not alter list stdout"
+    );
+
     // --- explicit unlock of the locked second collection ------------------
-    // A wrong password is denied with exit 2 and leaves it locked.
+    // A wrong password is denied with exit 2 and leaves it locked. This run
+    // carries `-v`: its stderr must positively classify the denial while the
+    // stream scan proves the diagnostic events carry no secret bytes.
     let denied = run_gmellon(
-        &["unlock", &second_id, "--stdin"],
+        &["-v", "unlock", &second_id, "--stdin"],
         CliStdin::Password(password_line(&secrets.wrong)),
         secrets,
         "unlock second with the wrong password",
@@ -207,6 +305,11 @@ fn run_proof(secrets: &ProofSecrets) {
     assert!(
         String::from_utf8_lossy(&denied.stderr).contains("denied"),
         "denied unlock must explain the denial on stderr"
+    );
+    let denied_stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        denied_stderr.contains("unlock outcome") && denied_stderr.contains("Denied"),
+        "-v must positively classify the denial as an outcome event: {denied_stderr}"
     );
     assert_listed_locked(secrets, &second_id, true, "second after wrong password");
 
@@ -384,12 +487,13 @@ fn run_proof(secrets: &ProofSecrets) {
 
     // Wrong current password with matching new+confirmation: the daemon is
     // asked (one private call) and denies; exit 2 with the old password
-    // still valid.
+    // still valid. This run carries `-v` so a change with two live secrets
+    // transits the diagnostics path under the stream scan.
     fixture
         .lock(&second_path)
         .expect("fixture Lock second before denied change");
     let denied_change = run_gmellon(
-        &["change", &second_id, "--stdin"],
+        &["-v", "change", &second_id, "--stdin"],
         CliStdin::Lines(change_stdin([
             secrets.wrong.as_slice(),
             secrets.second_two.as_slice(),
@@ -403,9 +507,14 @@ fn run_proof(secrets: &ProofSecrets) {
         Some(2),
         "wrong current password must exit 2"
     );
+    let denied_change_stderr = String::from_utf8_lossy(&denied_change.stderr);
     assert!(
-        String::from_utf8_lossy(&denied_change.stderr).contains("denied"),
+        denied_change_stderr.contains("denied"),
         "the denied change must explain the denial on stderr"
+    );
+    assert!(
+        denied_change_stderr.contains("change outcome") && denied_change_stderr.contains("Denied"),
+        "-v must positively classify the denied change as an outcome event: {denied_change_stderr}"
     );
     assert_listed_locked(secrets, &second_id, true, "second after denied change");
     let old_after_denial = run_gmellon(
