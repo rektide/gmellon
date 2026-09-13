@@ -3,9 +3,10 @@
 > *mellon* — "speak, friend, and enter."
 
 `gmellon` is a small Rust CLI that speaks GNOME Keyring's private D-Bus
-password interface, so you can **list, unlock, and re-key any GNOME keyring
-collection from a shell** — no GUI, no PAM, and no display server. A
-`gnome-keyring-daemon` Secret Service must be available on the session bus.
+password interface, so you can **list, unlock, lock, and re-key any GNOME
+keyring collection from a shell** — no GUI, no PAM, and no display server.
+A `gnome-keyring-daemon` Secret Service must be available on the session
+bus.
 
 It exists because every other door is shut on a headless, SSH-only machine:
 
@@ -45,11 +46,177 @@ message body for the generated passwords and finds only ciphertext
 Current implementation, verification, security boundaries, and remaining work
 are summarized in [`doc/status.md`](/doc/status.md).
 
+## Install
+
+From a checkout:
+
+```sh
+cargo install --path /path/to/gmellon
+```
+
+The default build is the complete CLI. The historical login control-socket
+backend is **not** included by default; see
+[Backend policy](#backend-policy) for `--features login-control`.
+
+A crates.io release is pending an operator decision — the release blocker
+(encrypted transport) and the packaging boundary are both closed, so
+publishing is unblocked.
+
+## Usage
+
+```
+# list stable collection IDs, mutable labels, and lock state
+gmellon list
+
+# prompt-free service health report: capabilities and lock states;
+# never prompts, never unlocks or locks, never calls a password method
+gmellon status
+
+# unlock the login collection; password prompted on the TTY, no echo
+gmellon unlock
+
+# unlock another collection by stable ID
+gmellon unlock work
+
+# scripting: read a single line (sans newline) from stdin
+gmellon unlock work --stdin < /dev/shm/pw
+
+# rotate a collection password (prompts for current + new + confirm)
+gmellon change work
+
+# scripting: current, new, and confirmation lines in that order
+gmellon change work --stdin < /dev/shm/password-change
+
+# lock a collection — an explicit state change, prompt-free
+gmellon lock work
+
+# redacted diagnostics on stderr (operations, results, lengths only)
+gmellon -v unlock work
+
+# shell completions (zsh shown; bash, elvish, fish, powershell also built in)
+gmellon completions zsh > ~/.zfunc/_gmellon
+
+# already-unlocked collections return success without checking the password;
+# already-locked collections return success without a Lock call;
+# ordinary unlock never locks or relocks a collection to verify one
+```
+
+Omitted collection IDs default directly to `login`; there is no
+configuration layer or environment-selected default.
+
+**Password policy:** passwords are accepted only from the TTY (default) or a
+single line on stdin (`--stdin`). They are never accepted as argv or flags —
+argv is world-readable in `ps`. Password values and password-bearing request
+buffers use best-effort zeroization when dropped; command paths drop them
+promptly after each exchange. This cannot erase copies abandoned by dependency
+internals or allocator behavior.
+
+**`--stdin` contract:** exactly one line, terminated by LF or CRLF — input
+ending without a newline is an error (an empty pipe included; an empty line is
+a valid empty password). Input must be valid UTF-8 — invalid bytes error
+rather than being replaced. Every byte before the terminator is literal
+password content: no line editing is applied, so backspace and control bytes
+from a pipe are data, not commands. Input is capped at 64 KiB. With no
+controlling terminal the TTY prompt fails with an actionable error suggesting
+`--stdin`.
+
+### Exit codes
+
+| code | meaning |
+|---|---|
+| 0 | OK — including already-unlocked and already-locked no-ops |
+| 1 | usage, input, missing collection, encrypted-session failure, or unexpected local/D-Bus error |
+| 2 | DENIED — wrong password |
+| 3 | GNOME's private password interface is unavailable |
+| 4 | session bus or GNOME Secret Service is unavailable |
+
+The exit table is a contract; new failure modes fold into the existing codes
+(for example, both encrypted-session failures and a lock that would demand an
+interactive prompt exit 1 with distinct messages).
+
+## Security model
+
+- **Encrypted transport, always.** Every connection negotiates the standard
+  `dh-ietf1024-sha256-aes128-cbc-pkcs7` Secret Service session with a fresh
+  per-connection DH keypair; every password is sealed under a fresh random
+  IV. No plain session is ever negotiated, silently or otherwise. The
+  protocol's group (RFC 2409 1024-bit MODP) and cipher mode (CBC, not an
+  AEAD) are dated; they are what the spec offers, mitigated by fresh
+  exponents, per-secret IVs, and gmellon's strict peer-key validation —
+  which the daemon itself lacks.
+- **Secrets enter through one narrow door.** TTY (echo disabled) or one
+  bounded stdin line. Never argv, environment, config, or retained
+  artifacts. Secret types expose only borrowed bytes and implement none of
+  `Debug`, `Clone`, or `Display`.
+- **No side effects you didn't ask for.** Unlock never locks or relocks to
+  verify a password. Lock is its own explicit command. Status never calls a
+  password method. Loading the zsh module never prompts and never runs
+  `systemctl`.
+- **Fail closed.** An algorithm-rejecting service, a demanded prompt object,
+  an out-of-range peer key, malformed monitor output — each fails with a
+  clear error rather than degrading.
+- **Best-effort memory hygiene, honestly stated.** Zeroized exponents,
+  keys, IVs, padded buffers, and frames; but zbus, the broker, the daemon,
+  and the allocator hold copies gmellon cannot erase. Bus components
+  legitimately see ciphertext and metadata (paths, lengths, algorithm).
+
+## Architecture
+
+```mermaid
+flowchart LR
+    User["CLI invocation"] --> Cli["src/cli<br/>clap parsing, exit mapping,<br/>tracing diagnostics"]
+    Cli --> Input["src/secret_input<br/>rpassword TTY prompt<br/>bounded stdin reader"]
+    Input --> Secret["zeroizing Secret"]
+    Cli --> Client["secret_service::BlockingClient"]
+
+    subgraph SessionCore["src/secret_service/session.rs — sans-I/O crypto core"]
+        DH["fresh DH keypair<br/>(RFC 2409 1024-bit, g=2)"] --> Derive["peer-key validation,<br/>modpow, 128-byte pad,<br/>HKDF-SHA256 → AES-128 key"]
+        Derive --> Seal["AES-128-CBC / PKCS#7 seal<br/>fresh IV per secret"]
+    end
+
+    Client -->|"OpenSession negotiation"| SessionCore
+    Client --> StdProxy["standard Secret Service API<br/>collections, labels, lock state, Lock"]
+    Client --> PrivProxy["GNOME private interface<br/>password methods"]
+    StdProxy --> Daemon["gnome-keyring-daemon<br/>on the session bus"]
+    PrivProxy --> Daemon
+```
+
+The design rule that shapes it: **I/O and cryptography never mix**. The
+session core in [`src/secret_service/session.rs`](/src/secret_service/session.rs)
+is pure computation over byte slices — no zbus types — so the blocking
+client and a future Tokio adapter share it verbatim, and every constant and
+derivation step is pinned by known-answer tests (including the
+prime-length shared-secret normalization that silently breaks naive
+implementations).
+
+| Area | Path | Responsibility |
+| --- | --- | --- |
+| CLI | [`/src/cli/mod.rs`](/src/cli/mod.rs) | clap parsing, subcommand dispatch, redacted `-v` tracing, exit mapping |
+| Secret input | [`/src/secret_input/mod.rs`](/src/secret_input/mod.rs) | rpassword TTY prompts, bounded stdin records, confirmation, zeroizing ownership |
+| Session crypto core | [`/src/secret_service/session.rs`](/src/secret_service/session.rs) | DH keypair, peer-key validation, HKDF-SHA256 derivation, AES-CBC sealing — sans I/O |
+| Collection client | [`/src/secret_service/`](/src/secret_service/) | encrypted-session negotiation, collection IDs/metadata, generated zbus proxies, list/status/unlock/lock/change, error classification |
+| Historical control backend | [`/src/control/`](/src/control/) | login-only control-socket codec and client, behind `login-control` (off by default) |
+| Executable harness | [`/dev/harness/`](/dev/harness/) | private dbus-broker + daemon lifecycles, checks, teardown, retained evidence |
+| Rust proofs | [`/tests/harness/`](/tests/harness/) | real-daemon transport, collection, binary CLI, wire-monitor, and redaction proofs |
+| Zsh module | [`/zimfw/`](/zimfw/) | SSH agent socket selection, completions regeneration — never prompts |
+
+### Durable decisions
+
+- Collections are addressed by stable D-Bus ID, with `login` as the fixed
+  omitted-argument default.
+- No configuration layer for a single default value.
+- Passwords never enter argv, environment, config, or retained evidence.
+- Ordinary unlock never locks or relocks; lock is always explicit.
+- Never a silent fallback: not to a plain session, not to the create-capable
+  control backend.
+- Sync product APIs today; the sans-I/O crypto core and generated async
+  zbus proxies keep a Tokio sibling cheap when one is wanted.
+
 ### Backend policy
 
-The collection-oriented zbus client is the default product backend. The proven
-login control socket is available through the `login-control` Cargo feature,
-disabled by default. Enabling it (for example
+The collection-oriented zbus client is the default product backend. The
+proven login control socket is available through the `login-control` Cargo
+feature, disabled by default. Enabling it (for example
 `cargo build --features login-control`, or by adding the feature to the
 `gmellon` dependency) exposes the library-only
 `gmellon::control::LoginControlClient` with `unlock_login` and
@@ -62,83 +229,153 @@ encrypted with the supplied password; and an OK result cannot distinguish an
 already-unlocked keyring from a newly unlocked one. It is retained machinery
 with different semantics, not an alternative default backend.
 
-## Usage (spec)
+## Zsh integration (zimfw module)
 
-```
-# list stable collection IDs, mutable labels, and lock state
-gmellon list
+The [`zimfw/`](/zimfw) directory is a self-contained zsh module that exports
+a validated `SSH_AUTH_SOCK` in the loading shell. It is shell-local and
+idempotent: **loading it never prompts for a password, never locks or
+unlocks anything, and never invokes `systemctl`** — environment setup stays
+fully separate from unlocking.
 
-# unlock the login collection; password prompted on the TTY, no echo
-gmellon unlock
+Add one line to `~/.zimrc`:
 
-# unlock another collection by stable ID
-gmellon unlock work
-
-# scripting: read a single line (sans newline) from stdin
-gmellon unlock work --stdin < /dev/shm/pw
-
-# rotate a collection password (prompts for old + new + confirm)
-gmellon change work
-
-# scripting: current, new, and confirmation lines in that order
-gmellon change work --stdin < /dev/shm/password-change
-
-# prompt-free service health report: capabilities and lock states;
-# never prompts, never unlocks or locks, never calls a password method
-gmellon status
-
-# redacted diagnostics on stderr (operations, results, lengths only)
-gmellon -v unlock work
-
-# shell completions (zsh shown; bash, elvish, fish, powershell also built in)
-gmellon completions zsh > ~/.zfunc/_gmellon
-
-# already-unlocked collections return success without checking the password;
-# ordinary unlock never locks or relocks a collection to verify it
+```zsh
+zmodule rektide/gmellon --root zimfw
+# or, for a local checkout zimfw should never install or update:
+zmodule /path/to/gmellon/zimfw
 ```
 
-**Password policy:** passwords are accepted only from the TTY (default) or a
-single line on stdin (`--stdin`). They are never accepted as argv or flags —
-argv is world-readable in `ps`. Password values and password-bearing request
-buffers use best-effort zeroization when dropped; command paths drop them
-promptly after each exchange. This cannot erase copies abandoned by dependency
-internals or allocator behavior.
+The module's init file is `init.zsh`, zimfw's default discovery name, so no
+`--source` is needed in either form.
 
-**`--stdin` contract:** exactly one line, terminated by LF or CRLF — input
-ending without a newline is an error (an empty pipe included; an empty line is
-a valid empty password). Input must be valid UTF-8 — invalid bytes error
-rather than being replaced (the control protocol itself stays byte
-transparent). Every byte before the terminator is literal password content:
-no line editing is applied, so backspace and control bytes from a pipe are
-data, not commands. Input is capped at 64 KiB. With no controlling terminal
-the TTY prompt fails with an actionable error suggesting `--stdin`.
+Selection priority: an explicit `GMELLON_SSH_AUTH_SOCK` override (must be an
+existing socket, otherwise an actionable error and no change) → an existing
+`SSH_AUTH_SOCK` that still resolves to a socket (never clobbered; repeated
+loads are stable) → discovery of `$XDG_RUNTIME_DIR/gcr/ssh` then
+`$XDG_RUNTIME_DIR/keyring/ssh` → an actionable, non-fatal message when
+nothing validates.
 
-### Exit codes
+Publishing to the systemd user manager is opt-in and explicit:
+`gmellon-ssh-auth-sock-publish-systemd` reads `systemctl --user
+show-environment` and only sets `SSH_AUTH_SOCK` when absent there,
+preserving any existing value exactly and reporting an unavailable user
+manager without changes.
 
-| code | meaning |
+**Completions:** when a `gmellon` binary is on `PATH`, module load also
+keeps `functions/_gmellon` current — regenerating it from
+`gmellon completions zsh` whenever the binary is newer than the file
+(the zimfw convention: the module's `functions/` directory is on `fpath`
+automatically). Without a `gmellon` binary the module skips this silently;
+the SSH environment work is unaffected.
+
+### Opt-in: unlock at shell login
+
+The module above deliberately handles only the environment. Unlocking is a
+password operation and stays fully opt-in — if you want your login keyring
+unlocked from your first interactive shell, add this to `~/.zshrc`:
+
+```zsh
+# prompt only when the login keyring is actually locked
+if [[ -o interactive ]] && (( $+commands[gmellon] )); then
+  gmellon unlock
+fi
+```
+
+This is safe unconditionally: `gmellon unlock` on an already-unlocked
+collection exits 0 **without reading a password** (proven in the private
+broker harness), so the first shell after login prompts once and every later
+shell is a silent no-op. A wrong password exits 2 and the next shell simply
+tries again. The `[[ -o interactive ]]` guard keeps non-interactive shells
+(scp, CI, hooks) away from the TTY prompt entirely.
+
+Details and the zsh test suite: [`zimfw/README.md`](/zimfw/README.md).
+
+## Development
+
+The maintained harness and evidence are intentionally more substantial than
+the small product path, because they prove isolation, lifecycle, and
+secret-handling claims against real external processes: a private
+`dbus-broker`, a manually launched `gnome-keyring-daemon` with redirected
+`HOME`/XDG storage, streaming bus monitors that scan every password-method
+message body for generated secrets, and redaction scans over every retained
+binary stream and artifact. The harness is configuration/session isolation,
+not a security sandbox; exact boundaries and evidence live in
+[`doc/harness/README.md`](/doc/harness/README.md), with the current
+verification matrix in [`doc/status.md`](/doc/status.md).
+
+Ordinary checks:
+
+```sh
+cargo nextest run                            # 90 passed, 2 skipped
+cargo nextest run --features login-control   # 117 passed, 4 skipped
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
+zimfw/test.zsh                               # 68 assertions
+```
+
+Maintained external proofs (each fails with status 125 when its hard
+prerequisites are absent):
+
+```sh
+dev/harness/check rust-nextest  # control backend against the real daemon (feature-enabled)
+dev/harness/check rust-broker   # collection client proof under the private broker
+dev/harness/check rust-cli      # compiled list/status/unlock/lock/change proof
+dev/harness/check broker        # private-broker lifecycle and interface suite
+dev/harness/check all           # everything above plus Python suites
+```
+
+### Crates
+
+| crate | use |
 |---|---|
-| 0 | OK |
-| 1 | usage / io / unexpected error |
-| 2 | DENIED — wrong password |
-| 3 | FAILED — daemon-side failure |
-| 4 | NO_DAEMON — GNOME Keyring's Secret Service is unavailable |
+| clap v4 (derive) + clap_complete | CLI + completions |
+| rpassword | no-echo TTY prompts |
+| zeroize | clear password and request buffers after use |
+| rustix | effective and peer UID checks (net/process features only under `login-control`) |
+| zbus | Secret Service discovery, Lock, and GNOME private password methods |
+| crypto-bigint | 1024-bit DH modpow (Montgomery ladder, zeroized exponents) |
+| sha2 + hkdf | HKDF-SHA256 session-key derivation |
+| aes + cbc | AES-128-CBC sealing with PKCS#7 padding |
+| getrandom | DH private exponents and per-Secret IVs |
+| tracing + tracing-subscriber | redacted `-v` operation diagnostics |
 
-## Historical login-only control protocol
+Publishing: `cargo bump` + `jj commit` + `cargo publish` when it earns it.
+
+## Behavior notes (the sharp edges)
+
+- **The private interface is unsupported upstream.** It may change or vanish
+  without notice; gmellon detects its absence and reports it distinctly
+  (exit 3). Locked-collection password change is confirmed against
+  `gnome-keyring-daemon` 48.0 and is version-scoped evidence, not a
+  promise.
+- **No rate limiting or lockout exists server-side.** A wrong password just
+  returns DENIED, from any client on the session bus — same trust boundary
+  the bus itself has.
+- **Evidence is host-scoped.** Proofs ran against daemon 48.0, systemd 261,
+  and dbus-broker 37; monitor parsing is pinned to the installed `busctl`
+  rendering and fails closed on unexpected shapes.
+- **TTY behavior** is covered through rpassword's injected-reader seam; the
+  maintained real-daemon binary proofs use `--stdin`.
+
+## Appendix: the login control protocol
 
 The first implementation used GNOME Keyring's private control socket. It is
 retained as tested machinery behind the optional, disabled-by-default
 `login-control` Rust feature — library-only, with no CLI selection path (see
 [Backend policy](#backend-policy)). It can address only the special `login`
-collection and is not the default collection-oriented product backend.
+collection, its UNLOCK/CHANGE may **create** a missing login keyring with
+the supplied password, and its OK result cannot distinguish already-unlocked
+from newly unlocked. Those semantics — not just the transport — are why it
+is not the default backend.
 
 Transport: `AF_UNIX` `SOCK_STREAM` at `<control-dir>/control`,
 default control dir `$XDG_RUNTIME_DIR/keyring`.
 
 Immediately after connecting, the client writes one NUL credential byte. The
 daemon consumes it separately from the frame and verifies that the peer UID
-matches its own (on Linux via `SO_PEERCRED`). This byte is not included in the
-frame length. A client should also verify that the socket and connected peer
-belong to its effective UID before sending a password.
+matches its own (on Linux via `SO_PEERCRED`). This byte is not included in
+the frame length. A client should also verify that the socket and connected
+peer belong to its effective UID before sending a password.
 
 All integers are **u32 big-endian**. Strings are u32 BE length + raw bytes,
 with no NUL terminator or interior NUL. GNOME's `EggBuffer` rejects string
@@ -173,206 +410,12 @@ recv: 00 00 00 08  00 00 00 00
       └len=8────── └OK
 ```
 
-## Behavior notes (the sharp edges)
-
-- **Only the `login` keyring is addressable.** Server-side `UNLOCK` runs
-  `gkd_login_unlock()`, which only touches the keyring whose identity is
-  `login` — and identity is literally the filename stem
-  (`login.keyring`). A keyring with any other name is invisible to this
-  protocol.
-- **Unlock-or-create landmine:** if `login.keyring` does not exist, the
-  daemon *creates one encrypted with whatever password you send*. `gmellon
-  unlock` therefore checks for `~/.local/share/keyrings/login.keyring` first
-  and refuses with an explanation unless `--allow-create` is passed
-  (existence check is advisory; the daemon is the source of truth).
-- **`CHANGE` also creates:** installed `gnome-keyring-daemon` 48.0 creates a
-  missing login keyring with a nonempty new password, regardless of the
-  supplied original password. An empty new password is denied and does not
-  create the missing store. This is version-scoped harness evidence, so the
-  product must treat CHANGE as create-capable rather than as a safe existence
-  check.
-- Empty-password behavior is asymmetric in the observed cases: fresh
-  `UNLOCK(empty)` creates an empty-password login keyring, and
-  `CHANGE(empty, nonempty)` succeeds. `CHANGE(A, empty)` on the existing A
-  store and `CHANGE(arbitrary, empty)` with no store were both denied.
-- No rate limiting or lockout exists server-side; a wrong password just
-  returns DENIED.
-- The socket lives in a 0700 runtime dir — any process of your uid may
-  speak to it. Same trust boundary PAM already has.
-- Works happily against the systemd socket-activated daemon (we are just
-  another client connecting to `<dir>/control`).
-- Password-bearing request frames must never be logged or hexdumped. Verbose
-  diagnostics may report the operation, lengths, socket path, and result only.
-
-## Zsh integration (zimfw module)
-
-The [`zimfw/`](/zimfw) directory is a self-contained zsh module that exports
-a validated `SSH_AUTH_SOCK` in the loading shell. It is shell-local and
-idempotent: **loading it never prompts for a password, never locks or
-unlocks anything, and never invokes `systemctl`** — environment setup stays
-fully separate from unlocking.
-
-Add one line to `~/.zimrc`:
-
-```zsh
-zmodule rektide/gmellon --root zimfw
-# or, for a local checkout zimfw should never install or update:
-zmodule /path/to/gmellon/zimfw
-```
-
-The module's init file is `init.zsh`, zimfw's default discovery name, so no
-`--source` is needed in either form.
-
-Selection priority: an explicit `GMELLON_SSH_AUTH_SOCK` override (must be an
-existing socket, otherwise an actionable error and no change) → an existing
-`SSH_AUTH_SOCK` that still resolves to a socket (never clobbered; repeated
-loads are stable) → discovery of `$XDG_RUNTIME_DIR/gcr/ssh` then
-`$XDG_RUNTIME_DIR/keyring/ssh` → an actionable, non-fatal message when
-nothing validates.
-
-Publishing to the systemd user manager is opt-in and explicit:
-`gmellon-ssh-auth-sock-publish-systemd` reads `systemctl --user
-show-environment` and only sets `SSH_AUTH_SOCK` when absent there,
-preserving any existing value exactly and reporting an unavailable user
-manager without changes.
-
-Tests: `zimfw/test.zsh` (real AF_UNIX fixtures, recording `systemctl` stub).
-
-**Completions:** when a `gmellon` binary is on `PATH`, module load also
-keeps `functions/_gmellon` current — regenerating it from
-`gmellon completions zsh` whenever the binary is newer than the file
-(the zimfw convention: the module's `functions/` directory is on `fpath`
-automatically). Without a `gmellon` binary the module skips this silently;
-the SSH environment work is unaffected. Loading still never prompts and
-never invokes `systemctl`.
-Details: [`zimfw/README.md`](/zimfw/README.md).
-
-### Opt-in: unlock at shell login
-
-The module above deliberately handles only the environment. Unlocking is a
-password operation and stays fully opt-in — if you want your login keyring
-unlocked from your first interactive shell, add this to `~/.zshrc`:
-
-```zsh
-# prompt only when the login keyring is actually locked
-if [[ -o interactive ]] && (( $+commands[gmellon] )); then
-  gmellon unlock
-fi
-```
-
-This is safe unconditionally: `gmellon unlock` on an already-unlocked
-collection exits 0 **without reading a password** (proven in the private
-broker harness), so the first shell after login prompts once and every later
-shell is a silent no-op. A wrong password exits 2 and the next shell simply
-tries again. The `[[ -o interactive ]]` guard keeps non-interactive shells
-(scp, CI, hooks) away from the TTY prompt entirely.
-
-## Development (readme-driven)
-
-This README is the spec. Stages land in independently committable and testable
-increments. The maintained harness and evidence are intentionally more
-substantial than the small product path because they prove isolation,
-lifecycle, and secret-handling claims against real external processes.
-
-### Stage 0 — scaffold
-`cargo init`, clap v4 derive skeleton with stub subcommands, `.gitignore`,
-clippy + rustfmt clean, nextest wired. `gmellon --help` prints the spec
-above.
-
-### Stage 1 — login control codec (optional-backend foundation)
-`protocol.rs`: op/result enums, frame + string encode/decode. Unit tests
-with golden byte vectors — including the `mellon` example above — so the
-wire format is locked by test before any socket is opened.
-
-### Stage 1.5 — login control transport (optional-backend foundation)
-`control::sans_io` exposes the pure codec for alternate adapters. The
-Linux-only `LoginControlClient` (feature `login-control`, disabled by
-default) opens one connection per operation, validates the
-socket metadata and connected peer UID, writes the credential NUL and
-zeroizing frame, and reads the response under an absolute deadline. Unix
-validation accepts `Metadata` and `AsFd` rather than depending directly on the
-synchronous stream type. A future `TokioClient` can therefore reuse the codec
-and security checks while replacing only connect/read/write scheduling; sync
-and async are not forced through one trait.
-
-### Stage 2 — test harness (complete)
-Implemented under `dev/harness/`: the reusable
-[`lifecycle.py`](/dev/harness/lifecycle.py) supervisor starts a throwaway
-`gnome-keyring-daemon --foreground --components=secrets
---control-directory=<tmp>`, with `HOME` and all XDG directories redirected to
-a mode-0700 scratch tree and both D-Bus addresses pointed at nonexistent
-scratch sockets. It waits for the daemon's initialization EOF, verifies child
-liveness and the control socket, and performs bounded teardown. This
-control-only layer validates the transport and frame transcription without
-touching the real store or buses. A private `dbus-broker` composition
-([`broker.py`](/dev/harness/broker.py)) was promoted from optional parity to
-required infrastructure for the zbus Secret Service product backend, but it
-remains separate from — and no prerequisite for — this control-only layer and
-its tests.
-
-The reproducible behavior runner adds supervisor-owned restarts over the same
-private store and explicit stopped/SIGSTOP fault transitions. Against installed
-daemon 48.0 it proves missing/correct/wrong UNLOCK, persisted A→B CHANGE,
-missing-store CHANGE creation, empty-password cases, stopped `NO_DAEMON`, and
-bounded unresponsive behavior without logging generated passwords or frames.
-
-The durable harness guide, runnable interface, isolation boundary, and evidence
-map are in [`doc/harness/README.md`](/doc/harness/README.md). The underlying
-acceptance constraints and ticket graph remain in
-[`doc/harness/prompt.md`](/doc/harness/prompt.md).
-
-### Stage 2.5 — secret input
-`secret_input`: `Secret` owns a zeroized-on-drop UTF-8 string and exposes
-only borrowed `as_bytes()` — no `Debug`, `Clone`, `Display`, or ownership
-escape. Interactive prompts run through rpassword on the controlling TTY
-(no echo, with rpassword's best-effort terminal-state restoration); the
-`--stdin` path uses
-its own bounded line-record reader because rpassword interprets DEL,
-Ctrl-U, and Ctrl-W as editing commands even over pipes, where those bytes
-are password bytes. LF/CRLF terminate a line, EOF before the newline
-errors, an empty line passes, input is capped at 64 KiB, and invalid UTF-8
-errors. ENXIO (no controlling terminal) maps to an actionable error
-suggesting `--stdin`. A reusable two-prompt confirmation (single-shot
-mismatch, zeroized temporaries) supports `change`.
-
-### Stage 3 — collection `list` and `unlock`
-Connect to Secret Service with zbus, list collection IDs/labels/lock state,
-select `login` by default or an explicit ID, acquire a password from the TTY or
-`--stdin`, and call `UnlockWithMasterPassword`. An already-unlocked collection
-returns success without checking the supplied password; ordinary unlock never
-locks or relocks. The private-broker Rust proof covers exact `login` plus a
-second collection with distinct passwords.
-
-### Stage 4 — collection `change`
-Select a collection by ID, read old/new/confirmation secrets, and call
-`ChangeWithMasterPassword`. The private-broker Rust proof demonstrates A→B,
-fixture-only locking, old-password denial, and new-password unlock.
-
-### Stage 5 — polish
-Collection/alias display refinements, redacted diagnostics via `tracing`,
-`clap_complete` shell completions, and manpage-grade `--help`.
-
-### Stage 6 — stretch (only if wanted)
-An explicit side-effecting password-verification mode may lock then unlock, but
-must never become ordinary unlock behavior. Wrapper docs for the zsh login
-hook remain optional.
-
-### Crates
-
-| crate | use |
-|---|---|
-| clap v4 (derive) + clap_complete | CLI + completions |
-| rpassword | no-echo TTY prompts |
-| zeroize | clear password and request buffers after use |
-| rustix | effective and peer UID checks |
-| zbus | Secret Service discovery and GNOME private password methods |
-| crypto-bigint | 1024-bit DH modpow (Montgomery ladder, zeroized exponents) |
-| sha2 + hkdf | HKDF-SHA256 session-key derivation |
-| aes + cbc | AES-128-CBC sealing with PKCS#7 padding |
-| getrandom | DH private exponents and per-Secret IVs |
-| tracing (optional, Stage 5) | redacted `-v` operation diagnostics |
-
-Publishing: `cargo bump` + `jj commit` + `cargo publish` when it earns it.
+Control-path observations (version-scoped to daemon 48.0): a missing
+`login.keyring` is created by UNLOCK with whatever password arrives;
+CHANGE with a nonempty new password also creates it regardless of the
+supplied original; empty-password behavior is asymmetric across those
+paths. The socket lives in a 0700 runtime dir — any process of your uid
+may speak to it, the same trust boundary PAM already has.
 
 ## References
 
@@ -404,6 +447,6 @@ Local checkouts (same content, no network):
 Context and docs:
 
 - [Arch Wiki: GNOME/Keyring](https://wiki.archlinux.org/title/GNOME/Keyring) — PAM wiring, TTY patterns, troubleshooting
-- [Secret Service API spec](https://specifications.freedesktop.org/secret-service-spec/latest/) — the D-Bus side (why `Unlock()` needs a prompt; stretch `lock`)
+- [Secret Service API spec](https://specifications.freedesktop.org/secret-service-spec/latest/) — the D-Bus side (why `Unlock()` needs a prompt; the standard `Lock` gmellon's lock uses)
 - [Debian `gnome-keyring` package](https://packages.debian.org/sid/gnome-keyring) / [Debian `libpam-gnome-keyring`](https://packages.debian.org/sid/libpam-gnome-keyring)
 - JtR `gnome2john` — precedent that the on-disk keyring format is parseable offline (rescue path of last resort)
