@@ -1,9 +1,13 @@
 //! Opt-in tests of the maintained Rust transport against an isolated daemon.
 //!
+//! This proof target exists only with the `login-control` Cargo feature;
+//! default builds compile it to an empty target rather than failing.
+//!
 //! Each ignored outer test invokes the executable lifecycle contract, which
 //! starts a fresh daemon and re-runs only that test inside the isolated command
 //! environment. Pure codec and fake-socket tests do not depend on this file's
 //! external prerequisites.
+#![cfg(feature = "login-control")]
 
 mod common;
 
@@ -16,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-use gmellon::control::{DaemonResult, SyncClient};
+use gmellon::control::{DaemonResult, LoginControlClient};
 
 use common::{KEEP_SUCCESS_MARKER, relay, require_command};
 
@@ -34,15 +38,19 @@ fn real_daemon_unlock_uses_the_reviewed_transport() {
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
                 let client = isolated_client();
 
-                require_result(client.unlock(&password), DaemonResult::Ok, "fresh UNLOCK");
+                require_result(
+                    client.unlock_login(&password),
+                    DaemonResult::Ok,
+                    "fresh UNLOCK",
+                );
                 require_login_files();
                 require_result(
-                    client.unlock(&password),
+                    client.unlock_login(&password),
                     DaemonResult::Ok,
                     "subsequent correct UNLOCK",
                 );
                 require_result(
-                    client.unlock(&wrong_password),
+                    client.unlock_login(&wrong_password),
                     DaemonResult::Denied,
                     "wrong UNLOCK",
                 );
@@ -65,19 +73,23 @@ fn real_daemon_change_uses_the_reviewed_transport() {
                 let client = isolated_client();
 
                 require_result(
-                    client.unlock(&original_password),
+                    client.unlock_login(&original_password),
                     DaemonResult::Ok,
                     "fixture UNLOCK",
                 );
                 require_login_files();
                 require_result(
-                    client.change(&original_password, &new_password),
+                    client.change_login_password(&original_password, &new_password),
                     DaemonResult::Ok,
                     "CHANGE A-to-B",
                 );
-                require_result(client.unlock(&new_password), DaemonResult::Ok, "UNLOCK B");
                 require_result(
-                    client.unlock(&original_password),
+                    client.unlock_login(&new_password),
+                    DaemonResult::Ok,
+                    "UNLOCK B",
+                );
+                require_result(
+                    client.unlock_login(&original_password),
                     DaemonResult::Denied,
                     "UNLOCK former A",
                 );
@@ -173,7 +185,7 @@ fn require_outer_prerequisites() {
 }
 
 #[cfg(target_os = "linux")]
-fn isolated_client() -> SyncClient {
+fn isolated_client() -> LoginControlClient {
     let root = harness_root();
     let control_directory = common::required_path("GMELL_HARNESS_CONTROL_DIR");
     let control_socket = common::required_path("GMELL_HARNESS_CONTROL_SOCKET");
@@ -214,7 +226,7 @@ fn isolated_client() -> SyncClient {
         );
     }
 
-    SyncClient::new(control_directory)
+    LoginControlClient::new(control_directory)
 }
 
 #[cfg(target_os = "linux")]
@@ -229,7 +241,7 @@ fn harness_root() -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn require_result(
-    actual: Result<DaemonResult, gmellon::control::ControlError>,
+    actual: Result<DaemonResult, gmellon::control::LoginControlError>,
     expected: DaemonResult,
     operation: &str,
 ) {
@@ -257,7 +269,7 @@ fn require_login_files() {
 fn finish_case(path_name: &str, secrets: &[&[u8]], outcome: std::thread::Result<()>) {
     let root = harness_root();
     let header = format!(
-        "path={path_name}\ntransport=gmellon::control::SyncClient\nsecret_values={}",
+        "path={path_name}\ntransport=gmellon::control::LoginControlClient\nsecret_values={}",
         secrets.len()
     );
     common::finish_case(&root, "rust-integration.txt", &header, secrets, outcome);

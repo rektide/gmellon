@@ -45,7 +45,7 @@ impl Display for IoStage {
 
 /// A local failure while exchanging a request with the daemon.
 #[derive(Debug)]
-pub enum ControlError {
+pub enum LoginControlError {
     NoDaemon { path: PathBuf },
     Security(SecurityError),
     Encode(EncodeError),
@@ -53,7 +53,7 @@ pub enum ControlError {
     Io { stage: IoStage, source: io::Error },
 }
 
-impl Display for ControlError {
+impl Display for LoginControlError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoDaemon { path } => {
@@ -67,7 +67,7 @@ impl Display for ControlError {
     }
 }
 
-impl Error for ControlError {
+impl Error for LoginControlError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Security(error) => Some(error),
@@ -79,17 +79,23 @@ impl Error for ControlError {
     }
 }
 
-/// Blocking adapter for GNOME Keyring's one-request-per-connection protocol.
+/// Blocking client for the login-only control socket.
 ///
-/// Framing is provided by [`super::sans_io`]. A future asynchronous adapter can
-/// reuse that codec and the Unix ownership checks without wrapping this type.
+/// Framing is provided by [`super::sans_io`]. A future asynchronous adapter
+/// can reuse that codec and the Unix ownership checks without wrapping this
+/// type.
+///
+/// This client addresses only the special `login` keyring. Its operations are
+/// create-capable — UNLOCK and CHANGE each create a missing login keyring
+/// encrypted with the supplied password — and an `Ok` result cannot
+/// distinguish an already-unlocked keyring from a newly unlocked one.
 #[derive(Clone, Debug)]
-pub struct SyncClient {
+pub struct LoginControlClient {
     socket_path: PathBuf,
     io_timeout: Duration,
 }
 
-impl SyncClient {
+impl LoginControlClient {
     /// Address the `control` socket inside `control_directory`.
     pub fn new(control_directory: impl Into<PathBuf>) -> Self {
         Self {
@@ -114,53 +120,63 @@ impl SyncClient {
         &self.socket_path
     }
 
-    /// Unlock or create the login keyring with `password`.
-    pub fn unlock(&self, password: &[u8]) -> Result<DaemonResult, ControlError> {
+    /// Unlock the login keyring with `password`, creating it if missing.
+    ///
+    /// The daemon's UNLOCK cannot address any collection other than the
+    /// special `login` keyring, and it creates a missing login keyring
+    /// encrypted with the supplied password. An `Ok` result therefore cannot
+    /// distinguish an already-unlocked keyring from a newly unlocked one.
+    pub fn unlock_login(&self, password: &[u8]) -> Result<DaemonResult, LoginControlError> {
         self.exchange(Request::Unlock { password })
     }
 
-    /// Change the login keyring password.
-    pub fn change(
+    /// Change the login keyring password, creating the keyring if missing.
+    ///
+    /// Observed against `gnome-keyring-daemon` 48.0, CHANGE against a missing
+    /// login keyring creates one with the nonempty new password regardless of
+    /// the supplied original password. Like [`Self::unlock_login`], this
+    /// operation can address only the `login` keyring.
+    pub fn change_login_password(
         &self,
         original_password: &[u8],
         new_password: &[u8],
-    ) -> Result<DaemonResult, ControlError> {
+    ) -> Result<DaemonResult, LoginControlError> {
         self.exchange(Request::Change {
             original_password,
             new_password,
         })
     }
 
-    fn exchange(&self, request: Request<'_>) -> Result<DaemonResult, ControlError> {
-        let frame = encode_request(request).map_err(ControlError::Encode)?;
+    fn exchange(&self, request: Request<'_>) -> Result<DaemonResult, LoginControlError> {
+        let frame = encode_request(request).map_err(LoginControlError::Encode)?;
         let expected_uid = effective_uid();
         let metadata = match fs::symlink_metadata(&self.socket_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(ControlError::NoDaemon {
+                return Err(LoginControlError::NoDaemon {
                     path: self.socket_path.clone(),
                 });
             }
             Err(source) => {
-                return Err(ControlError::Io {
+                return Err(LoginControlError::Io {
                     stage: IoStage::InspectSocket,
                     source,
                 });
             }
         };
         validate_socket_metadata(&self.socket_path, &metadata, expected_uid)
-            .map_err(ControlError::Security)?;
+            .map_err(LoginControlError::Security)?;
 
         let mut stream = UnixStream::connect(&self.socket_path).map_err(|source| {
             if matches!(
                 source.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
             ) {
-                ControlError::NoDaemon {
+                LoginControlError::NoDaemon {
                     path: self.socket_path.clone(),
                 }
             } else {
-                ControlError::Io {
+                LoginControlError::Io {
                     stage: IoStage::Connect,
                     source,
                 }
@@ -168,7 +184,7 @@ impl SyncClient {
         })?;
         stream
             .set_write_timeout(Some(self.io_timeout))
-            .map_err(|source| ControlError::Io {
+            .map_err(|source| LoginControlError::Io {
                 stage: IoStage::ConfigureSocket,
                 source,
             })?;
@@ -177,19 +193,19 @@ impl SyncClient {
 
         stream
             .write_all(&CREDENTIAL_BYTE)
-            .map_err(|source| ControlError::Io {
+            .map_err(|source| LoginControlError::Io {
                 stage: IoStage::SendCredentials,
                 source,
             })?;
         stream
             .write_all(frame.as_ref())
-            .map_err(|source| ControlError::Io {
+            .map_err(|source| LoginControlError::Io {
                 stage: IoStage::SendRequest,
                 source,
             })?;
 
         let response = read_response_before(&mut stream, self.io_timeout)?;
-        decode_response(&response).map_err(ControlError::Decode)
+        decode_response(&response).map_err(LoginControlError::Decode)
     }
 }
 
@@ -197,21 +213,21 @@ fn validate_connected_peer(
     stream: &UnixStream,
     path: &Path,
     expected_uid: rustix::process::RawUid,
-) -> Result<(), ControlError> {
-    let actual_uid = peer_uid(stream).map_err(|source| ControlError::Io {
+) -> Result<(), LoginControlError> {
+    let actual_uid = peer_uid(stream).map_err(|source| LoginControlError::Io {
         stage: IoStage::InspectPeer,
         source,
     })?;
-    validate_peer_owner(path, expected_uid, actual_uid).map_err(ControlError::Security)
+    validate_peer_owner(path, expected_uid, actual_uid).map_err(LoginControlError::Security)
 }
 
 fn read_response_before(
     stream: &mut UnixStream,
     timeout: Duration,
-) -> Result<[u8; RESPONSE_LENGTH], ControlError> {
+) -> Result<[u8; RESPONSE_LENGTH], LoginControlError> {
     let deadline = Instant::now()
         .checked_add(timeout)
-        .ok_or_else(|| ControlError::Io {
+        .ok_or_else(|| LoginControlError::Io {
             stage: IoStage::ConfigureSocket,
             source: io::Error::new(io::ErrorKind::InvalidInput, "response timeout is too large"),
         })?;
@@ -221,7 +237,7 @@ fn read_response_before(
     while received < response.len() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
-            .ok_or_else(|| ControlError::Io {
+            .ok_or_else(|| LoginControlError::Io {
                 stage: IoStage::ReceiveResponse,
                 source: io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -229,7 +245,7 @@ fn read_response_before(
                 ),
             })?;
         if remaining.is_zero() {
-            return Err(ControlError::Io {
+            return Err(LoginControlError::Io {
                 stage: IoStage::ReceiveResponse,
                 source: io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -239,14 +255,14 @@ fn read_response_before(
         }
         stream
             .set_read_timeout(Some(remaining))
-            .map_err(|source| ControlError::Io {
+            .map_err(|source| LoginControlError::Io {
                 stage: IoStage::ConfigureSocket,
                 source,
             })?;
 
         match stream.read(&mut response[received..]) {
             Ok(0) => {
-                return Err(ControlError::Io {
+                return Err(LoginControlError::Io {
                     stage: IoStage::ReceiveResponse,
                     source: io::Error::from(io::ErrorKind::UnexpectedEof),
                 });
@@ -254,7 +270,7 @@ fn read_response_before(
             Ok(count) => received += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(source) => {
-                return Err(ControlError::Io {
+                return Err(LoginControlError::Io {
                     stage: IoStage::ReceiveResponse,
                     source,
                 });
@@ -287,9 +303,9 @@ mod tests {
     fn unlock_sends_credentials_then_the_request() {
         let (directory, listener) = listening_control_socket();
         let server = serve_once(listener, vec![response(DaemonResult::Ok)], Duration::ZERO);
-        let client = SyncClient::new(directory.path());
+        let client = LoginControlClient::new(directory.path());
 
-        assert_eq!(client.unlock(b"mellon").unwrap(), DaemonResult::Ok);
+        assert_eq!(client.unlock_login(b"mellon").unwrap(), DaemonResult::Ok);
         let received = server.join().unwrap();
         assert_eq!(received.credential, 0);
         match decode_request(received.frame.as_slice()).unwrap() {
@@ -306,9 +322,12 @@ mod tests {
             vec![response(DaemonResult::Denied)],
             Duration::ZERO,
         );
-        let client = SyncClient::new(directory.path());
+        let client = LoginControlClient::new(directory.path());
 
-        assert_eq!(client.change(b"old", b"new").unwrap(), DaemonResult::Denied);
+        assert_eq!(
+            client.change_login_password(b"old", b"new").unwrap(),
+            DaemonResult::Denied
+        );
         let received = server.join().unwrap();
         match decode_request(received.frame.as_slice()).unwrap() {
             Request::Change {
@@ -333,7 +352,9 @@ mod tests {
         );
 
         assert_eq!(
-            SyncClient::new(directory.path()).unlock(b"friend").unwrap(),
+            LoginControlClient::new(directory.path())
+                .unlock_login(b"friend")
+                .unwrap(),
             DaemonResult::Ok
         );
         server.join().unwrap();
@@ -342,18 +363,18 @@ mod tests {
     #[test]
     fn missing_and_refused_sockets_are_no_daemon() {
         let directory = TempDir::new().unwrap();
-        let client = SyncClient::new(directory.path());
+        let client = LoginControlClient::new(directory.path());
         assert!(matches!(
-            client.unlock(b"friend"),
-            Err(ControlError::NoDaemon { .. })
+            client.unlock_login(b"friend"),
+            Err(LoginControlError::NoDaemon { .. })
         ));
 
         let socket_path = directory.path().join("control");
         let listener = UnixListener::bind(&socket_path).unwrap();
         drop(listener);
         assert!(matches!(
-            client.unlock(b"friend"),
-            Err(ControlError::NoDaemon { .. })
+            client.unlock_login(b"friend"),
+            Err(LoginControlError::NoDaemon { .. })
         ));
     }
 
@@ -363,8 +384,8 @@ mod tests {
         let socket_path = directory.path().join("control");
         File::create(&socket_path).unwrap();
         assert!(matches!(
-            SyncClient::new(directory.path()).unlock(b"friend"),
-            Err(ControlError::Security(SecurityError::NotSocket { .. }))
+            LoginControlClient::new(directory.path()).unlock_login(b"friend"),
+            Err(LoginControlError::Security(SecurityError::NotSocket { .. }))
         ));
 
         fs::remove_file(&socket_path).unwrap();
@@ -372,8 +393,10 @@ mod tests {
         let _listener = UnixListener::bind(&target_path).unwrap();
         symlink(&target_path, &socket_path).unwrap();
         assert!(matches!(
-            SyncClient::new(directory.path()).unlock(b"friend"),
-            Err(ControlError::Security(SecurityError::SymbolicLink { .. }))
+            LoginControlClient::new(directory.path()).unlock_login(b"friend"),
+            Err(LoginControlError::Security(
+                SecurityError::SymbolicLink { .. }
+            ))
         ));
     }
 
@@ -382,18 +405,18 @@ mod tests {
         let (directory, listener) = listening_control_socket();
         let server = serve_once(listener, vec![vec![0, 0, 0, 9, 0, 0, 0, 0]], Duration::ZERO);
         assert!(matches!(
-            SyncClient::new(directory.path()).unlock(b"friend"),
-            Err(ControlError::Decode(DecodeError::InvalidDeclaredLength {
-                declared: 9
-            }))
+            LoginControlClient::new(directory.path()).unlock_login(b"friend"),
+            Err(LoginControlError::Decode(
+                DecodeError::InvalidDeclaredLength { declared: 9 }
+            ))
         ));
         server.join().unwrap();
 
         let (directory, listener) = listening_control_socket();
         let server = serve_once(listener, vec![vec![0, 0, 0, 8]], Duration::ZERO);
         assert!(matches!(
-            SyncClient::new(directory.path()).unlock(b"friend"),
-            Err(ControlError::Io {
+            LoginControlClient::new(directory.path()).unlock_login(b"friend"),
+            Err(LoginControlError::Io {
                 stage: IoStage::ReceiveResponse,
                 ..
             })
@@ -405,12 +428,13 @@ mod tests {
     fn response_read_is_bounded_by_the_configured_timeout() {
         let (directory, listener) = listening_control_socket();
         let server = serve_once(listener, Vec::new(), Duration::from_millis(150));
-        let client = SyncClient::new(directory.path()).with_io_timeout(Duration::from_millis(25));
+        let client =
+            LoginControlClient::new(directory.path()).with_io_timeout(Duration::from_millis(25));
 
-        let error = client.unlock(b"friend").unwrap_err();
+        let error = client.unlock_login(b"friend").unwrap_err();
         assert!(matches!(
             error,
-            ControlError::Io {
+            LoginControlError::Io {
                 stage: IoStage::ReceiveResponse,
                 ..
             }
@@ -426,11 +450,12 @@ mod tests {
             .map(|byte| vec![byte])
             .collect();
         let server = serve_once(listener, chunks, Duration::from_millis(20));
-        let client = SyncClient::new(directory.path()).with_io_timeout(Duration::from_millis(55));
+        let client =
+            LoginControlClient::new(directory.path()).with_io_timeout(Duration::from_millis(55));
 
         assert!(matches!(
-            client.unlock(b"friend"),
-            Err(ControlError::Io {
+            client.unlock_login(b"friend"),
+            Err(LoginControlError::Io {
                 stage: IoStage::ReceiveResponse,
                 ..
             })
@@ -448,7 +473,7 @@ mod tests {
 
         assert!(matches!(
             validate_connected_peer(&stream, Path::new("control"), wrong_uid),
-            Err(ControlError::Security(SecurityError::PeerOwnerMismatch {
+            Err(LoginControlError::Security(SecurityError::PeerOwnerMismatch {
                 expected,
                 actual,
                 ..
@@ -475,10 +500,10 @@ mod tests {
             }
             received
         });
-        let client = SyncClient::new(directory.path());
+        let client = LoginControlClient::new(directory.path());
 
-        assert_eq!(client.unlock(b"first").unwrap(), DaemonResult::Ok);
-        assert_eq!(client.unlock(b"second").unwrap(), DaemonResult::Ok);
+        assert_eq!(client.unlock_login(b"first").unwrap(), DaemonResult::Ok);
+        assert_eq!(client.unlock_login(b"second").unwrap(), DaemonResult::Ok);
         let received = server.join().unwrap();
         assert_eq!(received.len(), 2);
         match decode_request(received[0].frame.as_slice()).unwrap() {

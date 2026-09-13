@@ -298,6 +298,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+    #[cfg(feature = "login-control")]
     use crate::control::sans_io::{Request, decode_request, encode_request};
 
     /// A cursor over borrowed bytes, so byte literals work uniformly.
@@ -578,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "login-control")]
     fn secrets_feed_the_control_codec_and_round_trip() {
         let secret = read_stdin_line(&mut line_input(b"mellon\n")).unwrap();
         let frame = encode_request(Request::Unlock {
@@ -592,6 +594,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "login-control")]
     fn multibyte_secrets_round_trip_through_the_wire_shape() {
         let text = "mellón-🔑";
         let mut input = Cursor::new(format!("{text}\n").into_bytes());

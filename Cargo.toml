@@ -11,10 +11,18 @@ crypto-bigint = { version = "0.7.5", features = ["alloc", "zeroize"] }
 getrandom = "0.4.3"
 hkdf = "0.13.0"
 rpassword = "7.5.4"
-rustix = { version = "1.1.4", features = ["net", "process"] }
+# Non-optional only for `io::Errno` (ENXIO classification in secret_input);
+# the control backend's net/process surfaces are activated by `login-control`.
+rustix = "1.1.4"
 sha2 = "0.11.0"
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 zeroize = "1.9.0"
+
+[features]
+# The login-only control-socket backend: library-only, never a fallback.
+# Default builds omit the control codec/client and rustix's net/process
+# features entirely.
+login-control = ["rustix/net", "rustix/process"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
