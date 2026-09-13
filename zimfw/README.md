@@ -25,7 +25,10 @@ zmodule /path/to/gmellon/zimfw
 The module's init file is `init.zsh` at the module root — zimfw's default
 discovery name — so no `--source` is needed in either form. (Verified
 against the real zimfw: the generated `${ZIM_HOME}/init.zsh` contains
-`source <module>/init.zsh`.)
+`source <module>/init.zsh`.) Note that the real zimfw also `zcompile`s the
+module files it initializes, leaving read-only `*.zwc` siblings; inside
+`${ZIM_HOME}` that is expected, and for the absolute-path form the repo
+ignores them (`.gitignore`).
 
 ## Selection policy
 
