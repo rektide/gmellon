@@ -582,20 +582,23 @@ are co-located implementation seams, not a public import contract.
 
 ### Ordinary Rust workflow
 
-The real-daemon tests are normal Rust integration tests marked `#[ignore]`.
-Ordinary workflows stay pure and make the omission visible:
+The real-daemon tests are normal Rust integration tests marked `#[ignore]`,
+compiled only with the `login-control` Cargo feature. Ordinary workflows
+stay pure and make the omission visible:
 
 ```sh
 cargo test
 cargo nextest run
 ```
 
-Cargo reports four tests as `ignored` — two real-daemon control-protocol
-tests plus one ignored proof per broker target; nextest reports the same
-four as `skipped`. The pure codec unit tests, the fake Unix-socket transport
-tests, and the `redaction_scan` positive controls for the shared secret
-scanner and streaming monitor parser remain in the ordinary run and never
-invoke Python or a system daemon. Do not select only the
+In a default build the `real_daemon` target is empty (the control client it
+exercises is feature-gated) and Cargo reports the two broker proofs as
+`ignored`; nextest reports the same two as `skipped`. The pure codec unit
+tests, the fake Unix-socket transport tests, and the `redaction_scan`
+positive controls for the shared secret scanner and streaming monitor parser
+remain in the ordinary run and never invoke Python or a system daemon.
+Building with `cargo nextest run --features login-control` restores the two
+ignored real-daemon tests to the summary. Do not select only the
 ignored test binary without `--run-ignored`: nextest correctly returns its
 "no tests to run" status in that narrowed case.
 
@@ -608,11 +611,12 @@ dev/harness/check rust-nextest
 dev/harness/check rust-cargo
 ```
 
-The corresponding direct conventional commands are:
+The wrappers pass `--features login-control` so the control proof is
+compiled and exercised. The corresponding direct conventional commands are:
 
 ```sh
-cargo nextest run --test real_daemon --run-ignored ignored-only
-cargo test --test real_daemon -- --ignored
+cargo nextest run --features login-control --test real_daemon --run-ignored ignored-only
+cargo test --features login-control --test real_daemon -- --ignored
 ```
 
 Both tests first validate Linux support, an executable lifecycle, `python3`, a
@@ -627,7 +631,7 @@ Each outer Rust test invokes the executable
 [`lifecycle.py`](/dev/harness/lifecycle.py) command and re-runs only its own
 test binary as the lifecycle command. It does not import Python or reconstruct
 the daemon environment. The inner test consumes `GMELL_HARNESS_*` and uses the
-public `gmellon::control::SyncClient` to cover:
+public `gmellon::control::LoginControlClient` to cover:
 
 - fresh UNLOCK, login-file creation, repeated correct UNLOCK, and wrong
   password DENIED; and
@@ -818,8 +822,9 @@ There is currently no tracked CI configuration in this repository. Operator
 policy is therefore explicit rather than presented as an existing CI job:
 
 1. ordinary development runs full `cargo nextest run`, whose summary must
-   show the four omitted real-daemon and private-broker proof tests as
-   skipped;
+   show the two omitted private-broker proof tests as skipped (the two
+   real-daemon control tests are additionally absent unless
+   `--features login-control` is passed);
 2. a provisioned Linux integration environment runs `dev/harness/check all`;
 3. missing prerequisites in that explicitly provisioned run are setup
    failures, never allowed skips; and
@@ -899,7 +904,7 @@ one kind of truth:
 | [`dev/harness/broker.py`](/dev/harness/broker.py) and its [focused tests](/dev/harness/tests/test_broker.py) | Executable private-broker mechanics, command contract, exact process/FD ownership, and acceptance coverage |
 | [`dev/harness/private_bus_probe.py`](/dev/harness/private_bus_probe.py) | Non-password plain-session and private-interface capability proof |
 | [`dev/harness/check`](/dev/harness/check) | Maintained explicit prerequisite and check composition; delegates lifecycle/process orchestration |
-| [`tests/harness/real_daemon.rs`](/tests/harness/real_daemon.rs) | Ignored Rust integration boundary and real `SyncClient` assertions |
+| [`tests/harness/real_daemon.rs`](/tests/harness/real_daemon.rs) | Ignored Rust integration boundary and real `LoginControlClient` assertions (feature-gated behind `login-control`) |
 | [`tests/harness/broker_collections.rs`](/tests/harness/broker_collections.rs) | Ignored Rust multi-collection proof under the private broker: zbus fixture setup plus `BlockingClient` behavior and no-relock wire evidence |
 | [`tests/harness/broker_cli.rs`](/tests/harness/broker_cli.rs) | Ignored Rust CLI binary proof under the private broker: the compiled `gmellon` binary's list/unlock/change exit codes, messages, no-read paths, no-change wire evidence, and secret scans |
 | [`dev/harness/tests/test_lifecycle.py`](/dev/harness/tests/test_lifecycle.py) | Executable acceptance coverage for lifecycle invariants and races |

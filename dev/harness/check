@@ -7,8 +7,8 @@ usage() {
 usage: dev/harness/check [--keep-success] MODE
 
 MODE:
-  rust-cargo    run ignored Rust real-daemon tests with cargo test
-  rust-nextest run ignored Rust real-daemon tests with cargo nextest
+  rust-cargo    run ignored Rust real-daemon login-control tests with cargo test
+  rust-nextest run ignored Rust real-daemon login-control tests with cargo nextest
   rust-broker   run the ignored Rust private-broker collection proof with cargo nextest
   rust-cli      run the ignored Rust private-broker CLI binary proof with cargo nextest
   python        run Python lifecycle tests, behavior matrix, and smoke proof
@@ -16,8 +16,9 @@ MODE:
   all           run rust-nextest, rust-broker, rust-cli, control-only Python, and broker checks
 
 An explicit invocation fails before testing when a required external tool is
-missing. Ordinary `cargo test` and `cargo nextest run` visibly skip the ignored
-Rust real-daemon tests instead.
+missing. Ordinary `cargo test` and `cargo nextest run` visibly skip the
+ignored Rust real-daemon tests instead (the control proof needs
+--features login-control even to compile; it is an empty target without it).
 EOF
 }
 
@@ -105,9 +106,10 @@ run_rust_cargo() {
 	need_common
 	need_path_tool cargo 'install the Rust toolchain and make `cargo` available'
 	if [ -n "$KEEP_SUCCESS" ]; then
-		GMELL_HARNESS_KEEP_SUCCESS=1 cargo test --test real_daemon -- --ignored
+		GMELL_HARNESS_KEEP_SUCCESS=1 \
+			cargo test --features login-control --test real_daemon -- --ignored
 	else
-		cargo test --test real_daemon -- --ignored
+		cargo test --features login-control --test real_daemon -- --ignored
 	fi
 }
 
@@ -118,9 +120,9 @@ run_rust_nextest() {
 		fail 'cargo-nextest is unavailable; install it or use MODE rust-cargo'
 	if [ -n "$KEEP_SUCCESS" ]; then
 		GMELL_HARNESS_KEEP_SUCCESS=1 \
-			cargo nextest run --test real_daemon --run-ignored ignored-only
+			cargo nextest run --features login-control --test real_daemon --run-ignored ignored-only
 	else
-		cargo nextest run --test real_daemon --run-ignored ignored-only
+		cargo nextest run --features login-control --test real_daemon --run-ignored ignored-only
 	fi
 }
 
