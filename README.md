@@ -4,9 +4,10 @@
 
 `gmellon` is a small Rust CLI that speaks GNOME Keyring's private D-Bus
 password interface, so you can **list, unlock, lock, and re-key any GNOME
-keyring collection from a shell** — no GUI, no PAM, and no display server.
-A `gnome-keyring-daemon` Secret Service must be available on the session
-bus.
+keyring collection from a shell** — no GUI, no PAM, and no display server —
+and **store your SSH key passphrases exactly where gcr-ssh-agent reads
+them**. A `gnome-keyring-daemon` Secret Service must be available on the
+session bus.
 
 It exists because every other door is shut on a headless, SSH-only machine:
 
@@ -64,7 +65,15 @@ publishing is unblocked.
 
 ## Usage
 
-```
+Omitted collection IDs default directly to `login`; there is no
+configuration layer or environment-selected default.
+
+### Collections
+
+Discover what exists, then act on one collection at a time by its stable
+ID:
+
+```sh
 # list stable collection IDs, mutable labels, and lock state
 gmellon list
 
@@ -81,85 +90,125 @@ gmellon unlock work
 # scripting: read a single line (sans newline) from stdin
 gmellon unlock work --stdin < /dev/shm/pw
 
+# lock a collection — an explicit state change, prompt-free
+gmellon lock work
+
 # rotate a collection password (prompts for current + new + confirm)
 gmellon change work
 
 # scripting: current, new, and confirmation lines in that order
 gmellon change work --stdin < /dev/shm/password-change
+```
 
-# list every stored SSH key passphrase across all collections
-# (metadata only; keyed the way gcr-ssh-agent looks them up)
-gmellon ssh-list
+The safety rails around this group are proven, not promised:
 
+- An already-unlocked collection returns success **without reading or
+  checking a password**; an already-locked collection returns success
+  without a Lock call.
+- Ordinary unlock never locks or relocks a collection to verify one; lock
+  is its own explicit command and nothing ever calls it implicitly.
+- A denied current password during `change` leaves the old password valid.
+
+### SSH key passphrases
+
+gcr's SSH agent (the `SSH_AUTH_SOCK` you get on a modern GNOME session)
+reads key passphrases from the keyring, keyed by the key's absolute path.
+This group stores, finds, and removes exactly those entries:
+
+```sh
 # store an SSH key passphrase — prompted for the KEY's passphrase
-# (not the keyring password), verified against the key with ssh-keygen
-# first, and only then stored where gcr-ssh-agent finds it; a wrong
-# passphrase stores nothing, an unencrypted key has nothing to store
+# (not the keyring password), verified against the key first
 gmellon ssh-add ~/.ssh/deck
 
 # scripting: read the passphrase from one stdin line instead
 gmellon ssh-add ~/.ssh/deck --stdin < /dev/shm/pw
 
-# remove a stored key passphrase (the key file itself may be long gone)
+# list every stored key passphrase across all collections
+# (metadata only: the passphrases are never read)
+gmellon ssh-list
+
+# remove a stored passphrase (the key file itself may be long gone)
 gmellon ssh-remove ~/.ssh/deck
+```
 
-# list a collection's items: labels, lock state, attributes — metadata
-# only, no secret is ever read
+The `ssh-add` contract, in order:
+
+1. **Verify before store.** The passphrase is checked by running
+   `ssh-keygen -y` against the key through gmellon's own askpass helper —
+   the passphrase never appears in argv, the environment, or a file. A
+   wrong passphrase exits 2 and stores nothing; an unencrypted key exits
+   1 (a deliberately wrong probe also decrypts it — there is nothing to
+   store).
+2. **Store where gcr looks.** The item goes to the collection the
+   service's `default` alias resolves to (an unset alias is refused with
+   an explanation rather than storing somewhere unreadable), keyed by
+   `unique=ssh-store:<absolute path>` with the generic-schema attribute
+   gcr's lookup matches, labeled `Unlock password for: <basename>`, and
+   sealed under the encrypted session (the harness's CreateItem body
+   monitor proves ciphertext-only on the wire).
+3. **Replace, never duplicate.** Storing again for the same key rotates
+   the stored passphrase.
+
+`ssh-remove` deletes the single exactly-matching item; duplicates (which
+gcr cannot disambiguate either) are reported without changing anything.
+
+### Keyring items
+
+Generic, metadata-only inspection of what a collection holds:
+
+```sh
+# list a collection's items: labels, lock state, sorted attributes
+# — no secret is ever read
 gmellon items work
+```
 
-# lock a collection — an explicit state change, prompt-free
-gmellon lock work
+`ssh-list` is this view filtered to gcr's `ssh-store:` items across all
+collections.
 
-# redacted diagnostics on stderr (operations, results, lengths only)
+### Diagnostics and completions
+
+```sh
+# redacted diagnostics on stderr: operations, results, lengths only —
+# never password bytes or key material
 gmellon -v unlock work
 
 # shell completions (zsh shown; bash, elvish, fish, powershell also built in)
 gmellon completions zsh > ~/.zfunc/_gmellon
-
-# already-unlocked collections return success without checking the password;
-# already-locked collections return success without a Lock call;
-# ordinary unlock never locks or relocks a collection to verify one
 ```
 
-Omitted collection IDs default directly to `login`; there is no
-configuration layer or environment-selected default.
+zsh users generally want the [zimfw module](#zsh-integration-zimfw-module)
+instead: it installs and regenerates the completion automatically.
 
-**Password policy:** passwords are accepted only from the TTY (default) or a
-single line on stdin (`--stdin`). They are never accepted as argv or flags —
-argv is world-readable in `ps`. Password values and password-bearing request
-buffers use best-effort zeroization when dropped; command paths drop them
-promptly after each exchange. This cannot erase copies abandoned by dependency
-internals or allocator behavior.
+### Secret input contract
 
-**`--stdin` contract:** exactly one line, terminated by LF or CRLF — input
-ending without a newline is an error (an empty pipe included; an empty line is
-a valid empty password). Input must be valid UTF-8 — invalid bytes error
-rather than being replaced. Every byte before the terminator is literal
-password content: no line editing is applied, so backspace and control bytes
-from a pipe are data, not commands. Input is capped at 64 KiB. With no
-controlling terminal the TTY prompt fails with an actionable error suggesting
-`--stdin`.
+Every password and passphrase — collection passwords for `unlock` and
+`change`, key passphrases for `ssh-add` — enters through the same narrow
+door:
 
-**SSH key passphrases (`ssh-add`):** the passphrase is prompted once (TTY
-or one `--stdin` line) and verified by running `ssh-keygen -y` against the
-key through gmellon's own askpass helper — the passphrase never appears in
-argv, the environment, or a file. Only a passphrase that actually decrypts
-the key is stored, and only for keys a wrong passphrase fails against
-(unencrypted keys are refused: there is nothing to store). Storage goes to
-the collection the service's `default` alias resolves to — exactly where
-gcr-ssh-agent's libsecret lookup reads — keyed by the
-`unique=ssh-store:<absolute path>` attribute with the generic schema
-attribute, and replacing any previously stored passphrase for the same
-key. The passphrase crosses the bus sealed under the encrypted session,
-proven by the CreateItem body monitor in the harness.
+- **TTY (default)** or **one `--stdin` line**. Never argv or flags — argv
+  is world-readable in `ps` — and never environment, config, or files.
+- The `--stdin` contract: exactly one line, terminated by LF or CRLF —
+  input ending without a newline is an error (an empty pipe included; an
+  empty line is a valid empty password). Input must be valid UTF-8 —
+  invalid bytes error rather than being replaced. Every byte before the
+  terminator is literal content: no line editing is applied, so backspace
+  and control bytes from a pipe are data, not commands. Input is capped
+  at 64 KiB. `change --stdin` reads three lines: current, new,
+  confirmation.
+- With no controlling terminal the TTY prompt fails with an actionable
+  error suggesting `--stdin`.
+- Secret values and secret-bearing buffers use best-effort zeroization
+  when dropped; command paths drop them promptly after each exchange.
+  This cannot erase copies abandoned by dependency internals or allocator
+  behavior.
 
 ### Exit codes
 
 | code | meaning |
 |---|---|
 | 0 | OK — including already-unlocked and already-locked no-ops |
-| 1 | usage, input, missing collection, encrypted-session failure, or unexpected local/D-Bus error |
-| 2 | DENIED — wrong password |
+| 1 | usage, input, missing collection/key, encrypted-session failure, or unexpected local/D-Bus error |
+| 2 | DENIED — wrong password or passphrase |
 | 3 | GNOME's private password interface is unavailable |
 | 4 | session bus or GNOME Secret Service is unavailable |
 
@@ -179,12 +228,15 @@ interactive prompt exit 1 with distinct messages).
   which the daemon itself lacks.
 - **Secrets enter through one narrow door.** TTY (echo disabled) or one
   bounded stdin line. Never argv, environment, config, or retained
-  artifacts. Secret types expose only borrowed bytes and implement none of
-  `Debug`, `Clone`, or `Display`.
+  artifacts — including on the way *out* to helper processes: key
+  passphrase verification runs ssh-keygen through gmellon's askpass
+  helper rather than `-P` argv. Secret types expose only borrowed bytes
+  and implement none of `Debug`, `Clone`, or `Display`.
 - **No side effects you didn't ask for.** Unlock never locks or relocks to
-  verify a password. Lock is its own explicit command. Status never calls a
-  password method. Loading the zsh module never prompts and never runs
-  `systemctl`.
+  verify a password. Lock is its own explicit command. Status never calls
+  a password method. `ssh-add` refuses rather than store unverified or
+  where it could not be found. Loading the zsh module never prompts and
+  never runs `systemctl`.
 - **Fail closed.** An algorithm-rejecting service, a demanded prompt object,
   an out-of-range peer key, malformed monitor output — each fails with a
   clear error rather than degrading.
@@ -200,6 +252,7 @@ flowchart LR
     User["CLI invocation"] --> Cli["src/cli<br/>clap parsing, exit mapping,<br/>tracing diagnostics"]
     Cli --> Input["src/secret_input<br/>rpassword TTY prompt<br/>bounded stdin reader"]
     Input --> Secret["zeroizing Secret"]
+    Cli --> Ssh["src/ssh.rs<br/>askpass-based<br/>ssh-keygen verification"]
     Cli --> Client["secret_service::BlockingClient"]
 
     subgraph SessionCore["src/secret_service/session.rs — sans-I/O crypto core"]
@@ -208,7 +261,7 @@ flowchart LR
     end
 
     Client -->|"OpenSession negotiation"| SessionCore
-    Client --> StdProxy["standard Secret Service API<br/>collections, labels, lock state, Lock"]
+    Client --> StdProxy["standard Secret Service API<br/>collections, items, aliases,<br/>CreateItem, Lock, Delete"]
     Client --> PrivProxy["GNOME private interface<br/>password methods"]
     StdProxy --> Daemon["gnome-keyring-daemon<br/>on the session bus"]
     PrivProxy --> Daemon
@@ -227,9 +280,9 @@ implementations).
 | CLI | [`/src/cli/mod.rs`](/src/cli/mod.rs) | clap parsing, subcommand dispatch, redacted `-v` tracing, exit mapping |
 | Secret input | [`/src/secret_input/mod.rs`](/src/secret_input/mod.rs) | rpassword TTY prompts, bounded stdin records, confirmation, zeroizing ownership |
 | Session crypto core | [`/src/secret_service/session.rs`](/src/secret_service/session.rs) | DH keypair, peer-key validation, HKDF-SHA256 derivation, AES-CBC sealing — sans I/O |
-| Collection client | [`/src/secret_service/`](/src/secret_service/) | encrypted-session negotiation, collection IDs/metadata, generated zbus proxies, list/status/unlock/lock/change, error classification |
-| Historical control backend | [`/src/control/`](/src/control/) | login-only control-socket codec and client, behind `login-control` (off by default) |
+| Collection client | [`/src/secret_service/`](/src/secret_service/) | encrypted-session negotiation, collection/item metadata, aliases, generated zbus proxies, list/status/unlock/lock/change/items/ssh-*, error classification |
 | SSH key verification | [`/src/ssh.rs`](/src/ssh.rs) | askpass-based `ssh-keygen` verification of key passphrases without argv exposure |
+| Historical control backend | [`/src/control/`](/src/control/) | login-only control-socket codec and client, behind `login-control` (off by default) |
 | Executable harness | [`/dev/harness/`](/dev/harness/) | private dbus-broker + daemon lifecycles, checks, teardown, retained evidence |
 | Rust proofs | [`/tests/harness/`](/tests/harness/) | real-daemon transport, collection, binary CLI, wire-monitor, and redaction proofs |
 | Zsh module | [`/zimfw/`](/zimfw/) | SSH agent socket selection, completions regeneration — never prompts |
@@ -239,8 +292,11 @@ implementations).
 - Collections are addressed by stable D-Bus ID, with `login` as the fixed
   omitted-argument default.
 - No configuration layer for a single default value.
-- Passwords never enter argv, environment, config, or retained evidence.
+- Passwords and passphrases never enter argv, environment, config, files,
+  or retained evidence — in the product or in its tests.
 - Ordinary unlock never locks or relocks; lock is always explicit.
+- Key passphrases are verified against the key before anything is stored,
+  and stored exactly where gcr-ssh-agent will read them.
 - Never a silent fallback: not to a plain session, not to the create-capable
   control backend.
 - Sync product APIs today; the sans-I/O crypto core and generated async
@@ -331,17 +387,18 @@ the small product path, because they prove isolation, lifecycle, and
 secret-handling claims against real external processes: a private
 `dbus-broker`, a manually launched `gnome-keyring-daemon` with redirected
 `HOME`/XDG storage, streaming bus monitors that scan every password-method
-message body for generated secrets, and redaction scans over every retained
-binary stream and artifact. The harness is configuration/session isolation,
-not a security sandbox; exact boundaries and evidence live in
-[`doc/harness/README.md`](/doc/harness/README.md), with the current
-verification matrix in [`doc/status.md`](/doc/status.md).
+and CreateItem message body for generated secrets, fixture readback of
+stored secrets through a gcr-style encrypted GetSecret, and redaction scans
+over every retained binary stream and artifact. The harness is
+configuration/session isolation, not a security sandbox; exact boundaries
+and evidence live in [`doc/harness/README.md`](/doc/harness/README.md), with
+the current verification matrix in [`doc/status.md`](/doc/status.md).
 
 Ordinary checks:
 
 ```sh
-cargo nextest run                            # 90 passed, 2 skipped
-cargo nextest run --features login-control   # 117 passed, 4 skipped
+cargo nextest run                            # 98 passed, 2 skipped
+cargo nextest run --features login-control   # 125 passed, 4 skipped
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 zimfw/test.zsh                               # 68 assertions
@@ -353,10 +410,14 @@ prerequisites are absent):
 ```sh
 dev/harness/check rust-nextest  # control backend against the real daemon (feature-enabled)
 dev/harness/check rust-broker   # collection client proof under the private broker
-dev/harness/check rust-cli      # compiled list/status/unlock/lock/change proof
+dev/harness/check rust-cli      # compiled CLI proof: list/status/unlock/lock/change/items/ssh-*
 dev/harness/check broker        # private-broker lifecycle and interface suite
 dev/harness/check all           # everything above plus Python suites
 ```
+
+Encrypted test-key fixtures are generated under a pty (prompt-synchronized,
+in Rust — no scripting-language dependency), so fixture passphrases never
+touch argv, the environment, or the disk either.
 
 ### Crates
 
@@ -366,12 +427,13 @@ dev/harness/check all           # everything above plus Python suites
 | rpassword | no-echo TTY prompts |
 | zeroize | clear password and request buffers after use |
 | rustix | effective and peer UID checks (net/process features only under `login-control`) |
-| zbus | Secret Service discovery, Lock, and GNOME private password methods |
+| zbus | Secret Service discovery, items, aliases, Lock, and GNOME private password methods |
 | crypto-bigint | 1024-bit DH modpow (Montgomery ladder, zeroized exponents) |
 | sha2 + hkdf | HKDF-SHA256 session-key derivation |
-| aes + cbc | AES-128-CBC sealing with PKCS#7 padding |
+| aes + cbc | AES-128-CBC sealing with PKCS#7 padding (dev: fixture secret readback) |
 | getrandom | DH private exponents and per-Secret IVs |
 | tracing + tracing-subscriber | redacted `-v` operation diagnostics |
+| nix (dev) | pty fixture-key generation |
 
 Publishing: `cargo bump` + `jj commit` + `cargo publish` when it earns it.
 
@@ -382,12 +444,17 @@ Publishing: `cargo bump` + `jj commit` + `cargo publish` when it earns it.
   (exit 3). Locked-collection password change is confirmed against
   `gnome-keyring-daemon` 48.0 and is version-scoped evidence, not a
   promise.
+- **Item storage is only as gcr-compatible as the service's default
+  alias.** `ssh-add` stores in the collection `ReadAlias("default")`
+  resolves to, because that is where gcr-ssh-agent's libsecret lookup
+  reads; a service with no default alias is refused rather than written.
 - **No rate limiting or lockout exists server-side.** A wrong password just
   returns DENIED, from any client on the session bus — same trust boundary
   the bus itself has.
 - **Evidence is host-scoped.** Proofs ran against daemon 48.0, systemd 261,
   and dbus-broker 37; monitor parsing is pinned to the installed `busctl`
-  rendering and fails closed on unexpected shapes.
+  rendering and fails closed on unexpected shapes. Key-passphrase
+  verification behavior is OpenSSH's `ssh-keygen -y` semantics.
 - **TTY behavior** is covered through rpassword's injected-reader seam; the
   maintained real-daemon binary proofs use `--stdin`.
 
@@ -472,6 +539,7 @@ Upstream source (canonical, version-observed: gnome-keyring 48.0 / gcr
 - [GNOME/gnome-keyring `egg/egg-hkdf.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/egg/egg-hkdf.c) — the HKDF both peers use (empty salt = HashLen zeros)
 - [GNOME/gnome-keyring `daemon/dbus/gkd-secret-unlock.c`](https://gitlab.gnome.org/GNOME/gnome-keyring/-/blob/main/daemon/dbus/gkd-secret-unlock.c) — collection credential attachment and already-unlocked shortcut
 - [GNOME/gcr `gcr/gcr-ssh-agent-service.c`](https://gitlab.gnome.org/GNOME/gcr/-/blob/main/gcr/gcr-ssh-agent-service.c) — the `unique=ssh-store:<path>` passphrase-item convention (why unlocking matters for ssh)
+- [GNOME/gcr `gcr/gcr-ssh-agent-interaction.c`](https://gitlab.gnome.org/GNOME/gcr/-/blob/main/gcr/gcr-ssh-agent-interaction.c) — the lookup schema gmellon's stored items match (generic schema, `unique` field, libsecret default-collection search)
 
 Local checkouts (same content, no network):
 
@@ -481,6 +549,6 @@ Local checkouts (same content, no network):
 Context and docs:
 
 - [Arch Wiki: GNOME/Keyring](https://wiki.archlinux.org/title/GNOME/Keyring) — PAM wiring, TTY patterns, troubleshooting
-- [Secret Service API spec](https://specifications.freedesktop.org/secret-service-spec/latest/) — the D-Bus side (why `Unlock()` needs a prompt; the standard `Lock` gmellon's lock uses)
+- [Secret Service API spec](https://specifications.freedesktop.org/secret-service-spec/latest/) — the D-Bus side (why `Unlock()` needs a prompt; the standard `Lock`, `CreateItem`, and `Delete` gmellon uses)
 - [Debian `gnome-keyring` package](https://packages.debian.org/sid/gnome-keyring) / [Debian `libpam-gnome-keyring`](https://packages.debian.org/sid/libpam-gnome-keyring)
 - JtR `gnome2john` — precedent that the on-disk keyring format is parseable offline (rescue path of last resort)
