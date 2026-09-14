@@ -124,6 +124,10 @@ fn run_proof(secrets: &ProofSecrets) {
     // pipes; decoded bodies never touch disk.
     let password_monitor = BodyMonitor::password_methods(&bus.address, &bus.root, secrets);
     let negotiation_monitor = BodyMonitor::open_sessions(&bus.address, &bus.root, secrets);
+    // The item-creation monitor: CreateItem is the only standard-API path a
+    // passphrase can travel, so its bodies get the same encrypted-shape and
+    // leak-scan treatment as the private password methods.
+    let create_item_monitor = BodyMonitor::create_items(&bus.address, &bus.root, secrets);
 
     // Fixture connection: separate D-Bus unique name from the product binary,
     // so every observed Lock call can be attributed to a sender. The fixture
@@ -144,6 +148,12 @@ fn run_proof(secrets: &ProofSecrets) {
         .expect("fixture CreateWithMasterPassword second");
     assert_ne!(login_path, second_path);
     fixture.lock(&login_path).expect("fixture Lock login");
+    // Establish the default alias exactly as a real desktop session has it:
+    // gcr-ssh-agent's libsecret lookup resolves through it. The private
+    // creation path does not set aliases by itself.
+    fixture
+        .set_alias("default", &login_path)
+        .expect("fixture SetAlias default -> login");
     fixture.lock(&second_path).expect("fixture Lock second");
 
     // --- `gmellon list`: deterministic rows for both fixtures -------------
@@ -505,6 +515,225 @@ fn run_proof(secrets: &ProofSecrets) {
     );
     assert_eq!(exit_code(&rotated_second_unlock), Some(0));
     assert_listed_locked(secrets, &second_id, false, "second after the lock rotation");
+
+    // --- `gmellon ssh-add` / `items` / `ssh-list` / `ssh-remove` ---------
+    // Entering this section both collections are unlocked; the harness's
+    // default alias points at the exact-login fixture, which is where
+    // gcr-ssh-agent's libsecret lookup goes. The proof's key passphrase is
+    // a generated secret like the collection passwords: it must appear in
+    // no stream, artifact, or bus body in the clear (the CreateItem body
+    // monitor below enforces the wire side).
+    let key_path = bus.root.join("proof-ssh-key");
+    let key_generated = common::generate_encrypted_ssh_key(&key_path, secrets.key_pass.as_slice());
+    assert!(
+        key_generated.success(),
+        "the proof's encrypted ssh key must generate"
+    );
+    let key_canonical = std::fs::canonicalize(&key_path).expect("canonical proof key path");
+    let key_unique = format!("ssh-store:{}", key_canonical.display());
+
+    let plain_key_path = bus.root.join("proof-plain-key");
+    let plain_generated = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&plain_key_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("generate the unencrypted proof key");
+    assert!(
+        plain_generated.success(),
+        "the plain proof key must generate"
+    );
+
+    let ssh_list = |stage: &str| -> std::process::Output {
+        run_gmellon(&["ssh-list"], CliStdin::FailIfRead, secrets, stage)
+    };
+    let ssh_list_key_rows = |output: &std::process::Output| -> usize {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .skip(1)
+            .filter(|line| line.starts_with(&format!("{}\t", key_canonical.display())))
+            .count()
+    };
+
+    // Before storing: no rows anywhere, and the fresh login collection
+    // holds no items at all.
+    let before = ssh_list("ssh-list before any store");
+    assert_eq!(exit_code(&before), Some(0));
+    assert_eq!(ssh_list_key_rows(&before), 0, "nothing is stored yet");
+    let items_before = run_gmellon(
+        &["items", "login"],
+        CliStdin::FailIfRead,
+        secrets,
+        "items login before any store",
+    );
+    assert_eq!(exit_code(&items_before), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&items_before.stdout)
+            .lines()
+            .count(),
+        1,
+        "a fresh login collection lists only the header"
+    );
+
+    // A wrong passphrase is refused with exit 2 and stores nothing.
+    let wrong_add = run_gmellon(
+        &["ssh-add", key_canonical.to_str().unwrap(), "--stdin"],
+        CliStdin::Password(password_line(&secrets.wrong)),
+        secrets,
+        "ssh-add with the wrong passphrase",
+    );
+    assert_eq!(
+        exit_code(&wrong_add),
+        Some(2),
+        "a wrong key passphrase must exit 2"
+    );
+    assert!(
+        String::from_utf8_lossy(&wrong_add.stderr).contains("WRONG"),
+        "the wrong-passphrase refusal must say so"
+    );
+    assert!(
+        wrong_add.stdout.is_empty(),
+        "a refused ssh-add must not write stdout"
+    );
+    let after_wrong = ssh_list("ssh-list after the refused store");
+    assert_eq!(ssh_list_key_rows(&after_wrong), 0, "nothing was stored");
+
+    // An unencrypted key has nothing to store: exit 1.
+    let plain_add = run_gmellon(
+        &["ssh-add", plain_key_path.to_str().unwrap(), "--stdin"],
+        CliStdin::Password(password_line(&secrets.key_pass)),
+        secrets,
+        "ssh-add against an unencrypted key",
+    );
+    assert_eq!(
+        exit_code(&plain_add),
+        Some(1),
+        "an unencrypted key must be refused with exit 1"
+    );
+    assert!(
+        String::from_utf8_lossy(&plain_add.stderr).contains("not passphrase-protected"),
+        "the unencrypted refusal must say what it found"
+    );
+
+    // The verified store: exit 0, stored exactly where gcr looks.
+    let stored = run_gmellon(
+        &["ssh-add", key_canonical.to_str().unwrap(), "--stdin"],
+        CliStdin::Password(password_line(&secrets.key_pass)),
+        secrets,
+        "ssh-add with the verified passphrase",
+    );
+    assert_eq!(
+        exit_code(&stored),
+        Some(0),
+        "a verified passphrase must store successfully"
+    );
+    let stored_stdout = String::from_utf8_lossy(&stored.stdout);
+    assert!(
+        stored_stdout.contains("stored in collection login & verified against the key"),
+        "the successful store must say where and that it verified: {stored_stdout}"
+    );
+
+    let listed = ssh_list("ssh-list after the verified store");
+    assert_eq!(exit_code(&listed), Some(0));
+    assert_eq!(
+        ssh_list_key_rows(&listed),
+        1,
+        "exactly one stored passphrase row must exist"
+    );
+    assert!(
+        String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .any(|line| line == format!("{}\tlogin\tno", key_canonical.display())),
+        "the stored row must name the key, the login collection, and the unlocked state"
+    );
+
+    let items_after = run_gmellon(
+        &["items", "login"],
+        CliStdin::FailIfRead,
+        secrets,
+        "items login after the verified store",
+    );
+    assert_eq!(exit_code(&items_after), Some(0));
+    let items_text = String::from_utf8_lossy(&items_after.stdout);
+    let expected_attributes =
+        format!("unique={key_unique},xdg:schema=org.freedesktop.Secret.Generic");
+    assert!(
+        items_text.lines().any(
+            |line| line.starts_with("Unlock password for: proof-ssh-key\tno\t")
+                && line.ends_with(&expected_attributes)
+        ),
+        "the item row must carry the gcr label and attributes: {items_text}"
+    );
+
+    // Storing again replaces rather than duplicates.
+    let stored_again = run_gmellon(
+        &["ssh-add", key_canonical.to_str().unwrap(), "--stdin"],
+        CliStdin::Password(password_line(&secrets.key_pass)),
+        secrets,
+        "ssh-add replacing the stored passphrase",
+    );
+    assert_eq!(exit_code(&stored_again), Some(0));
+    let after_replace = ssh_list("ssh-list after the replacing store");
+    assert_eq!(
+        ssh_list_key_rows(&after_replace),
+        1,
+        "replace=true must rotate the item, not duplicate it"
+    );
+
+    // The stored secret is exactly the passphrase the proof fed in, read
+    // back the way gcr-ssh-agent reads it: GetSecret under an encrypted
+    // session, decrypted with the reading side's session key.
+    let readback = fixture
+        .read_item_secret_by_unique(&login_path, &key_unique)
+        .expect("fixture reads the stored item back");
+    assert_eq!(
+        readback.as_slice(),
+        secrets.key_pass.as_slice(),
+        "the stored item secret must equal the verified passphrase"
+    );
+
+    // Removal: exactly the matching item, and a second removal finds
+    // nothing.
+    let removed = run_gmellon(
+        &["ssh-remove", key_canonical.to_str().unwrap()],
+        CliStdin::FailIfRead,
+        secrets,
+        "ssh-remove the stored passphrase",
+    );
+    assert_eq!(
+        exit_code(&removed),
+        Some(0),
+        "removing the stored passphrase must exit 0"
+    );
+    assert!(
+        String::from_utf8_lossy(&removed.stdout).contains(&format!(
+            "removed stored passphrase for {}",
+            key_canonical.display()
+        )),
+        "the removal must name the key"
+    );
+    let after_remove = ssh_list("ssh-list after removal");
+    assert_eq!(
+        ssh_list_key_rows(&after_remove),
+        0,
+        "the stored passphrase must be gone"
+    );
+    let removed_again = run_gmellon(
+        &["ssh-remove", key_canonical.to_str().unwrap()],
+        CliStdin::FailIfRead,
+        secrets,
+        "ssh-remove with nothing stored",
+    );
+    assert_eq!(
+        exit_code(&removed_again),
+        Some(1),
+        "removing a missing stored passphrase must exit 1"
+    );
+    assert!(
+        String::from_utf8_lossy(&removed_again.stderr).contains("no stored passphrase"),
+        "the missing-store removal must say so"
+    );
 
     // --- missing collection: actionable exit 1 before any password use ----
     let missing = run_gmellon(
@@ -909,10 +1138,33 @@ fn run_proof(secrets: &ProofSecrets) {
         );
     }
 
+    // The CreateItem wire evidence: exactly the two legitimate stores (the
+    // verified store and the replacing store) reached the daemon, every one
+    // with an encrypted Secret. The finish call itself fails closed on any
+    // leak of the key passphrase into a captured body, and the refused and
+    // unencrypted attempts never got here to be counted.
+    let created = create_item_monitor.finish(secrets);
+    assert_eq!(
+        created.messages.len(),
+        2,
+        "exactly the verified store and the replacing store may create items"
+    );
+    assert!(
+        created
+            .messages
+            .iter()
+            .all(|message| message.encrypted_secrets),
+        "every CreateItem body must carry a well-formed encrypted secret"
+    );
+
+    // The wrong-passphrase and unencrypted-key ssh-add refusals verify the
+    // key before ever connecting, so those invocations negotiate nothing.
+    let verify_refused_invocations = 2_usize;
+
     let negotiations = negotiation_monitor.finish(secrets);
     assert_eq!(
         negotiations.messages.len(),
-        INVOCATIONS.load(Ordering::Relaxed) + 1,
+        INVOCATIONS.load(Ordering::Relaxed) + 1 - verify_refused_invocations,
         "one encrypted OpenSession per CLI invocation (every invocation constructs the \
          client) plus the fixture's own negotiation must be captured"
     );

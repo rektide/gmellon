@@ -42,7 +42,18 @@ fn zsh_completions_name_subcommands_and_pass_zsh_n() {
     let output = run_completions("zsh");
     assert_eq!(output.status.code(), Some(0));
     let script = String::from_utf8(output.stdout.clone()).expect("zsh script is UTF-8");
-    for subcommand in ["list", "status", "unlock", "change", "completions"] {
+    for subcommand in [
+        "list",
+        "status",
+        "unlock",
+        "lock",
+        "items",
+        "ssh-list",
+        "ssh-add",
+        "ssh-remove",
+        "change",
+        "completions",
+    ] {
         assert!(
             script.contains(subcommand),
             "the zsh script must name the {subcommand} subcommand"

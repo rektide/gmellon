@@ -215,3 +215,74 @@ pub fn scan_directory(directory: &Path, secrets: &[&[u8]]) {
         // scan scope.
     }
 }
+
+/// Generate an encrypted OpenSSH ed25519 key at `key` under a pty.
+///
+/// ssh-keygen's new-key passphrase prompts read piped stdin directly and
+/// buffered (both enter+confirm lines land in one read and mismatch, and
+/// the key is silently saved unencrypted), and askpass is not consulted
+/// for those prompts. A pty keeps ssh-keygen interactive, and this helper
+/// waits for each `passphrase` prompt before writing its line, one line
+/// per prompt, so the passphrase never touches argv, the environment, or
+/// the disk. Returns the ssh-keygen exit status.
+///
+/// Used by the proofs that generate SSH keys; other binaries including
+/// this module do not.
+#[allow(dead_code)]
+pub fn generate_encrypted_ssh_key(key: &Path, passphrase: &[u8]) -> std::process::ExitStatus {
+    use nix::pty::openpty;
+    use std::io::{Read, Write};
+
+    // Default winsize and termios are fine: ssh-keygen only needs the line
+    // discipline.
+    let pair =
+        openpty(None::<&nix::pty::Winsize>, None).expect("allocate a pty for key generation");
+
+    // One File for prompt-synchronized master I/O; three duplicated slave
+    // descriptors so each stdio slot owns exactly one and every close
+    // happens exactly once.
+    let mut master = File::from(pair.master);
+    let slave_out = pair.slave.try_clone().expect("duplicate pty slave");
+    let slave_err = pair.slave.try_clone().expect("duplicate pty slave");
+    let mut child = Command::new("ssh-keygen")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-f")
+        .arg(key)
+        .stdin(std::process::Stdio::from(pair.slave))
+        .stdout(std::process::Stdio::from(slave_out))
+        .stderr(std::process::Stdio::from(slave_err))
+        .spawn()
+        .expect("spawn ssh-keygen on the pty");
+
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    for _ in 0..2 {
+        // Wait for the prompt before writing: ssh-keygen reconfigures the
+        // terminal around each read, and premature writes race it.
+        while !pending
+            .windows(b"passphrase".len())
+            .any(|window| window == b"passphrase")
+        {
+            match master.read(&mut chunk) {
+                Ok(0) | Err(_) => {
+                    return child.wait().expect("reap ssh-keygen after pty EOF/error");
+                }
+                Ok(read) => pending.extend_from_slice(&chunk[..read]),
+            }
+        }
+        pending.clear();
+        master
+            .write_all(passphrase)
+            .and_then(|()| master.write_all(b"\n"))
+            .expect("write the passphrase line over the pty");
+    }
+    // Drain until the child exits and the pty closes.
+    loop {
+        match master.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    child.wait().expect("reap ssh-keygen")
+}

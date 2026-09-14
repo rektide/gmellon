@@ -80,6 +80,12 @@ pub const PASSWORD_INTERFACE_MATCH: &str =
 /// header- and algorithm-derived facts all the same.
 pub const OPEN_SESSION_MATCH: &str =
     "interface='org.freedesktop.Secret.Service',member='OpenSession'";
+/// The item-creation monitor sees CreateItem calls on Secret Service
+/// collections: the only standard-API path a passphrase can travel. Bodies
+/// are secret-bearing by design, so the pipe/reader discipline of the
+/// password monitor applies unchanged.
+pub const CREATE_ITEM_MATCH: &str =
+    "interface='org.freedesktop.Secret.Collection',member='CreateItem'";
 /// The exact body line the installed busctl renders for the encrypted
 /// session algorithm string inside an OpenSession call.
 pub const DH_ALGORITHM_LINE: &str = "STRING \"dh-ietf1024-sha256-aes128-cbc-pkcs7\";";
@@ -214,6 +220,12 @@ trait FixtureService {
         &self,
         objects: &[ObjectPath<'_>],
     ) -> zbus::Result<(Vec<OwnedObjectPath>, OwnedObjectPath)>;
+
+    /// TEST-FIXTURE ONLY: point an alias such as "default" at a collection,
+    /// mirroring the state a real desktop session has (a real system's
+    /// default alias resolves to its login keyring; the private fixture
+    /// creation path does not establish one by itself).
+    fn set_alias(&self, name: &str, collection: &ObjectPath<'_>) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(
@@ -229,6 +241,56 @@ trait FixtureGnomeInternal {
         properties: &HashMap<&str, Value<'_>>,
         master: FixtureSecret<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.Secret.Collection",
+    default_service = "org.freedesktop.secrets"
+)]
+trait FixtureCollection {
+    #[zbus(property)]
+    fn items(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.Secret.Item",
+    default_service = "org.freedesktop.secrets"
+)]
+trait FixtureItem {
+    #[zbus(property)]
+    fn attributes(&self) -> zbus::Result<HashMap<String, String>>;
+
+    /// TEST-FIXTURE ONLY: read one item's secret under the caller's
+    /// encrypted session; the returned tuple is the wire Secret.
+    fn get_secret(
+        &self,
+        session: &ObjectPath<'_>,
+    ) -> zbus::Result<(OwnedObjectPath, Vec<u8>, Vec<u8>, String)>;
+}
+
+/// TEST-FIXTURE ONLY: decrypt one wire Secret under the fixture's session
+/// key, mirroring what gcr-ssh-agent would obtain from the item. Lives in
+/// the test harness: the product never decrypts.
+pub fn fixture_open(
+    key: &session::SessionKey,
+    iv: &[u8],
+    ciphertext: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    use aes::cipher::BlockModeDecrypt;
+    use aes::cipher::{InnerIvInit, Key, KeyInit};
+    use cbc::Decryptor;
+
+    type Aes128 = aes::Aes128;
+    let cipher = Aes128::new(&Key::<Aes128>::from(
+        <[u8; 16]>::try_from(key.as_slice()).map_err(|_| "session key is not 16 bytes")?,
+    ));
+    let decryptor = Decryptor::<Aes128>::inner_iv_slice_init(cipher, iv)
+        .map_err(|_| "item secret IV is not 16 bytes")?;
+    let mut buffer = ciphertext.to_vec();
+    let plaintext = decryptor
+        .decrypt_padded::<aes::cipher::block_padding::Pkcs7>(&mut buffer)
+        .map_err(|_| "item secret failed to decrypt under the fixture session")?;
+    Ok(Zeroizing::new(plaintext.to_vec()))
 }
 
 impl Fixture {
@@ -267,8 +329,62 @@ impl Fixture {
             .to_string()
     }
 
+    /// TEST-FIXTURE ONLY: read one item's secret back by its exact `unique`
+    /// attribute, decrypting under the fixture's encrypted session — the
+    /// same read gcr-ssh-agent performs. Proves the stored value equals the
+    /// passphrase the proof fed to `ssh-add`.
+    pub fn read_item_secret_by_unique(
+        &self,
+        collection: &OwnedObjectPath,
+        unique_value: &str,
+    ) -> Result<Zeroizing<Vec<u8>>, FixtureError> {
+        let collection_proxy = FixtureCollectionProxyBlocking::builder(&self.connection)
+            .destination("org.freedesktop.secrets")
+            .map_err(FixtureError::Transport)?
+            .path(collection.clone())
+            .map_err(FixtureError::Transport)?
+            .build()
+            .map_err(FixtureError::Transport)?;
+        for item_path in collection_proxy.items().map_err(FixtureError::Transport)? {
+            let item_proxy = FixtureItemProxyBlocking::builder(&self.connection)
+                .destination("org.freedesktop.secrets")
+                .map_err(FixtureError::Transport)?
+                .path(item_path)
+                .map_err(FixtureError::Transport)?
+                .build()
+                .map_err(FixtureError::Transport)?;
+            let attributes = item_proxy.attributes().map_err(FixtureError::Transport)?;
+            if attributes.get("unique").map(String::as_str) == Some(unique_value) {
+                let session: ObjectPath<'_> = self.session_path.as_ref();
+                let (_session, iv, value, _content_type) = item_proxy
+                    .get_secret(&session)
+                    .map_err(FixtureError::Transport)?;
+                return Ok(fixture_open(&self.session_key, &iv, &value)
+                    .unwrap_or_else(|reason| panic!("fixture secret readback failed: {reason}")));
+            }
+        }
+        Err(FixtureError::Session(
+            gmellon::secret_service::Error::SshKeyItemNotFound {
+                key: unique_value.to_owned(),
+            },
+        ))
+    }
+
     pub fn lock_calls(&self) -> usize {
         self.lock_calls
+    }
+
+    /// Test-fixture setup only: point an alias such as "default" at a
+    /// collection, mirroring a real desktop session (whose default alias
+    /// resolves to the login keyring). The private fixture creation path
+    /// does not establish aliases.
+    pub fn set_alias(&self, name: &str, collection: &OwnedObjectPath) -> Result<(), FixtureError> {
+        let service =
+            FixtureServiceProxyBlocking::new(&self.connection).map_err(FixtureError::Transport)?;
+        let path: ObjectPath<'_> = collection.as_ref();
+        service
+            .set_alias(name, &path)
+            .map_err(FixtureError::Transport)
     }
 
     /// Test-fixture setup only: standard Lock on one disposable collection.
@@ -889,6 +1005,10 @@ pub enum BodyMode {
     /// algorithm is the encrypted-session one and that a 1..=128-byte DH
     /// public key array traveled.
     OpenSessions,
+    /// Secret Service CreateItem calls on collections. Verdicts assert each
+    /// created item's Secret traveled encrypted: a 16-byte IV array plus a
+    /// non-empty 16-multiple ciphertext array as the trailing pair.
+    CreateItems,
 }
 
 /// Header- and length-derived facts for one captured method call. Never
@@ -1152,7 +1272,7 @@ impl BodyScanner {
             return;
         };
         match self.mode {
-            BodyMode::PasswordMethods => {
+            BodyMode::PasswordMethods | BodyMode::CreateItems => {
                 match encrypted_secret_shape(&message.member, &message.array_lengths) {
                     Ok(shape) => message.encrypted_secrets = shape,
                     Err(reason) => self.failures.push(reason),
@@ -1198,6 +1318,12 @@ fn encrypted_secret_shape(member: &str, array_lengths: &[usize]) -> Result<bool,
         "CreateWithMasterPassword" => {
             // The properties dictionary precedes the master Secret; only the
             // trailing pair is the Secret.
+            array_lengths.len() >= 2 && one_secret(&array_lengths[array_lengths.len() - 2..])
+        }
+        // The a{sv} properties render as strings; the Secret's IV and
+        // ciphertext arrays are the only `ay` bodies, so the trailing pair
+        // is the encrypted Secret.
+        "CreateItem" => {
             array_lengths.len() >= 2 && one_secret(&array_lengths[array_lengths.len() - 2..])
         }
         other => {
@@ -1305,6 +1431,17 @@ impl BodyMonitor {
             BodyMode::OpenSessions,
             OPEN_SESSION_MATCH,
             "open-session-monitor",
+            address,
+            root,
+            secrets.named().to_vec(),
+        )
+    }
+
+    pub fn create_items(address: &str, root: &Path, secrets: &ProofSecrets) -> Self {
+        Self::start(
+            BodyMode::CreateItems,
+            CREATE_ITEM_MATCH,
+            "create-item-monitor",
             address,
             root,
             secrets.named().to_vec(),
@@ -1472,6 +1609,9 @@ pub struct ProofSecrets {
     /// The rotated password for the second collection: `second` becomes
     /// invalid and `second_two` unlocks after a proven `gmellon change`.
     pub second_two: Zeroizing<Vec<u8>>,
+    /// The passphrase of the proof's generated SSH key; it must appear in
+    /// no stream, artifact, or bus body in the clear.
+    pub key_pass: Zeroizing<Vec<u8>>,
 }
 
 impl ProofSecrets {
@@ -1481,6 +1621,8 @@ impl ProofSecrets {
         let login_two = common::distinct_password(&[&login, &second]);
         let second_two = common::distinct_password(&[&login, &second, &login_two]);
         let wrong = common::distinct_password(&[&login, &second, &login_two, &second_two]);
+        let key_pass =
+            common::distinct_password(&[&login, &second, &login_two, &second_two, &wrong]);
 
         // Not a secret: a printable tag identifying this run's second fixture.
         let mut random = [0_u8; 4];
@@ -1497,6 +1639,7 @@ impl ProofSecrets {
             wrong,
             login_two,
             second_two,
+            key_pass,
         }
     }
 
@@ -1507,16 +1650,18 @@ impl ProofSecrets {
             self.wrong.as_slice(),
             self.login_two.as_slice(),
             self.second_two.as_slice(),
+            self.key_pass.as_slice(),
         ]
     }
 
-    pub fn named(&self) -> [(&'static str, &[u8]); 5] {
+    pub fn named(&self) -> [(&'static str, &[u8]); 6] {
         [
             ("login", self.login.as_slice()),
             ("second", self.second.as_slice()),
             ("wrong", self.wrong.as_slice()),
             ("login_two", self.login_two.as_slice()),
             ("second_two", self.second_two.as_slice()),
+            ("key_pass", self.key_pass.as_slice()),
         ]
     }
 }
