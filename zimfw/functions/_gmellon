@@ -56,6 +56,51 @@ _arguments "${_arguments_options[@]}" : \
 '::collection -- Stable collection ID; defaults to login:_default' \
 && ret=0
 ;;
+(lock)
+_arguments "${_arguments_options[@]}" : \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::collection -- Stable collection ID; defaults to login:_default' \
+&& ret=0
+;;
+(items)
+_arguments "${_arguments_options[@]}" : \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::collection -- Stable collection ID; defaults to login:_default' \
+&& ret=0
+;;
+(ssh-list)
+_arguments "${_arguments_options[@]}" : \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(ssh-add)
+_arguments "${_arguments_options[@]}" : \
+'--stdin[Read one passphrase line from stdin instead of prompting on the TTY]' \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':key -- Path to the SSH private key:_files' \
+&& ret=0
+;;
+(ssh-remove)
+_arguments "${_arguments_options[@]}" : \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':key -- Path to the SSH private key the passphrase was stored for:_files' \
+&& ret=0
+;;
 (change)
 _arguments "${_arguments_options[@]}" : \
 '--stdin[Read current, new, and confirmation lines from stdin]' \
@@ -99,6 +144,26 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(lock)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(items)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ssh-list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ssh-add)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ssh-remove)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (change)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -126,6 +191,11 @@ _gmellon_commands() {
 'list:List collection IDs, labels, and lock state' \
 'status:Report service capabilities and collection lock state' \
 'unlock:Unlock an existing collection' \
+'lock:Lock an existing collection' \
+'items:List items inside a collection\: labels, lock state, attributes' \
+'ssh-list:List stored SSH key passphrases' \
+'ssh-add:Store an SSH key passphrase, verified against the key first' \
+'ssh-remove:Remove a stored SSH key passphrase' \
 'change:Change an existing collection'\''s password' \
 'completions:Generate shell completions' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -148,6 +218,11 @@ _gmellon__subcmd__help_commands() {
 'list:List collection IDs, labels, and lock state' \
 'status:Report service capabilities and collection lock state' \
 'unlock:Unlock an existing collection' \
+'lock:Lock an existing collection' \
+'items:List items inside a collection\: labels, lock state, attributes' \
+'ssh-list:List stored SSH key passphrases' \
+'ssh-add:Store an SSH key passphrase, verified against the key first' \
+'ssh-remove:Remove a stored SSH key passphrase' \
 'change:Change an existing collection'\''s password' \
 'completions:Generate shell completions' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -169,10 +244,35 @@ _gmellon__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'gmellon help help commands' commands "$@"
 }
+(( $+functions[_gmellon__subcmd__help__subcmd__items_commands] )) ||
+_gmellon__subcmd__help__subcmd__items_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help items commands' commands "$@"
+}
 (( $+functions[_gmellon__subcmd__help__subcmd__list_commands] )) ||
 _gmellon__subcmd__help__subcmd__list_commands() {
     local commands; commands=()
     _describe -t commands 'gmellon help list commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__lock_commands] )) ||
+_gmellon__subcmd__help__subcmd__lock_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help lock commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__ssh-add_commands] )) ||
+_gmellon__subcmd__help__subcmd__ssh-add_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help ssh-add commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__ssh-list_commands] )) ||
+_gmellon__subcmd__help__subcmd__ssh-list_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help ssh-list commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__ssh-remove_commands] )) ||
+_gmellon__subcmd__help__subcmd__ssh-remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help ssh-remove commands' commands "$@"
 }
 (( $+functions[_gmellon__subcmd__help__subcmd__status_commands] )) ||
 _gmellon__subcmd__help__subcmd__status_commands() {
@@ -184,10 +284,35 @@ _gmellon__subcmd__help__subcmd__unlock_commands() {
     local commands; commands=()
     _describe -t commands 'gmellon help unlock commands' commands "$@"
 }
+(( $+functions[_gmellon__subcmd__items_commands] )) ||
+_gmellon__subcmd__items_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon items commands' commands "$@"
+}
 (( $+functions[_gmellon__subcmd__list_commands] )) ||
 _gmellon__subcmd__list_commands() {
     local commands; commands=()
     _describe -t commands 'gmellon list commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__lock_commands] )) ||
+_gmellon__subcmd__lock_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon lock commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__ssh-add_commands] )) ||
+_gmellon__subcmd__ssh-add_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon ssh-add commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__ssh-list_commands] )) ||
+_gmellon__subcmd__ssh-list_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon ssh-list commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__ssh-remove_commands] )) ||
+_gmellon__subcmd__ssh-remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon ssh-remove commands' commands "$@"
 }
 (( $+functions[_gmellon__subcmd__status_commands] )) ||
 _gmellon__subcmd__status_commands() {

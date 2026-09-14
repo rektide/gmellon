@@ -5,7 +5,7 @@ description: Current product architecture, validated capabilities, security boun
 resource: /doc/status.md
 tags: [gmellon, gnome-keyring, secret-service, rust, status]
 status: draft
-generated: { by: model:openai/gpt-6, at: 2026-09-13T15:20:00-04:00 }
+generated: { by: model:openai/gpt-6, at: 2026-09-14T12:00:00-04:00 }
 stale_after: 2026-10-13
 sources:
   - id: product-spec
@@ -65,6 +65,10 @@ gmellon status
 gmellon unlock [COLLECTION]
 gmellon unlock [COLLECTION] --stdin
 gmellon lock [COLLECTION]
+gmellon items [COLLECTION]
+gmellon ssh-list
+gmellon ssh-add KEY [--stdin]
+gmellon ssh-remove KEY
 gmellon change [COLLECTION]
 gmellon change [COLLECTION] --stdin
 gmellon completions SHELL
@@ -79,6 +83,19 @@ gmellon -v [COMMAND]   # redacted diagnostics on stderr
   never a password method), and a lock summary consistent with `list`. It
   never prompts, unlocks, or locks.
 - `unlock --stdin` reads one LF/CRLF-terminated UTF-8 line.
+- `items` lists a collection's item metadata (label, lock state, sorted
+  attributes) without reading any secret; `ssh-list` filters all
+  collections for gcr's `ssh-store:` items.
+- `ssh-add KEY` prompts for the key's passphrase (TTY or one `--stdin`
+  line), verifies it against the key via ssh-keygen and gmellon's askpass
+  helper (never argv), and stores it — sealed under the encrypted session
+  via CreateItem with `replace=true` — in the `default`-alias collection
+  with the gcr-matching `unique=ssh-store:<path>` and generic-schema
+  attributes. A wrong passphrase stores nothing (exit 2); an unencrypted
+  key is refused (exit 1); an unset default alias is refused with an
+  explanation.
+- `ssh-remove KEY` deletes the exactly-matching stored item; duplicates
+  are reported without changes, and the key file itself need not exist.
 - `lock` is an explicit state change through the standard `Service.Lock`
   API: already-locked is a successful no-op that makes no Lock call, and a
   demanded interactive prompt object fails closed rather than being
@@ -286,9 +303,9 @@ Ordinary development checks currently report:
 
 ```text
 cargo nextest run
-90 passed, 2 skipped
+98 passed, 2 skipped
 cargo nextest run --features login-control
-117 passed, 4 skipped
+125 passed, 4 skipped
 ```
 
 The zsh module suite reports independently:
@@ -312,7 +329,7 @@ returns with the feature:
 
 ```text
 cargo nextest run --features login-control
-106 passed, 4 skipped
+125 passed, 4 skipped
 ```
 
 The four ignored tests are explicit external-daemon proofs rather than silent
@@ -359,12 +376,19 @@ rustdoc.
 
 ## Open work
 
-No release blocker remains open, and the epic's declared boundary — release
-security plus packaging/polish — is complete. The stretch items (explicit
-`lock`, login-hook documentation) have also landed.
+No release blocker remains open. The original epic's boundary — release
+security plus packaging/polish — plus its stretch items landed. The item
+and SSH key management layer (`gmell-key-mgmt`) has landed its P2/P3
+items: item listing, gcr-compatible verified `ssh-add`, `ssh-list`, and
+`ssh-remove`, all with CreateItem body-monitor and fixture-readback
+proofs.
 
 ### Product follow-ups
 
+- **`gmell-ssh-verify` (P4):** re-verify stored passphrases against their
+  keys; introduces the first product path that reads a secret back.
+- **`gmell-askpass-helper` (P4, exploratory):** gmellon as an SSH_ASKPASS
+  provider backed by the keyring; needs a threat-model note first.
 - **`gmell-firmament-config` (P4, deferred):** Firmament is under active
   rebuild and no current configuration domain justifies adoption. The fixed
   default remains `login`; explicit collection IDs remain command arguments.

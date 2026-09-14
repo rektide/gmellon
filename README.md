@@ -87,6 +87,26 @@ gmellon change work
 # scripting: current, new, and confirmation lines in that order
 gmellon change work --stdin < /dev/shm/password-change
 
+# list every stored SSH key passphrase across all collections
+# (metadata only; keyed the way gcr-ssh-agent looks them up)
+gmellon ssh-list
+
+# store an SSH key passphrase — prompted for the KEY's passphrase
+# (not the keyring password), verified against the key with ssh-keygen
+# first, and only then stored where gcr-ssh-agent finds it; a wrong
+# passphrase stores nothing, an unencrypted key has nothing to store
+gmellon ssh-add ~/.ssh/deck
+
+# scripting: read the passphrase from one stdin line instead
+gmellon ssh-add ~/.ssh/deck --stdin < /dev/shm/pw
+
+# remove a stored key passphrase (the key file itself may be long gone)
+gmellon ssh-remove ~/.ssh/deck
+
+# list a collection's items: labels, lock state, attributes — metadata
+# only, no secret is ever read
+gmellon items work
+
 # lock a collection — an explicit state change, prompt-free
 gmellon lock work
 
@@ -119,6 +139,19 @@ password content: no line editing is applied, so backspace and control bytes
 from a pipe are data, not commands. Input is capped at 64 KiB. With no
 controlling terminal the TTY prompt fails with an actionable error suggesting
 `--stdin`.
+
+**SSH key passphrases (`ssh-add`):** the passphrase is prompted once (TTY
+or one `--stdin` line) and verified by running `ssh-keygen -y` against the
+key through gmellon's own askpass helper — the passphrase never appears in
+argv, the environment, or a file. Only a passphrase that actually decrypts
+the key is stored, and only for keys a wrong passphrase fails against
+(unencrypted keys are refused: there is nothing to store). Storage goes to
+the collection the service's `default` alias resolves to — exactly where
+gcr-ssh-agent's libsecret lookup reads — keyed by the
+`unique=ssh-store:<absolute path>` attribute with the generic schema
+attribute, and replacing any previously stored passphrase for the same
+key. The passphrase crosses the bus sealed under the encrypted session,
+proven by the CreateItem body monitor in the harness.
 
 ### Exit codes
 
@@ -196,6 +229,7 @@ implementations).
 | Session crypto core | [`/src/secret_service/session.rs`](/src/secret_service/session.rs) | DH keypair, peer-key validation, HKDF-SHA256 derivation, AES-CBC sealing — sans I/O |
 | Collection client | [`/src/secret_service/`](/src/secret_service/) | encrypted-session negotiation, collection IDs/metadata, generated zbus proxies, list/status/unlock/lock/change, error classification |
 | Historical control backend | [`/src/control/`](/src/control/) | login-only control-socket codec and client, behind `login-control` (off by default) |
+| SSH key verification | [`/src/ssh.rs`](/src/ssh.rs) | askpass-based `ssh-keygen` verification of key passphrases without argv exposure |
 | Executable harness | [`/dev/harness/`](/dev/harness/) | private dbus-broker + daemon lifecycles, checks, teardown, retained evidence |
 | Rust proofs | [`/tests/harness/`](/tests/harness/) | real-daemon transport, collection, binary CLI, wire-monitor, and redaction proofs |
 | Zsh module | [`/zimfw/`](/zimfw/) | SSH agent socket selection, completions regeneration — never prompts |
