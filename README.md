@@ -129,6 +129,13 @@ gmellon ssh-list
 
 # remove a stored passphrase (the key file itself may be long gone)
 gmellon ssh-remove ~/.ssh/deck
+
+# also grant the askpass helper permission to answer for this key
+gmellon ssh-add ~/.ssh/deck --askpass
+
+# grant or revoke that permission on an already-stored key
+gmellon ssh-allow ~/.ssh/deck
+gmellon ssh-deny ~/.ssh/deck
 ```
 
 The `ssh-add` contract, in order:
@@ -151,6 +158,35 @@ The `ssh-add` contract, in order:
 
 `ssh-remove` deletes the single exactly-matching item; duplicates (which
 gcr cannot disambiguate either) are reported without changing anything.
+
+#### The askpass helper
+
+OpenSSH asks for key passphrases by execing the program in `SSH_ASKPASS`
+with the prompt as its only argument and reading one line from its stdout
+(OpenSSH 8.4+ can force this anywhere with `SSH_ASKPASS_REQUIRE=force`).
+gmellon can be that program, answering from the same stored items gcr
+reads — headless `ssh`, `ssh-add`, and `git`-over-ssh included:
+
+```sh
+# one-time setup: expose the binary under its multicall name
+ln -s "$(command -v gmellon)" ~/.local/bin/gmellon-askpass
+
+# then answer prompts from the keyring
+export SSH_ASKPASS=gmellon-askpass SSH_ASKPASS_REQUIRE=force
+ssh somewhere.example
+```
+
+Nothing is answerable by default. A key becomes answerable only when its
+stored item carries the `gmellon:askpass=allow` attribute (`ssh-add
+--askpass`, or `ssh-allow` on a stored key), because an askpass program is
+a passphrase oracle: any local process can invoke it directly with a
+forged prompt. The helper therefore never prompts (a locked keyring is a
+refusal, not a hang), never answers OpenSSH's yes/no confirmation prompts
+(`SSH_ASKPASS_PROMPT=confirm`), and refuses everything else with exit 1
+and an empty stdout. Wrapper scripts that cannot carry a second binary
+name can use the hidden subcommand instead:
+`SSH_ASKPASS` → a script running `exec gmellon __askpass "$1"`.
+The full contract and threat model: [design/askpass/askpass.glm53.md](design/askpass/askpass.glm53.md).
 
 ### Keyring items
 

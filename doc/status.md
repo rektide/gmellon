@@ -67,8 +67,10 @@ gmellon unlock [COLLECTION] --stdin
 gmellon lock [COLLECTION]
 gmellon items [COLLECTION]
 gmellon ssh-list
-gmellon ssh-add KEY [--stdin]
+gmellon ssh-add KEY [--stdin] [--askpass]
 gmellon ssh-remove KEY
+gmellon ssh-allow KEY
+gmellon ssh-deny KEY
 gmellon change [COLLECTION]
 gmellon change [COLLECTION] --stdin
 gmellon completions SHELL
@@ -96,6 +98,20 @@ gmellon -v [COMMAND]   # redacted diagnostics on stderr
   explanation.
 - `ssh-remove KEY` deletes the exactly-matching stored item; duplicates
   are reported without changes, and the key file itself need not exist.
+- `ssh-list` renders `KEY`, `COLLECTION`, `LOCKED`, and `ASKPASS` columns;
+  `ASKPASS` is yes only for items carrying the per-key opt-in.
+- The askpass helper answers OpenSSH passphrase prompts (`SSH_ASKPASS`)
+  from stored items: entry points are the `gmellon-askpass` multicall
+  binary name (selected by argv[0] before clap) and the hidden
+  `gmellon __askpass PROMPT` subcommand for wrapper scripts. Default-deny:
+  only items marked `gmellon:askpass=allow` (set by `ssh-add --askpass`
+  in the same CreateItem, or `ssh-allow`/`ssh-deny` on a stored item via
+  the writable Item attributes property) are answerable. The helper never
+  prompts (locked storage refuses), never answers permission prompts
+  (`SSH_ASKPASS_PROMPT=confirm`), and reads the secret back through
+  `GetSecret` under the encrypted session — the one place gmellon
+  decrypts (`session::open`). Contract and threat model:
+  [`design/askpass/askpass.glm53.md`](/design/askpass/askpass.glm53.md).
 - `lock` is an explicit state change through the standard `Service.Lock`
   API: already-locked is a successful no-op that makes no Lock call, and a
   demanded interactive prompt object fails closed rather than being
