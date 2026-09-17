@@ -235,3 +235,19 @@ place gmellon reads a secret back (shared future surface with the open
 - `gmell-ssh-verify` should reuse `ssh_key_secret` when it lands.
 - A per-session confirm cache could later soften headless refusal of
   un-allowed keys without widening the standing oracle; not built now.
+
+## Cross-references
+
+- [`/doc/status.md`](/doc/status.md) — current product status; its Current
+  CLI table and command notes now describe the askpass surface and point
+  back here for the contract and threat model.
+- [`/README.md`](/README.md) — the askpass helper usage section (multicall
+  setup, grant commands, refusal invariants) is the user-facing rendering
+  of this design.
+- [`/doc/harness/README.md`](/doc/harness/README.md) — the harness guide;
+  the private-broker CLI proof (implemented in
+  [`tests/harness/broker_cli.rs`](/tests/harness/broker_cli.rs)) carries the
+  full grant/answer/revoke lifecycle, the gcr-compat superset-matching
+  readback, and the stdout-exempt redaction stance this note specifies.
+- beads `gmell-askpass-helper` — the ticket this note gates; the
+  subset-matching trap recorded above was caught by its proof run.

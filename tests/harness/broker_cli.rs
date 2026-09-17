@@ -1401,16 +1401,16 @@ fn run_proof(secrets: &ProofSecrets) {
         );
     }
 
-    // The CreateItem wire evidence: exactly the two legitimate stores (the
-    // verified store and the replacing store) reached the daemon, every one
-    // with an encrypted Secret. The finish call itself fails closed on any
-    // leak of the key passphrase into a captured body, and the refused and
-    // unencrypted attempts never got here to be counted.
+    // The CreateItem wire evidence: exactly the three legitimate stores (the
+    // verified store, the replacing store, and the granted re-store) reached
+    // the daemon, every one with an encrypted Secret. The finish call itself
+    // fails closed on any leak of the key passphrase into a captured body,
+    // and the refused and unencrypted attempts never got here to be counted.
     let created = create_item_monitor.finish(secrets);
     assert_eq!(
         created.messages.len(),
-        2,
-        "exactly the verified store and the replacing store may create items"
+        3,
+        "exactly the verified store, the replacing store, and the granted re-store may create items"
     );
     assert!(
         created
@@ -1421,13 +1421,15 @@ fn run_proof(secrets: &ProofSecrets) {
     );
 
     // The wrong-passphrase and unencrypted-key ssh-add refusals verify the
-    // key before ever connecting, so those invocations negotiate nothing.
-    let verify_refused_invocations = 2_usize;
+    // key before ever connecting, and two askpass refusals (the permission
+    // hint and the unparseable prompt) are refused before any bus use, so
+    // those invocations negotiate nothing.
+    let never_connecting_invocations = 4_usize;
 
     let negotiations = negotiation_monitor.finish(secrets);
     assert_eq!(
         negotiations.messages.len(),
-        INVOCATIONS.load(Ordering::Relaxed) + 1 - verify_refused_invocations,
+        INVOCATIONS.load(Ordering::Relaxed) + 1 - never_connecting_invocations,
         "one encrypted OpenSession per CLI invocation (every invocation constructs the \
          client) plus the fixture's own negotiation must be captured"
     );

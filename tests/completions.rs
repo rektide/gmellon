@@ -50,6 +50,8 @@ fn zsh_completions_name_subcommands_and_pass_zsh_n() {
         "items",
         "ssh-list",
         "ssh-add",
+        "ssh-allow",
+        "ssh-deny",
         "ssh-remove",
         "change",
         "completions",
@@ -59,6 +61,10 @@ fn zsh_completions_name_subcommands_and_pass_zsh_n() {
             "the zsh script must name the {subcommand} subcommand"
         );
     }
+    assert!(
+        !script.contains("__askpass"),
+        "the intercepted provider entry must never appear in completions"
+    );
 
     // A real syntax check through the system zsh. The same interpreter runs
     // the zimfw module suite, so it is a hard prerequisite here too.

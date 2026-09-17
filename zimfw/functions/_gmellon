@@ -85,11 +85,30 @@ _arguments "${_arguments_options[@]}" : \
 (ssh-add)
 _arguments "${_arguments_options[@]}" : \
 '--stdin[Read one passphrase line from stdin instead of prompting on the TTY]' \
+'--askpass[Also allow the askpass helper to answer for this key]' \
 '-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
 '--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':key -- Path to the SSH private key:_files' \
+&& ret=0
+;;
+(ssh-allow)
+_arguments "${_arguments_options[@]}" : \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':key -- Path to the SSH private key the passphrase was stored for:_files' \
+&& ret=0
+;;
+(ssh-deny)
+_arguments "${_arguments_options[@]}" : \
+'-v[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'--verbose[Print redacted diagnostic events on stderr (operations, results, lengths). Password bytes and key material are never printed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':key -- Path to the SSH private key the passphrase was stored for:_files' \
 && ret=0
 ;;
 (ssh-remove)
@@ -160,6 +179,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(ssh-allow)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ssh-deny)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (ssh-remove)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -195,6 +222,8 @@ _gmellon_commands() {
 'items:List items inside a collection\: labels, lock state, attributes' \
 'ssh-list:List stored SSH key passphrases' \
 'ssh-add:Store an SSH key passphrase, verified against the key first' \
+'ssh-allow:Grant the askpass helper permission to answer for a stored key' \
+'ssh-deny:Revoke the askpass helper'\''s permission to answer for a stored key' \
 'ssh-remove:Remove a stored SSH key passphrase' \
 'change:Change an existing collection'\''s password' \
 'completions:Generate shell completions' \
@@ -222,6 +251,8 @@ _gmellon__subcmd__help_commands() {
 'items:List items inside a collection\: labels, lock state, attributes' \
 'ssh-list:List stored SSH key passphrases' \
 'ssh-add:Store an SSH key passphrase, verified against the key first' \
+'ssh-allow:Grant the askpass helper permission to answer for a stored key' \
+'ssh-deny:Revoke the askpass helper'\''s permission to answer for a stored key' \
 'ssh-remove:Remove a stored SSH key passphrase' \
 'change:Change an existing collection'\''s password' \
 'completions:Generate shell completions' \
@@ -264,6 +295,16 @@ _gmellon__subcmd__help__subcmd__ssh-add_commands() {
     local commands; commands=()
     _describe -t commands 'gmellon help ssh-add commands' commands "$@"
 }
+(( $+functions[_gmellon__subcmd__help__subcmd__ssh-allow_commands] )) ||
+_gmellon__subcmd__help__subcmd__ssh-allow_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help ssh-allow commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__help__subcmd__ssh-deny_commands] )) ||
+_gmellon__subcmd__help__subcmd__ssh-deny_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon help ssh-deny commands' commands "$@"
+}
 (( $+functions[_gmellon__subcmd__help__subcmd__ssh-list_commands] )) ||
 _gmellon__subcmd__help__subcmd__ssh-list_commands() {
     local commands; commands=()
@@ -303,6 +344,16 @@ _gmellon__subcmd__lock_commands() {
 _gmellon__subcmd__ssh-add_commands() {
     local commands; commands=()
     _describe -t commands 'gmellon ssh-add commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__ssh-allow_commands] )) ||
+_gmellon__subcmd__ssh-allow_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon ssh-allow commands' commands "$@"
+}
+(( $+functions[_gmellon__subcmd__ssh-deny_commands] )) ||
+_gmellon__subcmd__ssh-deny_commands() {
+    local commands; commands=()
+    _describe -t commands 'gmellon ssh-deny commands' commands "$@"
 }
 (( $+functions[_gmellon__subcmd__ssh-list_commands] )) ||
 _gmellon__subcmd__ssh-list_commands() {
