@@ -644,8 +644,8 @@ fn run_proof(secrets: &ProofSecrets) {
     assert!(
         String::from_utf8_lossy(&listed.stdout)
             .lines()
-            .any(|line| line == format!("{}\tlogin\tno", key_canonical.display())),
-        "the stored row must name the key, the login collection, and the unlocked state"
+            .any(|line| line == format!("{}\tlogin\tno\tno", key_canonical.display())),
+        "the stored row must name the key, the login collection, the unlocked state, and the absent askpass grant"
     );
 
     let items_after = run_gmellon(
@@ -691,6 +691,269 @@ fn run_proof(secrets: &ProofSecrets) {
         readback.as_slice(),
         secrets.key_pass.as_slice(),
         "the stored item secret must equal the verified passphrase"
+    );
+
+    // --- `gmellon __askpass`: the per-key opt-in answer path --------------
+    // The stored item has no grant yet, so the provider must refuse — the
+    // default-deny posture is the whole design (design/askpass/askpass
+    // .glm53.md). Note run_askpass exempts stdout from the secret scan:
+    // a successful answer IS the passphrase on stdout, exactly as the
+    // OpenSSH askpass contract requires; stderr must stay clean either
+    // way, and retained artifacts stay under the full scan.
+    let key_prompt = format!(
+        "Enter passphrase for {}: ",
+        key_canonical.display()
+    );
+    let refused_no_grant = run_askpass(
+        &["__askpass", &key_prompt],
+        None,
+        secrets,
+        "askpass refuses a key with no grant",
+    );
+    assert_eq!(
+        exit_code(&refused_no_grant),
+        Some(1),
+        "an un-granted key must be refused"
+    );
+    assert!(
+        refused_no_grant.stdout.is_empty(),
+        "a refused askpass must write nothing to stdout"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused_no_grant.stderr).contains("no askpass grant"),
+        "the un-granted refusal must point at the grant command"
+    );
+
+    // Non-passphrase prompts are never answered: the SSH_ASKPASS_PROMPT
+    // hint marks permission questions and notifications.
+    let refused_hint = run_askpass(
+        &["__askpass", &key_prompt],
+        Some("confirm"),
+        secrets,
+        "askpass refuses a permission prompt",
+    );
+    assert_eq!(
+        exit_code(&refused_hint),
+        Some(1),
+        "a confirm-hinted invocation must be refused"
+    );
+    assert!(refused_hint.stdout.is_empty());
+
+    // Prompt shapes without a parseable absolute key path (ssh-keygen -p)
+    // refuse as unrecognized.
+    let refused_unparseable = run_askpass(
+        &["__askpass", "Enter old passphrase: "],
+        None,
+        secrets,
+        "askpass refuses an unparseable prompt",
+    );
+    assert_eq!(
+        exit_code(&refused_unparseable),
+        Some(1),
+        "an unparseable prompt must be refused"
+    );
+    assert!(refused_unparseable.stdout.is_empty());
+
+    // Grant, and the provider answers — with exactly the stored
+    // passphrase, once, on stdout, newline-terminated.
+    let allowed = run_gmellon(
+        &["ssh-allow", key_canonical.to_str().unwrap()],
+        CliStdin::FailIfRead,
+        secrets,
+        "ssh-allow grants the askpass opt-in",
+    );
+    assert_eq!(
+        exit_code(&allowed),
+        Some(0),
+        "granting the askpass opt-in must exit 0"
+    );
+    let answered = run_askpass(
+        &["__askpass", &key_prompt],
+        None,
+        secrets,
+        "askpass answers for a granted key",
+    );
+    assert_eq!(
+        exit_code(&answered),
+        Some(0),
+        "a granted key must be answered"
+    );
+    let mut expected_answer = secrets.key_pass.as_slice().to_vec();
+    expected_answer.push(b'\n');
+    assert_eq!(
+        answered.stdout,
+        expected_answer,
+        "the answer must be the stored passphrase, newline-terminated, and nothing else"
+    );
+
+    // ssh (the client) asks with the path single-quoted; that shape must
+    // answer too.
+    let quoted_prompt = format!(
+        "Enter passphrase for key '{}': ",
+        key_canonical.display()
+    );
+    let answered_quoted = run_askpass(
+        &["__askpass", &quoted_prompt],
+        None,
+        secrets,
+        "askpass answers ssh's quoted prompt shape",
+    );
+    assert_eq!(exit_code(&answered_quoted), Some(0));
+    assert_eq!(answered_quoted.stdout, expected_answer);
+
+    // The multicall entry: argv[0] named gmellon-askpass selects provider
+    // mode before clap parsing, so SSH_ASKPASS can point at one program.
+    let multicall_binary = bus.root.join("gmellon-askpass");
+    std::fs::copy(env!("CARGO_BIN_EXE_gmellon"), &multicall_binary)
+        .expect("copy the binary under its multicall name");
+    let multicall = std::process::Command::new(&multicall_binary)
+        .arg(&key_prompt)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the multicall askpass binary");
+    INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+    let multicall_output = multicall
+        .wait_with_output()
+        .expect("wait for the multicall askpass binary");
+    assert_eq!(exit_code(&multicall_output), Some(0));
+    assert_eq!(
+        multicall_output.stdout,
+        expected_answer,
+        "the multicall entry must answer exactly like the hidden subcommand"
+    );
+    for (name, secret) in secrets.named() {
+        common::assert_secret_absent(
+            &multicall_output.stderr,
+            secret,
+            &format!("gmellon-askpass multicall stderr (generated {name} password)"),
+        );
+    }
+
+    // ssh-list and items both show the grant, and the grant is visible as
+    // an ordinary attribute — superset matching keeps gcr's lookup intact.
+    let listed_granted = ssh_list("ssh-list after the grant");
+    assert_eq!(exit_code(&listed_granted), Some(0));
+    assert!(
+        String::from_utf8_lossy(&listed_granted.stdout)
+            .lines()
+            .any(|line| line == format!("{}\tlogin\tno\tyes", key_canonical.display())),
+        "the granted row must show the askpass column as yes"
+    );
+    let items_granted = run_gmellon(
+        &["items", "login"],
+        CliStdin::FailIfRead,
+        secrets,
+        "items login after the grant",
+    );
+    assert_eq!(exit_code(&items_granted), Some(0));
+    let granted_attributes = format!(
+        "gmellon:askpass=allow,unique={key_unique},xdg:schema=org.freedesktop.Secret.Generic"
+    );
+    assert!(
+        String::from_utf8_lossy(&items_granted.stdout)
+            .lines()
+            .any(|line| line.starts_with("Unlock password for: proof-ssh-key\tno\t")
+                && line.ends_with(&granted_attributes)),
+        "the granted item must carry the opt-in alongside the gcr attributes"
+    );
+    // The gcr-side read still finds the item by its unique attribute and
+    // still decrypts the same secret with the extra attribute present.
+    let readback_granted = fixture
+        .read_item_secret_by_unique(&login_path, &key_unique)
+        .expect("fixture re-reads the granted item by unique attribute");
+    assert_eq!(
+        readback_granted.as_slice(),
+        secrets.key_pass.as_slice(),
+        "the grant must not change the secret gcr-ssh-agent reads"
+    );
+
+    // Revoke: the item stays for gcr, the provider refuses again.
+    let denied = run_gmellon(
+        &["ssh-deny", key_canonical.to_str().unwrap()],
+        CliStdin::FailIfRead,
+        secrets,
+        "ssh-deny revokes the askpass opt-in",
+    );
+    assert_eq!(
+        exit_code(&denied),
+        Some(0),
+        "revoking the askpass opt-in must exit 0"
+    );
+    let refused_revoked = run_askpass(
+        &["__askpass", &key_prompt],
+        None,
+        secrets,
+        "askpass refuses a revoked key",
+    );
+    assert_eq!(
+        exit_code(&refused_revoked),
+        Some(1),
+        "a revoked key must be refused"
+    );
+    assert!(
+        refused_revoked.stdout.is_empty(),
+        "the revoked refusal must write nothing to stdout"
+    );
+    let readback_revoked = fixture
+        .read_item_secret_by_unique(&login_path, &key_unique)
+        .expect("fixture still reads the revoked item by unique attribute");
+    assert_eq!(
+        readback_revoked.as_slice(),
+        secrets.key_pass.as_slice(),
+        "revocation must leave the stored passphrase in place for gcr"
+    );
+
+    // `ssh-add --askpass` bakes the grant into the store itself: one
+    // CreateItem carries both the passphrase and the opt-in.
+    let stored_with_grant = run_gmellon(
+        &[
+            "ssh-add",
+            key_canonical.to_str().unwrap(),
+            "--stdin",
+            "--askpass",
+        ],
+        CliStdin::Password(password_line(&secrets.key_pass)),
+        secrets,
+        "ssh-add --askpass stores with the grant",
+    );
+    assert_eq!(
+        exit_code(&stored_with_grant),
+        Some(0),
+        "storing with the askpass grant must exit 0"
+    );
+    assert!(
+        String::from_utf8_lossy(&stored_with_grant.stdout)
+            .contains("; askpass will answer for it"),
+        "the granted store must say the helper will answer"
+    );
+    let answered_after_regrant = run_askpass(
+        &["__askpass", &key_prompt],
+        None,
+        secrets,
+        "askpass answers after ssh-add --askpass",
+    );
+    assert_eq!(exit_code(&answered_after_regrant), Some(0));
+    assert_eq!(
+        answered_after_regrant.stdout,
+        expected_answer,
+        "the one-shot granted store must be answerable immediately"
+    );
+    // The granted re-store must still be exactly one item — the
+    // subset-matching trap in gnome-keyring's CreateItem-replace would
+    // otherwise silently duplicate it (first broker run of this proof).
+    let after_regrant_list = ssh_list("ssh-list after the granted re-store");
+    assert_eq!(
+        ssh_list_key_rows(&after_regrant_list),
+        1,
+        "the granted re-store must replace, not duplicate"
+    );
+    assert!(
+        String::from_utf8_lossy(&after_regrant_list.stdout)
+            .lines()
+            .any(|line| line == format!("{}\tlogin\tno\tyes", key_canonical.display())),
+        "the re-stored row must show the grant"
     );
 
     // Removal: exactly the matching item, and a second removal finds
@@ -1288,6 +1551,44 @@ fn change_stdin(lines: [&[u8]; 3]) -> Zeroizing<Vec<u8>> {
 /// feed the chosen stdin, capture both streams, and scan the captured bytes
 /// for every generated password — literal bytes and the reversible encodings
 /// a diagnostic dump could carry — before the caller inspects the result.
+/// Run the askpass provider with the inherited (isolated harness) bus
+/// environment. Unlike [`run_gmellon`], the secret scan exempts stdout: a
+/// successful askpass answer IS the passphrase on stdout — that is the
+/// OpenSSH contract being proven — so only stderr is scanned. The equality
+/// against the expected answer stays in memory, and the retained-artifact
+/// scan in `finish_case` still covers everything on disk.
+fn run_askpass(
+    arguments: &[&str],
+    hint: Option<&str>,
+    secrets: &ProofSecrets,
+    stage: &str,
+) -> Output {
+    INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gmellon"));
+    command
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    if let Some(hint) = hint {
+        command.env("SSH_ASKPASS_PROMPT", hint);
+    }
+    let output = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn the gmellon binary for `{stage}`: {error}"))
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("wait for the gmellon binary for `{stage}`: {error}"));
+
+    for (name, secret) in secrets.named() {
+        common::assert_secret_absent(
+            &output.stderr,
+            secret,
+            &format!("gmellon `{stage}` stderr (generated {name} password)"),
+        );
+    }
+    output
+}
+
 fn run_gmellon(arguments: &[&str], stdin: CliStdin, secrets: &ProofSecrets, stage: &str) -> Output {
     INVOCATIONS.fetch_add(1, Ordering::Relaxed);
     let mut command = Command::new(env!("CARGO_BIN_EXE_gmellon"));

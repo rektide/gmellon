@@ -72,6 +72,24 @@ pub(super) trait SecretItem {
     #[zbus(property)]
     fn attributes(&self) -> zbus::Result<std::collections::HashMap<String, String>>;
 
+    /// Replace the item's attribute dictionary wholesale. This is the
+    /// standard writable Item interface property — the same mechanism
+    /// libsecret's attribute updates use. Callers must include the
+    /// existing attributes they want to keep; the daemon does not merge.
+    #[zbus(property)]
+    fn set_attributes(
+        &self,
+        attributes: std::collections::HashMap<String, String>,
+    ) -> zbus::Result<()>;
+
+    /// Read this item's secret sealed for one session: the wire Secret
+    /// tuple (session path, IV, ciphertext, content type). This is the
+    /// read gcr-ssh-agent's libsecret lookup performs.
+    fn get_secret(
+        &self,
+        session: &ObjectPath<'_>,
+    ) -> zbus::Result<(OwnedObjectPath, Vec<u8>, Vec<u8>, String)>;
+
     /// Delete this item. The reply is the prompt object path; an empty
     /// path or "/" means no prompt was necessary (the daemon completes
     /// plain deletions with "/").

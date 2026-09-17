@@ -109,8 +109,9 @@ pub enum Command {
     /// List stored SSH key passphrases.
     ///
     /// Every item across all collections whose unique attribute carries
-    /// the gcr-ssh-agent ssh-store: prefix, with its owning collection and
-    /// lock state. Metadata only; the passphrases are not read.
+    /// the gcr-ssh-agent ssh-store: prefix, with its owning collection,
+    /// lock state, and whether the askpass helper may answer for it.
+    /// Metadata only; the passphrases are not read.
     SshList,
 
     /// Store an SSH key passphrase, verified against the key first.
@@ -121,6 +122,11 @@ pub enum Command {
     /// the key's absolute path. A wrong passphrase stores nothing; an
     /// unencrypted key has nothing to store. Replaces any previously
     /// stored passphrase for the same key.
+    ///
+    /// --askpass also grants the hidden askpass helper permission to
+    /// answer OpenSSH passphrase prompts for this key; see
+    /// design/askpass/askpass.glm53.md for the threat model. Without a
+    /// grant, stored passphrases are never answerable.
     SshAdd {
         /// Path to the SSH private key.
         #[arg(value_name = "KEY")]
@@ -129,6 +135,36 @@ pub enum Command {
         /// Read one passphrase line from stdin instead of prompting on the TTY.
         #[arg(long)]
         stdin: bool,
+
+        /// Also allow the askpass helper to answer for this key.
+        #[arg(long)]
+        askpass: bool,
+    },
+
+    /// Grant the askpass helper permission to answer for a stored key.
+    ///
+    /// Marks the stored passphrase item for KEY with the per-key opt-in
+    /// (gmellon:askpass=allow), so `gmellon __askpass` — or the
+    /// gmellon-askpass multicall binary — will answer OpenSSH passphrase
+    /// prompts for that key. Nothing about the item changes for
+    /// gcr-ssh-agent. Exactly one stored item must exist; ssh-list shows
+    /// the candidates.
+    SshAllow {
+        /// Path to the SSH private key the passphrase was stored for.
+        #[arg(value_name = "KEY")]
+        key: PathBuf,
+    },
+
+    /// Revoke the askpass helper's permission to answer for a stored key.
+    ///
+    /// Removes the per-key opt-in from the stored passphrase item for KEY.
+    /// The stored passphrase itself is untouched — gcr-ssh-agent keeps
+    /// working; only the askpass helper refuses. Revoking an un-granted
+    /// key is a successful no-op.
+    SshDeny {
+        /// Path to the SSH private key the passphrase was stored for.
+        #[arg(value_name = "KEY")]
+        key: PathBuf,
     },
 
     /// Remove a stored SSH key passphrase.
@@ -186,7 +222,9 @@ pub fn run(cli: Cli) -> ExitCode {
         Command::Status => status(),
         Command::Items { collection } => items(&collection),
         Command::SshList => ssh_list(),
-        Command::SshAdd { key, stdin } => ssh_add(&key, stdin),
+        Command::SshAdd { key, stdin, askpass } => ssh_add(&key, stdin, askpass),
+        Command::SshAllow { key } => ssh_allow(&key, true),
+        Command::SshDeny { key } => ssh_allow(&key, false),
         Command::SshRemove { key } => ssh_remove(&key),
         Command::Unlock { collection, stdin } => unlock(&collection, stdin),
         Command::Lock { collection } => lock(&collection),
@@ -445,7 +483,7 @@ fn ssh_list() -> u8 {
 }
 
 /// Verify a key's passphrase and store it the way gcr-ssh-agent finds it.
-fn ssh_add(key: &Path, stdin: bool) -> u8 {
+fn ssh_add(key: &Path, stdin: bool, askpass: bool) -> u8 {
     let span = tracing::info_span!("operation", operation = "ssh-add", key = %key.display());
     span.in_scope(|| {
         // The absolute path is the storage key (the unique attribute), so
@@ -511,14 +549,66 @@ fn ssh_add(key: &Path, stdin: bool) -> u8 {
             Ok(collection) => collection,
             Err(error) => return report_service_error(error),
         };
-        match client.create_ssh_key_item(&target.id, &canonical.display().to_string(), secret.as_bytes())
-        {
+        match client.create_ssh_key_item(
+            &target.id,
+            &canonical.display().to_string(),
+            secret.as_bytes(),
+            askpass,
+        ) {
             Ok(()) => {
-                println!(
-                    "stored in collection {} & verified against the key",
-                    target.id
-                );
-                tracing::info!(outcome = "Stored", collection = %target.id, "ssh key passphrase stored");
+                if askpass {
+                    println!(
+                        "stored in collection {} & verified against the key; askpass will answer for it",
+                        target.id
+                    );
+                } else {
+                    println!(
+                        "stored in collection {} & verified against the key",
+                        target.id
+                    );
+                }
+                tracing::info!(outcome = "Stored", collection = %target.id, askpass, "ssh key passphrase stored");
+                EXIT_OK
+            }
+            Err(error) => report_service_error(error),
+        }
+    })
+}
+
+/// Grant or revoke the per-key askpass opt-in on a stored passphrase item.
+/// The item and its secret stay exactly as gcr-ssh-agent expects; only the
+/// gmellon:askpass attribute changes.
+fn ssh_allow(key: &Path, allowed: bool) -> u8 {
+    let span = tracing::info_span!(
+        "operation",
+        operation = if allowed { "ssh-allow" } else { "ssh-deny" },
+        key = %key.display()
+    );
+    span.in_scope(|| {
+        // Same path discipline as ssh-remove: canonicalize when present,
+        // verbatim-absolute otherwise, so the unique attribute matches.
+        let absolute = match std::fs::canonicalize(key) {
+            Ok(canonical) => canonical,
+            Err(_) => std::path::absolute(key).unwrap_or_else(|_| key.to_path_buf()),
+        };
+        let client = match BlockingClient::session() {
+            Ok(client) => client,
+            Err(error) => return report_service_error(error),
+        };
+        match client.set_ssh_key_askpass(&absolute.display().to_string(), allowed) {
+            Ok(collection) => {
+                if allowed {
+                    println!(
+                        "askpass may now answer for {} (collection {collection})",
+                        absolute.display()
+                    );
+                } else {
+                    println!(
+                        "askpass no longer answers for {} (collection {collection})",
+                        absolute.display()
+                    );
+                }
+                tracing::info!(outcome = if allowed { "Allowed" } else { "Denied" }, collection = %collection, "askpass grant updated");
                 EXIT_OK
             }
             Err(error) => report_service_error(error),
@@ -578,14 +668,21 @@ fn render_items(items: &[Item]) -> String {
 }
 
 fn render_ssh_items(entries: &[(CollectionId, Item)]) -> String {
-    let mut output = String::from("KEY\tCOLLECTION\tLOCKED\n");
+    let mut output = String::from("KEY\tCOLLECTION\tLOCKED\tASKPASS\n");
     for (collection, item) in entries {
         let locked = if item.locked { "yes" } else { "no" };
+        let askpass = if item.askpass_allowed() {
+            "yes"
+        } else {
+            "no"
+        };
         output.extend(item.ssh_key_path().unwrap_or_default().escape_debug());
         output.push('\t');
         output.push_str(collection.as_str());
         output.push('\t');
         output.push_str(locked);
+        output.push('\t');
+        output.push_str(askpass);
         output.push('\n');
     }
     output
@@ -659,6 +756,8 @@ fn service_error_exit(error: &ServiceError) -> u8 {
         | ServiceError::NoDefaultCollection
         | ServiceError::SshKeyItemNotFound { .. }
         | ServiceError::SshKeyItemsAmbiguous { .. }
+        | ServiceError::SshKeyItemLocked { .. }
+        | ServiceError::SecretSessionMismatch
         | ServiceError::Bus(_) => EXIT_ERROR,
     }
 }
@@ -772,8 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn completions_parse_every_advertised_shell_and_reject_others() {
-        for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+    fn completions_parse_every_advertised_shell_and_reject_others() {        for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
             let cli = Cli::try_parse_from(["gmellon", "completions", shell]).unwrap();
             assert!(
                 matches!(cli.command, Command::Completions { .. }),
@@ -944,6 +1042,79 @@ mod tests {
             read_change_stdin(&mut input),
             Err(SecretError::ConfirmationMismatch)
         ));
+    }
+
+    #[test]
+    fn ssh_add_accepts_the_askpass_flag() {
+        let cli = Cli::try_parse_from(["gmellon", "ssh-add", "/tmp/k", "--askpass"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::SshAdd {
+                key,
+                stdin: false,
+                askpass: true,
+            } if key == Path::new("/tmp/k")
+        ));
+    }
+
+    #[test]
+    fn ssh_allow_and_deny_parse_a_key() {
+        let allowed = Cli::try_parse_from(["gmellon", "ssh-allow", "/tmp/k"]).unwrap();
+        assert!(matches!(&allowed.command, Command::SshAllow { key } if *key == Path::new("/tmp/k")));
+
+        let denied = Cli::try_parse_from(["gmellon", "ssh-deny", "/tmp/k"]).unwrap();
+        assert!(matches!(&denied.command, Command::SshDeny { key } if *key == Path::new("/tmp/k")));
+    }
+
+    #[test]
+    fn askpass_provider_is_not_a_clap_subcommand() {
+        // The provider is intercepted in main before clap parsing, so it
+        // must not parse as a subcommand and must never appear in help or
+        // generated completions (clap_complete's generators would
+        // advertise a hidden subcommand — verified against 4.6.5).
+        assert!(Cli::try_parse_from(["gmellon", "__askpass", "prompt text"]).is_err());
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            !help.contains("__askpass"),
+            "the askpass provider must stay out of help"
+        );
+        for shell in Shell::value_variants() {
+            let mut buffer = Vec::new();
+            clap_complete::generate(*shell, &mut Cli::command(), "gmellon", &mut buffer);
+            let text = String::from_utf8_lossy(&buffer).to_string();
+            assert!(
+                !text.contains("__askpass"),
+                "{shell:?} completions must not mention the hidden provider"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_rendering_reports_the_askpass_grant_column() {
+        let entries = [(
+            CollectionId::new("login").unwrap(),
+            Item {
+                label: "Unlock password for: deck".to_owned(),
+                locked: false,
+                attributes: [
+                    ("gmellon:askpass", "allow"),
+                    ("unique", "ssh-store:/home/me/.ssh/deck"),
+                    ("xdg:schema", "org.freedesktop.Secret.Generic"),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+                path: OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/login/x")
+                    .unwrap(),
+            },
+        )];
+
+        assert_eq!(
+            render_ssh_items(&entries),
+            "KEY\tCOLLECTION\tLOCKED\tASKPASS\n/home/me/.ssh/deck\tlogin\tno\tyes\n"
+        );
     }
 
     #[test]

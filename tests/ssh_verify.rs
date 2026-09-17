@@ -103,3 +103,116 @@ fn a_missing_key_file_is_rejected_not_verified() {
         Verdict::Rejected
     );
 }
+
+// --- askpass provider: binary-level refusals (no daemon required) ---------
+
+/// Run the compiled binary's hidden `__askpass` entry with one prompt
+/// argument, optionally carrying the OpenSSH permission-hint environment.
+fn run_askpass(prompt: &str, hint: Option<&str>) -> std::process::Output {
+    let mut command = std::process::Command::new(gmellon_binary());
+    command
+        .arg("__askpass")
+        .arg(prompt)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(hint) = hint {
+        command.env("SSH_ASKPASS_PROMPT", hint);
+    }
+    command
+        .spawn()
+        .expect("spawn gmellon __askpass")
+        .wait_with_output()
+        .expect("wait for gmellon __askpass")
+}
+
+#[test]
+fn askpass_refuses_unparseable_prompts_with_empty_stdout() {
+    // ssh-keygen -p's pathless prompt shape; garbage. These refusals need
+    // no daemon: the parse happens before any bus connection.
+    for prompt in ["Enter old passphrase: ", "just some words"] {
+        let output = run_askpass(prompt, None);
+        assert_eq!(output.status.code(), Some(1), "prompt {prompt:?} must refuse");
+        assert!(
+            output.stdout.is_empty(),
+            "a refusal must write nothing to stdout"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("gmellon askpass:"),
+            "the refusal must carry one diagnostic line"
+        );
+    }
+}
+
+#[test]
+fn askpass_refuses_permission_and_notification_hints() {
+    // SSH_ASKPASS_PROMPT=confirm/none marks yes/no questions and
+    // notifications — never passphrase prompts — and must be refused
+    // before any keyring interaction.
+    for hint in ["confirm", "none"] {
+        let output = run_askpass("Enter passphrase for /home/me/.ssh/id_ed25519: ", Some(hint));
+        assert_eq!(output.status.code(), Some(1), "hint {hint:?} must refuse");
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("non-passphrase prompt"),
+            "the refusal must name the hint as the reason"
+        );
+    }
+}
+
+#[test]
+fn askpass_multicall_entry_answers_and_refuses_like_the_subcommand() {
+    // The multicall entry is selected by argv[0] before clap parsing: a
+    // copy of the binary named gmellon-askpass behaves exactly like the
+    // hidden subcommand for both refusal shapes.
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let multicall = directory.path().join("gmellon-askpass");
+    std::fs::copy(gmellon_binary(), &multicall).expect("copy binary under multicall name");
+
+    let run = |prompt: &str| {
+        std::process::Command::new(&multicall)
+            .arg(prompt)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn gmellon-askpass")
+            .wait_with_output()
+            .expect("wait for gmellon-askpass")
+    };
+
+    // A parseable prompt reaches the bus step and fails there — the tempdir
+    // path cannot be stored in any keyring, so even a live session bus
+    // misses, and a headless environment refuses at the connection step.
+    // Either way: exit 1, empty stdout, never a hang or a prompt.
+    let probe_dir = tempfile::tempdir().expect("scratch directory");
+    let prompt = format!(
+        "Enter passphrase for {}: ",
+        probe_dir.path().join("id_absent").display()
+    );
+    let probe = run(&prompt);
+    assert_eq!(probe.status.code(), Some(1));
+    assert!(probe.stdout.is_empty());
+}
+
+#[test]
+fn askpass_multicall_selection_requires_the_exact_binary_name() {
+    // argv[0] must end in exactly gmellon-askpass: a differently named
+    // copy still routes through clap, which rejects the bare prompt as an
+    // unknown subcommand.
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let other = directory.path().join("gmellon-helper");
+    std::fs::copy(gmellon_binary(), &other).expect("copy binary under another name");
+
+    let output = std::process::Command::new(&other)
+        .arg("Enter passphrase for /x: ")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn gmellon-helper")
+        .wait_with_output()
+        .expect("wait for gmellon-helper");
+    assert_ne!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+}

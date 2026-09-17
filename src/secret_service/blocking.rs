@@ -74,9 +74,14 @@ pub const SSH_STORE_PREFIX: &str = "ssh-store:";
 /// The schema attribute libsecret records on items stored under a dotted
 /// schema name; gcr's lookup includes it, so stored items must carry it.
 pub const GENERIC_SCHEMA_ATTRIBUTE: (&str, &str) = ("xdg:schema", "org.freedesktop.Secret.Generic");
+/// The per-key opt-in marking an SSH passphrase item answerable by the
+/// gmellon askpass helper (design/askpass/askpass.glm53.md). Superset
+/// attribute matching keeps gcr's lookup unaffected by its presence.
+pub const ASKPASS_ATTRIBUTE: (&str, &str) = ("gmellon:askpass", "allow");
 
 /// Public metadata for one item inside a collection. Metadata only —
-/// item secrets are never read by gmellon.
+/// item secrets are read solely by the askpass answer path
+/// ([`BlockingClient::ssh_key_secret`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Item {
     pub label: String,
@@ -93,6 +98,12 @@ impl Item {
         self.attributes
             .get(UNIQUE_ATTRIBUTE)?
             .strip_prefix(SSH_STORE_PREFIX)
+    }
+
+    /// Whether the gmellon askpass helper may answer for this item's key
+    /// (the per-key opt-in; default-deny).
+    pub fn askpass_allowed(&self) -> bool {
+        self.attributes.get(ASKPASS_ATTRIBUTE.0) == Some(&ASKPASS_ATTRIBUTE.1.to_owned())
     }
 }
 
@@ -176,6 +187,14 @@ pub enum Error {
     CollectionLocked {
         id: CollectionId,
     },
+    /// The stored passphrase item for the key is locked; the askpass
+    /// helper refuses rather than prompt.
+    SshKeyItemLocked {
+        key: String,
+    },
+    /// The service returned a secret sealed for a session other than the
+    /// caller's; a protocol violation, treated as an unreadable secret.
+    SecretSessionMismatch,
     /// The service has no `default` alias; gcr-ssh-agent's lookup goes
     /// there, so stored keys would be unreachable.
     NoDefaultCollection,
@@ -225,6 +244,16 @@ impl Display for Error {
                     "collection {id} is locked; run gmellon unlock {id} first"
                 )
             }
+            Self::SshKeyItemLocked { key } => {
+                write!(
+                    formatter,
+                    "the stored passphrase for SSH key {key} is locked; \
+                     the askpass helper refuses rather than prompt"
+                )
+            }
+            Self::SecretSessionMismatch => formatter.write_str(
+                "the Secret Service returned a secret sealed for a different session",
+            ),
             Self::NoDefaultCollection => formatter.write_str(
                 "the Secret Service has no default collection alias; gcr-ssh-agent \
                  looks there for stored key passphrases, so gmellon refuses to \
@@ -538,7 +567,21 @@ impl BlockingClient {
     /// Store (or replace, by unique attribute) the passphrase item for an
     /// SSH key exactly as gcr-ssh-agent expects to find it: the
     /// `unique=ssh-store:<path>` attribute, the generic schema attribute
-    /// libsecret records for dotted schemas, and a human label.
+    /// libsecret records for dotted schemas, and a human label. With
+    /// `askpass_allowed` the item also ends up carrying the per-key
+    /// opt-in that makes the gmellon askpass helper answer for it.
+    ///
+    /// gnome-keyring's CreateItem-replace match is subset-on-the-new-fields
+    /// (gkd-secret-objects.c collection_find_matching_item →
+    /// gkm_secret_fields_match): an existing item matches only when it
+    /// already carries every attribute of the incoming properties, and a
+    /// match has its attributes set wholesale. So a CreateItem carrying
+    /// the grant would *duplicate* an existing un-granted item instead of
+    /// replacing it. The store therefore always replaces with the plain
+    /// gcr attribute set (which subset-matches granted and un-granted
+    /// items alike, and replaces their attributes wholesale), and the
+    /// grant is merged afterwards through the writable attributes
+    /// property — two calls, but exactly one item, always.
     ///
     /// The caller is responsible for having verified the passphrase against
     /// the key; this method only stores.
@@ -547,6 +590,7 @@ impl BlockingClient {
         collection_id: &CollectionId,
         key_path: &str,
         passphrase: &[u8],
+        askpass_allowed: bool,
     ) -> Result<(), Error> {
         let collection = self.collection(collection_id)?;
         if collection.locked {
@@ -566,6 +610,9 @@ impl BlockingClient {
             GENERIC_SCHEMA_ATTRIBUTE.0.to_owned(),
             GENERIC_SCHEMA_ATTRIBUTE.1.to_owned(),
         );
+        // The merge step below re-sends the stored set plus the grant;
+        // keep a copy before the properties map takes ownership.
+        let mut merge_attributes = attributes.clone();
         let mut properties: std::collections::HashMap<&str, Value<'_>> =
             std::collections::HashMap::new();
         properties.insert("org.freedesktop.Secret.Item.Label", Value::from(label));
@@ -595,6 +642,20 @@ impl BlockingClient {
             let _ = item;
             return Err(Error::LockPromptRequired);
         }
+        // Second half of the no-duplicates sequence above: merge the grant
+        // into the (now exactly one) item through the writable attributes
+        // property. A plain re-store without the flag deliberately leaves
+        // the grant off — the flags passed are the state stored.
+        if askpass_allowed {
+            merge_attributes.insert(
+                ASKPASS_ATTRIBUTE.0.to_owned(),
+                ASKPASS_ATTRIBUTE.1.to_owned(),
+            );
+            let proxy = self.item_proxy(item)?;
+            proxy
+                .set_attributes(merge_attributes)
+                .map_err(classify_service_error)?;
+        }
         Ok(())
     }
 
@@ -615,13 +676,13 @@ impl BlockingClient {
         })
     }
 
-    /// Delete the stored passphrase item for an SSH key, selected by exact
-    /// `unique` attribute match. Exactly one match must exist: none is an
-    /// error, and duplicates (which gcr cannot disambiguate either) are
-    /// reported without changing anything.
-    pub fn remove_ssh_key_item(&self, key_path: &str) -> Result<CollectionId, Error> {
+    /// Every stored passphrase item across all collections whose `unique`
+    /// attribute is exactly `ssh-store:<key_path>`, paired with the owning
+    /// collection's ID. gcr-ssh-agent cannot disambiguate duplicates
+    /// either, so callers require exactly one match.
+    fn find_exact_ssh_key_items(&self, key_path: &str) -> Result<Vec<(CollectionId, Item)>, Error> {
         let wanted = format!("{SSH_STORE_PREFIX}{key_path}");
-        let mut matches: Vec<(CollectionId, Item)> = Vec::new();
+        let mut matches = Vec::new();
         for collection in self.collections()? {
             let proxy = self.collection_proxy(&collection.path)?;
             for path in proxy.items().map_err(classify_service_error)? {
@@ -631,26 +692,112 @@ impl BlockingClient {
                 }
             }
         }
+        Ok(matches)
+    }
+
+    /// The exactly-one match for a key's stored passphrase item with its
+    /// owning collection: none is [`Error::SshKeyItemNotFound`], duplicates
+    /// are [`Error::SshKeyItemsAmbiguous`] with nothing changed. Metadata
+    /// only — the askpass path checks the grant before reading any secret.
+    pub fn ssh_key_item(&self, key_path: &str) -> Result<(CollectionId, Item), Error> {
+        let mut matches = self.find_exact_ssh_key_items(key_path)?;
         match matches.len() {
+            1 => Ok(matches.pop().expect("one match")),
             0 => Err(Error::SshKeyItemNotFound {
                 key: key_path.to_owned(),
             }),
-            1 => {
-                let (collection_id, item) = matches.pop().expect("one match");
-                let proxy = self.item_proxy(item.path)?;
-                let prompt = proxy.delete().map_err(classify_service_error)?;
-                // An empty path or "/" means no prompt was necessary;
-                // gmellon does not perform prompt objects.
-                if !prompt.as_str().is_empty() && prompt.as_str() != "/" {
-                    return Err(Error::LockPromptRequired);
-                }
-                Ok(collection_id)
-            }
             count => Err(Error::SshKeyItemsAmbiguous {
                 key: key_path.to_owned(),
                 count,
             }),
         }
+    }
+
+    /// Read back the stored passphrase for an SSH key — the one place
+    /// gmellon decrypts a secret (the askpass answer path; see
+    /// design/askpass/askpass.glm53.md). The secret crosses the bus only
+    /// as ciphertext under this client's encrypted session and is
+    /// returned zeroized-on-drop.
+    ///
+    /// The opt-in askpass grant is *not* consulted here; callers enforce
+    /// their own policy before reading.
+    pub fn ssh_key_secret(&self, key_path: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, Error> {
+        let (_collection_id, item) = self.ssh_key_item(key_path)?;
+        if item.locked {
+            return Err(Error::SshKeyItemLocked {
+                key: key_path.to_owned(),
+            });
+        }
+        let proxy = self.item_proxy(item.path)?;
+        let session: ObjectPath<'_> = self.session_path.as_ref();
+        let (answered_session, iv, value, _content_type) = proxy
+            .get_secret(&session)
+            .map_err(classify_service_error)?;
+        if answered_session.as_str() != session.as_str() {
+            return Err(Error::SecretSessionMismatch);
+        }
+        let iv = zeroize::Zeroizing::new(iv);
+        let value = zeroize::Zeroizing::new(value);
+        let secret = session::open(&self.session_key, &iv, &value).map_err(Error::Session)?;
+        tracing::info!(
+            plaintext_length = secret.len(),
+            "stored passphrase read back under the encrypted session"
+        );
+        Ok(secret)
+    }
+
+    /// Grant or revoke the askpass opt-in attribute on the stored
+    /// passphrase item for a key, leaving the item (and its secret)
+    /// untouched for gcr-ssh-agent. Returns the owning collection's ID.
+    pub fn set_ssh_key_askpass(
+        &self,
+        key_path: &str,
+        allowed: bool,
+    ) -> Result<CollectionId, Error> {
+        let (collection_id, item) = self.ssh_key_item(key_path)?;
+        if item.locked {
+            return Err(Error::SshKeyItemLocked {
+                key: key_path.to_owned(),
+            });
+        }
+        // The writable attributes property replaces the dictionary
+        // wholesale, so start from the item's current attributes and
+        // merge the one change.
+        let mut attributes: std::collections::HashMap<String, String> = item
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if allowed {
+            attributes.insert(
+                ASKPASS_ATTRIBUTE.0.to_owned(),
+                ASKPASS_ATTRIBUTE.1.to_owned(),
+            );
+        } else {
+            attributes.remove(ASKPASS_ATTRIBUTE.0);
+        }
+        let proxy = self.item_proxy(item.path)?;
+        proxy
+            .set_attributes(attributes)
+            .map_err(classify_service_error)?;
+        tracing::info!(allowed, "ssh key askpass grant updated");
+        Ok(collection_id)
+    }
+
+    /// Delete the stored passphrase item for an SSH key, selected by exact
+    /// `unique` attribute match. Exactly one match must exist: none is an
+    /// error, and duplicates (which gcr cannot disambiguate either) are
+    /// reported without changing anything.
+    pub fn remove_ssh_key_item(&self, key_path: &str) -> Result<CollectionId, Error> {
+        let (collection_id, item) = self.ssh_key_item(key_path)?;
+        let proxy = self.item_proxy(item.path)?;
+        let prompt = proxy.delete().map_err(classify_service_error)?;
+        // An empty path or "/" means no prompt was necessary;
+        // gmellon does not perform prompt objects.
+        if !prompt.as_str().is_empty() && prompt.as_str() != "/" {
+            return Err(Error::LockPromptRequired);
+        }
+        Ok(collection_id)
     }
 
     fn find_path(&self, id: &CollectionId) -> Result<OwnedObjectPath, Error> {

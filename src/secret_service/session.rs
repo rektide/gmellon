@@ -25,7 +25,8 @@
 //!    HashLen zero bytes.
 //! 5. Each Secret seals with a fresh random IV and PKCS#7 padding: the
 //!    Secret tuple's `parameters` field carries the IV and `value` carries
-//!    the ciphertext. gmellon only ever encrypts.
+//!    the ciphertext. gmellon encrypts for every write; the one decrypting
+//!    read-back is [`open`], used by the askpass answer path.
 //!
 //! Hygiene follows `crate::secret_input`: the private exponent, shared
 //! secret, derived key, IV, and padded plaintext live in zeroizing
@@ -36,21 +37,16 @@ use std::error::Error as StdError;
 use std::fmt::{self, Display, Formatter};
 use std::sync::LazyLock;
 
+use aes::Aes128Dec;
 use aes::Aes128Enc;
 use aes::cipher::block_padding::Pkcs7;
-use aes::cipher::{BlockModeEncrypt, InnerIvInit, Key, KeyInit};
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, InnerIvInit, Key, KeyInit};
+use cbc::Decryptor;
 use cbc::Encryptor;
 use crypto_bigint::{BoxedUint, Odd};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
-
-#[cfg(test)]
-use aes::Aes128Dec;
-#[cfg(test)]
-use aes::cipher::BlockModeDecrypt;
-#[cfg(test)]
-use cbc::Decryptor;
 
 /// Secret Service OpenSession algorithm this module implements.
 pub const ALGORITHM: &str = "dh-ietf1024-sha256-aes128-cbc-pkcs7";
@@ -291,16 +287,29 @@ fn hkdf_sha256(
         .map_err(|_| CryptoError::KeyDerivation)
 }
 
-/// Decrypt helper for tests only. The product never decrypts.
-#[cfg(test)]
-fn open(key: &SessionKey, iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+/// Open one Secret the daemon sealed for this session: decrypt the
+/// AES-128-CBC `ciphertext` under `iv` and strip the PKCS#7 padding.
+///
+/// This is the read-back counterpart of [`seal`] — the one place the product
+/// decrypts a secret, used by the askpass answer path (and by tests). The
+/// decrypted plaintext is returned zeroized-on-drop; the working buffer is
+/// zeroizing too, so no plaintext-shaped allocation outlives the call.
+pub fn open(
+    key: &SessionKey,
+    iv: &[u8],
+    ciphertext: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let cipher = Aes128Dec::new(&Key::<Aes128Dec>::from(*key.bytes));
     let decryptor =
         Decryptor::<Aes128Dec>::inner_iv_slice_init(cipher, iv).map_err(|_| CryptoError::Cipher)?;
-    let mut buffer = ciphertext.to_vec();
+    let mut buffer = Zeroizing::new(ciphertext.to_vec());
     decryptor
         .decrypt_padded::<Pkcs7>(&mut buffer)
-        .map(|plaintext| plaintext.to_vec())
+        .map(|plaintext| {
+            let mut secret = Zeroizing::new(Vec::with_capacity(plaintext.len()));
+            secret.extend_from_slice(plaintext);
+            secret
+        })
         .map_err(|_| CryptoError::Cipher)
 }
 
