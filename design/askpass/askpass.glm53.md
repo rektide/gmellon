@@ -167,16 +167,34 @@ the secret; that is the contract, and the redaction stance below encodes it.
 
 ### CLI surface
 
-- `gmellon ssh add KEY [--askpass]` — `--askpass` bakes
-  `gmellon:askpass=allow` into the same `CreateItem` properties (atomic,
-  no second call).
+- `gmellon ssh add KEY [--askpass]` — `--askpass` ends with the item
+  carrying `gmellon:askpass=allow`.
 - `gmellon ssh allow KEY` / `gmellon ssh deny KEY` — set/remove the opt-in
   attribute on the stored item (`deny` leaves the item itself in place for
-  gcr). Implemented via `org.freedesktop.DBus.Properties.Set` on the item's
-  attributes, which is what libsecret's own attribute updates use.
+  gcr), via `org.freedesktop.DBus.Properties.Set` on the item's attributes
+  — the same mechanism libsecret's own attribute updates use.
 - `gmellon ssh-list` gains an `ASKPASS` column (yes/no) — the grant is
   security state and belongs where keys are listed; `items` shows the raw
   attribute as always.
+
+**Verified replace semantics (broker-proof correction).** gnome-keyring's
+CreateItem-replace match is subset-on-the-new-fields
+(`gkd-secret-objects.c` `collection_find_matching_item` →
+`gkm_secret_fields_match`: every incoming field must already exist, equal,
+on the item; extra item fields are fine), and a matched item has its
+attributes set wholesale. Two consequences:
+
+- a CreateItem carrying the grant **duplicates** an existing un-granted
+  item instead of replacing it — the first broker run of this design
+  failed exactly there;
+- a plain re-store **wipes** an existing grant (attributes are replaced
+  wholesale) — deliberate: the flags you pass are the state you get.
+
+`create_ssh_key_item` therefore always replaces with the plain gcr
+attribute set (subset-matches granted and un-granted items alike), then
+merges the grant through the writable attributes property when
+`--askpass` is given. Two bus calls in the granted case, one otherwise,
+and exactly one item, always.
 
 ### Product read path
 
