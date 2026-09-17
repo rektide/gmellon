@@ -32,13 +32,17 @@ sources:
 
 ## Snapshot
 
-As of 2026-09-13, `gmellon` is a working Rust CLI for headless GNOME Keyring
-collection discovery, unlock, and password change. The default product backend
+As of 2026-09-17, `gmellon` is a working Rust CLI for headless GNOME Keyring
+collection discovery, unlock, password change, and gcr-compatible SSH key
+passphrase management — storage, listing, removal, and a default-deny
+askpass answer path. The default product backend
 uses zbus to combine the standard Secret Service discovery API with GNOME's
 private `org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface` password
 methods, and every connection negotiates the standard encrypted Secret
 Service session (`dh-ietf1024-sha256-aes128-cbc-pkcs7`) — passwords never
-cross the bus in the clear, with no plain-session fallback. The
+cross the bus in the clear, with no plain-session fallback; the one
+decrypting read-back (the askpass answer) travels the same encrypted
+session. The
 `gmell-encrypted-session` release blocker is closed with body-scan monitor
 evidence.
 
@@ -402,9 +406,10 @@ proofs.
 ### Product follow-ups
 
 - **`gmell-ssh-verify` (P4):** re-verify stored passphrases against their
-  keys; introduces the first product path that reads a secret back.
-- **`gmell-askpass-helper` (P4, exploratory):** gmellon as an SSH_ASKPASS
-  provider backed by the keyring; needs a threat-model note first.
+  keys; reuses the askpass read path (`ssh_key_secret`) rather than
+  introducing a new one.
+- **askpass packaging:** nothing installs the `gmellon-askpass` multicall
+  name yet; the `__askpass` interception works without it meanwhile.
 - **`gmell-firmament-config` (P4, deferred):** Firmament is under active
   rebuild and no current configuration domain justifies adoption. The fixed
   default remains `login`; explicit collection IDs remain command arguments.
@@ -438,6 +443,9 @@ proofs.
 - [`session0.gpt6a.md`](/doc/harness/session0.gpt6a.md) establishes the
   encrypted-session implementation, first-live-run interop facts, and the
   body-scan monitor proof that passwords travel only as ciphertext.
+- [`/design/askpass/askpass.glm53.md`](/design/askpass/askpass.glm53.md) is
+  the verified SSH_ASKPASS contract, the passphrase-oracle threat model,
+  and the per-key default-deny grant design behind the askpass surface.
 - [`/zimfw/README.md`](/zimfw/README.md) is the maintained guide for the
   zsh module: install line, selection policy, and the opt-in systemd
   publisher.
