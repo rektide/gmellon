@@ -1612,6 +1612,11 @@ pub struct ProofSecrets {
     /// The passphrase of the proof's generated SSH key; it must appear in
     /// no stream, artifact, or bus body in the clear.
     pub key_pass: Zeroizing<Vec<u8>>,
+    /// The rotation passphrase: the proof's SSH key is regenerated at the
+    /// same path under it, making the stored `key_pass` item stale for the
+    /// `ssh-verify` proof. Held under the same redaction discipline as
+    /// every other generated secret.
+    pub key_pass_two: Zeroizing<Vec<u8>>,
 }
 
 impl ProofSecrets {
@@ -1623,6 +1628,14 @@ impl ProofSecrets {
         let wrong = common::distinct_password(&[&login, &second, &login_two, &second_two]);
         let key_pass =
             common::distinct_password(&[&login, &second, &login_two, &second_two, &wrong]);
+        let key_pass_two = common::distinct_password(&[
+            &login,
+            &second,
+            &login_two,
+            &second_two,
+            &wrong,
+            &key_pass,
+        ]);
 
         // Not a secret: a printable tag identifying this run's second fixture.
         let mut random = [0_u8; 4];
@@ -1640,6 +1653,7 @@ impl ProofSecrets {
             login_two,
             second_two,
             key_pass,
+            key_pass_two,
         }
     }
 
@@ -1651,10 +1665,11 @@ impl ProofSecrets {
             self.login_two.as_slice(),
             self.second_two.as_slice(),
             self.key_pass.as_slice(),
+            self.key_pass_two.as_slice(),
         ]
     }
 
-    pub fn named(&self) -> [(&'static str, &[u8]); 6] {
+    pub fn named(&self) -> [(&'static str, &[u8]); 7] {
         [
             ("login", self.login.as_slice()),
             ("second", self.second.as_slice()),
@@ -1662,6 +1677,7 @@ impl ProofSecrets {
             ("login_two", self.login_two.as_slice()),
             ("second_two", self.second_two.as_slice()),
             ("key_pass", self.key_pass.as_slice()),
+            ("key_pass_two", self.key_pass_two.as_slice()),
         ]
     }
 }

@@ -22,7 +22,13 @@
 //! the old password still valid, explicit second-collection A→B and default
 //! login L→L2 changes exit 0 and rotate exactly the selected collection
 //! (former password denied, new password accepted after fixture-only locks),
-//! and a missing collection is rejected before stdin is read. Captured
+//! and a missing collection is rejected before stdin is read. The SSH group
+//! is proven end to end: `ssh-add` stores verified passphrases where gcr
+//! reads them, the `__askpass` grant/answer/revoke lifecycle answers only
+//! granted keys, and `ssh-verify` re-verifies the stored passphrase — MATCH
+//! while it unlocks, STALE after the key is regenerated at the same path
+//! under a different generated passphrase, MISSING-KEY after the key file is
+//! removed — with every verdict exit-checked and scanned. Captured
 //! stdout/stderr and retained artifacts are scanned for every generated
 //! password, a match-filtered monitor attributes every standard Lock call to
 //! the fixture (ordinary CLI paths never lock or relock), and the
@@ -516,7 +522,7 @@ fn run_proof(secrets: &ProofSecrets) {
     assert_eq!(exit_code(&rotated_second_unlock), Some(0));
     assert_listed_locked(secrets, &second_id, false, "second after the lock rotation");
 
-    // --- `gmellon ssh-add` / `items` / `ssh-list` / `ssh-remove` ---------
+    // --- `gmellon ssh-add` / `items` / `ssh-list` / `ssh-verify` / `ssh-remove`
     // Entering this section both collections are unlocked; the harness's
     // default alias points at the exact-login fixture, which is where
     // gcr-ssh-agent's libsecret lookup goes. The proof's key passphrase is
@@ -956,8 +962,111 @@ fn run_proof(secrets: &ProofSecrets) {
         "the re-stored row must show the grant"
     );
 
+    // --- `gmellon ssh-verify`: re-verify the stored passphrase ------------
+    // The read path is the askpass read (ssh_key_secret): GetSecret under
+    // the encrypted session, zeroized, verdict-only output. run_gmellon
+    // scans both streams for every generated secret, so a verdict line
+    // that leaked a passphrase fails this proof; the CreateItem monitor
+    // below still counts exactly three stores, proving verify stores
+    // nothing; and every verify invocation negotiates its own encrypted
+    // OpenSession (the negotiation arithmetic counts them).
+    let verify_one = |stage: &str| {
+        run_gmellon(
+            &["ssh-verify", key_canonical.to_str().unwrap()],
+            CliStdin::FailIfRead,
+            secrets,
+            stage,
+        )
+    };
+    let verify_all = |stage: &str| run_gmellon(&["ssh-verify"], CliStdin::FailIfRead, secrets, stage);
+
+    // The stored passphrase still unlocks the key: MATCH and exit 0, both
+    // for the one key and across the whole store (exactly one item exists
+    // here, so verify-all must print exactly that one line).
+    let verified = verify_one("ssh-verify the matching stored passphrase");
+    assert_eq!(
+        exit_code(&verified),
+        Some(0),
+        "a matching stored passphrase must exit 0"
+    );
+    assert!(
+        String::from_utf8_lossy(&verified.stdout)
+            .lines()
+            .any(|line| line == format!("MATCH {}", key_canonical.display())),
+        "verify must report MATCH for the still-valid stored passphrase"
+    );
+    let verified_all = verify_all("ssh-verify all stores with a matching passphrase");
+    assert_eq!(exit_code(&verified_all), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&verified_all.stdout),
+        format!("MATCH {}\n", key_canonical.display()),
+        "verify-all must print exactly one verdict line here: the matching key"
+    );
+
+    // Stale detection: the key is regenerated at the same path under a
+    // different generated passphrase. The old files are removed first —
+    // the pty generation helper synchronizes on passphrase prompts and
+    // cannot answer ssh-keygen's overwrite question, so an in-place
+    // regeneration would deadlock it. The stored item is untouched: the
+    // stored passphrase is now stale.
+    std::fs::remove_file(&key_path).expect("remove the proof key before rotation");
+    let _ = std::fs::remove_file(key_path.with_extension("pub"));
+    let rotated = common::generate_encrypted_ssh_key(&key_path, secrets.key_pass_two.as_slice());
+    assert!(
+        rotated.success(),
+        "the rotated proof key must generate under the new passphrase"
+    );
+
+    let stale = verify_one("ssh-verify after the key rotation");
+    assert_eq!(
+        exit_code(&stale),
+        Some(1),
+        "a stale stored passphrase must exit 1"
+    );
+    let stale_stdout = String::from_utf8_lossy(&stale.stdout);
+    assert!(
+        stale_stdout
+            .lines()
+            .any(|line| line.starts_with(&format!("STALE {}", key_canonical.display()))),
+        "verify must report STALE for the rotated key: {stale_stdout}"
+    );
+    let stale_all = verify_all("ssh-verify all stores with a stale passphrase");
+    assert_eq!(exit_code(&stale_all), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&stale_all.stdout),
+        stale_stdout,
+        "verify-all must reproduce the single-key stale verdict exactly"
+    );
+
+    // The key file vanishes: the stored passphrase can no longer be
+    // checked, decided without reading any secret.
+    std::fs::remove_file(&key_path).expect("remove the rotated proof key");
+    let missing = verify_one("ssh-verify with the key file gone");
+    assert_eq!(
+        exit_code(&missing),
+        Some(1),
+        "a missing key file must exit 1"
+    );
+    let missing_stdout = String::from_utf8_lossy(&missing.stdout);
+    assert!(
+        missing_stdout
+            .lines()
+            .any(|line| line.starts_with(&format!("MISSING-KEY {}", key_canonical.display()))),
+        "verify must report MISSING-KEY when the key file is gone: {missing_stdout}"
+    );
+    let missing_all = verify_all("ssh-verify all stores with the key file gone");
+    assert_eq!(exit_code(&missing_all), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&missing_all.stdout),
+        missing_stdout,
+        "verify-all must reproduce the missing-key verdict exactly"
+    );
+
     // Removal: exactly the matching item, and a second removal finds
-    // nothing.
+    // nothing. Entering this section the key file is already gone (the
+    // ssh-verify rotation removed it), so the removal exercises the exact
+    // stale-cleanup path its contract promises — the stored item is found
+    // by its unique attribute alone.
     let removed = run_gmellon(
         &["ssh-remove", key_canonical.to_str().unwrap()],
         CliStdin::FailIfRead,
@@ -1423,7 +1532,10 @@ fn run_proof(secrets: &ProofSecrets) {
     // The wrong-passphrase and unencrypted-key ssh-add refusals verify the
     // key before ever connecting, and two askpass refusals (the permission
     // hint and the unparseable prompt) are refused before any bus use, so
-    // those invocations negotiate nothing.
+    // those invocations negotiate nothing. Every ssh-verify invocation
+    // connects: the verdict needs the stored secret read under the
+    // encrypted session, even for MISSING-KEY (the item lookup runs
+    // before the file check).
     let never_connecting_invocations = 4_usize;
 
     let negotiations = negotiation_monitor.finish(secrets);
