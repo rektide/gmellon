@@ -327,3 +327,30 @@ traffic elsewhere.
   the context for Move 7's factoring and for what the proofs pin in place.
 - [`README.md`](/README.md) — user-facing structure; unaffected by every
   move above (no public API or CLI surface changes proposed).
+
+# Outcome — the pass as executed (2026-09-19)
+
+All moves landed, reviewed, and gated by the parent; Move 7 included.
+Commits, in order: fmt (`qnzvnpqs`), cli split + `ALGORITHM` re-export
+(`vrqlyxyv`), `canonical_or_absolute` (`xvmvwxkq`), `ensure_no_prompt`
+(`zmrkqoow`), single walk + de-quadratic verify-all (`ownsotuo`) with the
+duplicates proof pin (`xtxzuzkz`), `ssh/` split (`utwzvrnl`),
+`rust-feature-fence` (`kkrqwmmz`), and the `broker_common/` directory
+factoring (`zuottxzp`). Gates at every commit: fmt, clippy
+`-D warnings --all-features --all-targets`, nextest (118 passed / 2
+skipped baseline held throughout); broker CLI proof green before and
+after Move 4 and at the end; `dev/harness/check all` green;
+`zimfw/functions/_gmellon` byte-identical across the whole pass.
+
+Deviations accepted by review: the completions grammar tests stayed in
+`cli/mod.rs` (they pin the `Command` enum); `canonical_or_absolute`
+unified on the `std::path::absolute` fallback flavor (strictly
+more-matches in a corner the proofs cannot reach); Move 7 split into six
+files rather than four (scanner/body separated to stay under ~600 lines)
+and hoisted nothing from `broker_cli.rs` — `broker_collections.rs` is an
+in-process client proof sharing none of the process-driving helpers, so
+the doc's conditional ("only as broker_collections can actually share
+them") resolved to none. Move 4 took no fallback: the single-walk
+verify-all landed, and the proof gained a genuine-duplicates fixture
+staged through the subset-match replace quirk documented in
+[`design/askpass/askpass.glm53.md`](/design/askpass/askpass.glm53.md).
