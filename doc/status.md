@@ -180,10 +180,11 @@ flowchart LR
 
 | Area | Path | Responsibility |
 | --- | --- | --- |
-| CLI | [`/src/cli/mod.rs`](/src/cli/mod.rs) | clap parsing, pre-input collection resolution, output, and exit mapping |
+| CLI | [`/src/cli/mod.rs`](/src/cli/mod.rs) | clap grammar + dispatch; handlers live in per-family siblings (`collections.rs`, `ssh.rs`, `completions.rs`) with `render.rs`/`report.rs` shared tails — see [`/design/elegance/elegance0.fx.md`](/design/elegance/elegance0.fx.md) |
 | Secret input | [`/src/secret_input/mod.rs`](/src/secret_input/mod.rs) | rpassword TTY prompts, bounded stdin records, confirmation, and zeroizing ownership |
 | Session crypto core | [`/src/secret_service/session.rs`](/src/secret_service/session.rs) | sans-I/O encrypted-session cryptography: DH keypair, peer-key validation, HKDF-SHA256 key derivation, AES-128-CBC/PKCS#7 sealing, zeroized key material |
-| Collection client | [`/src/secret_service/`](/src/secret_service/) | encrypted-session negotiation, collection IDs/metadata, generated zbus proxies, list/unlock/change, and remote-error classification |
+| Collection client | [`/src/secret_service/`](/src/secret_service/) | encrypted-session negotiation, collection IDs/metadata, generated zbus proxies, list/unlock/change, SSH item CRUD and the one decrypting read-back, and remote-error classification |
+| SSH capabilities | [`/src/ssh/`](/src/ssh/) | the ssh-keygen-backed passphrase verifier (`verify.rs`), the OpenSSH askpass provider (`askpass.rs`), and the shared lenient path discipline |
 | Historical control backend | [`/src/control/`](/src/control/) | login-only sans-I/O codec, peer validation, and synchronous control-socket exchange behind the disabled-by-default `login-control` feature |
 | Executable harness | [`/dev/harness/`](/dev/harness/) | control-only and private-broker daemon lifecycles, checks, cleanup, and retained evidence |
 | Rust proofs | [`/tests/harness/`](/tests/harness/) | opt-in real-daemon transport, collection, binary CLI, encrypted-session wire, and redaction proofs |
@@ -462,6 +463,11 @@ fixture-readback proofs.
 - [`/design/askpass/askpass.glm53.md`](/design/askpass/askpass.glm53.md) is
   the verified SSH_ASKPASS contract, the passphrase-oracle threat model,
   and the per-key default-deny grant design behind the askpass surface.
+- [`/design/elegance/elegance0.fx.md`](/design/elegance/elegance0.fx.md)
+  assesses the code's shape and records the 2026-09-19 refactor pass
+  (cli per-family split, named path discipline, single SSH item walk,
+  ssh/verify+askpass split, login-control compile fence, harness
+  broker_common/ factoring) with its outcome addendum.
 - [`/zimfw/README.md`](/zimfw/README.md) is the maintained guide for the
   zsh module: install line, selection policy, and the opt-in systemd
   publisher.
