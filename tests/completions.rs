@@ -53,6 +53,7 @@ fn zsh_completions_name_subcommands_and_pass_zsh_n() {
         "ssh-allow",
         "ssh-deny",
         "ssh-remove",
+        "ssh-verify",
         "change",
         "completions",
     ] {

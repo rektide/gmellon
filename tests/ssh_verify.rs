@@ -104,6 +104,67 @@ fn a_missing_key_file_is_rejected_not_verified() {
     );
 }
 
+#[test]
+fn a_regenerated_key_makes_the_old_passphrase_stale() {
+    // The ssh-verify use case end to end at the primitive level: a key
+    // regenerated at the same path under a new passphrase leaves the
+    // previously stored passphrase stale (the broker proof drives this
+    // same rotation through the CLI).
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let key = directory.path().join("id_rotated");
+    assert!(
+        common::generate_encrypted_ssh_key(&key, b"original-pass").success(),
+        "the original encrypted key must generate"
+    );
+    assert_eq!(
+        verify_passphrase_with(&gmellon_binary(), &key, b"original-pass"),
+        Verdict::Verified
+    );
+
+    // Remove before regenerating: the pty generation helper synchronizes
+    // on "passphrase" prompts and cannot answer ssh-keygen's overwrite
+    // question, so an in-place regeneration would deadlock it.
+    std::fs::remove_file(&key).expect("remove the original key");
+    let _ = std::fs::remove_file(key.with_extension("pub"));
+    assert!(
+        common::generate_encrypted_ssh_key(&key, b"rotated-pass").success(),
+        "the rotated encrypted key must generate"
+    );
+
+    assert_eq!(
+        verify_passphrase_with(&gmellon_binary(), &key, b"original-pass"),
+        Verdict::Rejected,
+        "the pre-rotation passphrase must be stale after regeneration"
+    );
+    assert_eq!(
+        verify_passphrase_with(&gmellon_binary(), &key, b"rotated-pass"),
+        Verdict::Verified,
+        "the new passphrase must unlock the regenerated key"
+    );
+}
+
+#[test]
+fn a_key_regenerated_unencrypted_verdicts_not_encrypted() {
+    // Rotation to a passphrase-less key: the stored passphrase "succeeds"
+    // but so does the deliberately wrong probe, so the verdict is
+    // NotEncrypted — nothing the stored secret could unlock.
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let key = directory.path().join("id_to_plain");
+    assert!(
+        common::generate_encrypted_ssh_key(&key, b"soon-stale-pass").success(),
+        "the encrypted key must generate"
+    );
+
+    std::fs::remove_file(&key).expect("remove the encrypted key");
+    let _ = std::fs::remove_file(key.with_extension("pub"));
+    generate_plaintext_key(directory.path(), "id_to_plain");
+
+    assert_eq!(
+        verify_passphrase_with(&gmellon_binary(), &key, b"soon-stale-pass"),
+        Verdict::NotEncrypted
+    );
+}
+
 // --- askpass provider: binary-level refusals (no daemon required) ---------
 
 /// Run the compiled binary's hidden `__askpass` entry with one prompt
