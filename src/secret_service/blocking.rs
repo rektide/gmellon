@@ -496,9 +496,7 @@ impl BlockingClient {
         let (locked, prompt) = service.lock(&[path]).map_err(classify_service_error)?;
         // An empty path or "/" means no prompt was necessary. Anything else
         // is a prompt object gmellon refuses to perform.
-        if !prompt.as_str().is_empty() && prompt.as_str() != "/" {
-            return Err(Error::LockPromptRequired);
-        }
+        ensure_no_prompt(&prompt)?;
         if !locked
             .iter()
             .any(|locked_path| locked_path == &collection.path)
@@ -636,11 +634,8 @@ impl BlockingClient {
             )
             .map_err(|error| classify_password_error(error, collection_id))?;
         // An empty path or "/" means no prompt was necessary; gmellon does
-        // not perform prompt objects.
-        if !prompt.as_str().is_empty() && prompt.as_str() != "/" {
-            let _ = item;
-            return Err(Error::LockPromptRequired);
-        }
+        // not perform prompt objects, and the created item is discarded.
+        ensure_no_prompt(&prompt)?;
         // Second half of the no-duplicates sequence above: merge the grant
         // into the (now exactly one) item through the writable attributes
         // property. A plain re-store without the flag deliberately leaves
@@ -792,9 +787,7 @@ impl BlockingClient {
         let prompt = proxy.delete().map_err(classify_service_error)?;
         // An empty path or "/" means no prompt was necessary;
         // gmellon does not perform prompt objects.
-        if !prompt.as_str().is_empty() && prompt.as_str() != "/" {
-            return Err(Error::LockPromptRequired);
-        }
+        ensure_no_prompt(&prompt)?;
         Ok(collection_id)
     }
 
@@ -848,6 +841,17 @@ impl BlockingClient {
             .build()
             .map_err(Error::Bus)
     }
+}
+
+/// Refuse to perform a prompt object. The Secret Service signals "no
+/// prompt was necessary" with an empty object path or `/`; anything else
+/// is an interactive prompt, and gmellon never performs one — the caller
+/// fails closed instead. The single encoding of that protocol invariant.
+fn ensure_no_prompt(prompt: &OwnedObjectPath) -> Result<(), Error> {
+    if !prompt.as_str().is_empty() && prompt.as_str() != "/" {
+        return Err(Error::LockPromptRequired);
+    }
+    Ok(())
 }
 
 fn classify_session_error(error: zbus::Error) -> Error {
