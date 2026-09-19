@@ -250,6 +250,15 @@ trait FixtureGnomeInternal {
 trait FixtureCollection {
     #[zbus(property)]
     fn items(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+
+    /// TEST-FIXTURE ONLY: stage one standard-API item in this collection.
+    /// Returns the item path and the prompt path (which must stay "/").
+    fn create_item(
+        &self,
+        properties: &HashMap<&str, Value<'_>>,
+        secret: FixtureSecret<'_>,
+        replace: bool,
+    ) -> zbus::Result<(OwnedObjectPath, OwnedObjectPath)>;
 }
 
 #[zbus::proxy(
@@ -259,6 +268,10 @@ trait FixtureCollection {
 trait FixtureItem {
     #[zbus(property)]
     fn attributes(&self) -> zbus::Result<HashMap<String, String>>;
+
+    /// TEST-FIXTURE ONLY: delete a fixture-staged item so a proof segment
+    /// leaves no state behind. Returns the prompt path (which must stay "/").
+    fn delete(&self) -> zbus::Result<OwnedObjectPath>;
 
     /// TEST-FIXTURE ONLY: read one item's secret under the caller's
     /// encrypted session; the returned tuple is the wire Secret.
@@ -437,6 +450,88 @@ impl Fixture {
                 ),
             )
             .map_err(FixtureError::Transport)
+    }
+
+    /// TEST-FIXTURE ONLY: stage one standard-API ssh-store item — the same
+    /// item shape the product's `ssh-add` stores, created through the plain
+    /// `org.freedesktop.Secret.Collection.CreateItem` path so a proof can
+    /// arrange states the product itself refuses to produce (such as two
+    /// items claiming one key). With `extra_attribute` the staged item
+    /// carries one attribute beyond the gcr set, which defeats
+    /// gnome-keyring's subset-match replace and makes genuine duplicates
+    /// possible. The passphrase is sealed under the fixture's encrypted
+    /// session exactly as the product seals its stores.
+    pub fn create_ssh_store_item(
+        &self,
+        collection: &OwnedObjectPath,
+        unique_value: &str,
+        label: &str,
+        passphrase: &[u8],
+        extra_attribute: Option<(&str, &str)>,
+    ) -> Result<OwnedObjectPath, FixtureError> {
+        let collection_proxy = FixtureCollectionProxyBlocking::builder(&self.connection)
+            .destination("org.freedesktop.secrets")
+            .map_err(FixtureError::Transport)?
+            .path(collection.clone())
+            .map_err(FixtureError::Transport)?
+            .build()
+            .map_err(FixtureError::Transport)?;
+        let sealed = session::seal(&self.session_key, passphrase).map_err(|error| {
+            FixtureError::Session(gmellon::secret_service::Error::Session(error))
+        })?;
+        let mut attributes: HashMap<String, String> = HashMap::new();
+        attributes.insert("unique".to_owned(), unique_value.to_owned());
+        attributes.insert(
+            "xdg:schema".to_owned(),
+            "org.freedesktop.Secret.Generic".to_owned(),
+        );
+        if let Some((key, value)) = extra_attribute {
+            attributes.insert(key.to_owned(), value.to_owned());
+        }
+        let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
+        properties.insert("org.freedesktop.Secret.Item.Label", Value::from(label));
+        properties.insert(
+            "org.freedesktop.Secret.Item.Attributes",
+            Value::Dict(zbus::zvariant::Dict::from(attributes)),
+        );
+        let session: ObjectPath<'_> = self.session_path.as_ref();
+        let (item, prompt) = collection_proxy
+            .create_item(
+                &properties,
+                (
+                    &session,
+                    sealed.iv.as_slice(),
+                    sealed.ciphertext.as_slice(),
+                    "text/plain",
+                ),
+                false,
+            )
+            .map_err(FixtureError::Transport)?;
+        assert_eq!(
+            prompt.as_str(),
+            "/",
+            "staging an ssh-store item must not demand a prompt"
+        );
+        Ok(item)
+    }
+
+    /// TEST-FIXTURE ONLY: delete a fixture-staged item, restoring the store
+    /// state a proof segment found. The returned prompt path must stay "/".
+    pub fn delete_item(&self, item: &OwnedObjectPath) -> Result<(), FixtureError> {
+        let item_proxy = FixtureItemProxyBlocking::builder(&self.connection)
+            .destination("org.freedesktop.secrets")
+            .map_err(FixtureError::Transport)?
+            .path(item.clone())
+            .map_err(FixtureError::Transport)?
+            .build()
+            .map_err(FixtureError::Transport)?;
+        let prompt = item_proxy.delete().map_err(FixtureError::Transport)?;
+        assert_eq!(
+            prompt.as_str(),
+            "/",
+            "deleting a fixture-staged item must not demand a prompt"
+        );
+        Ok(())
     }
 }
 

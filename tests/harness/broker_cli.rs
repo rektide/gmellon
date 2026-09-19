@@ -1100,6 +1100,108 @@ fn run_proof(secrets: &ProofSecrets) {
         "the missing-store removal must say so"
     );
 
+    // --- duplicate stored passphrases: the ambiguity refusal --------------
+    // The store is empty for the proof key here, so the fixture stages two
+    // items claiming the same key: one plain gcr-shaped store plus one
+    // carrying an extra attribute, which defeats gnome-keyring's
+    // subset-match replace and leaves genuine duplicates. The product must
+    // refuse to choose without ever reading a secret: ssh-list shows both
+    // rows; ssh-verify reports the ambiguity as an ERROR line per staged
+    // item in verify-all mode and as a house service error in single-key
+    // mode; ssh-remove changes nothing. The staged items seal
+    // `key_pass` under the fixture session (a scanner-known secret) and are
+    // deleted again before the narrative continues.
+    let duplicate_staged = fixture
+        .create_ssh_store_item(
+            &login_path,
+            &key_unique,
+            &format!("Unlock password for: {}", key_canonical.display()),
+            secrets.key_pass.as_slice(),
+            None,
+        )
+        .expect("fixture stages the first duplicate ssh-store item");
+    let duplicate_extra = fixture
+        .create_ssh_store_item(
+            &login_path,
+            &key_unique,
+            &format!("Unlock password for: {}", key_canonical.display()),
+            secrets.key_pass.as_slice(),
+            Some(("gmellon:proof", "duplicate")),
+        )
+        .expect("fixture stages the second duplicate ssh-store item");
+    let duplicated = ssh_list("ssh-list with duplicated stored passphrases");
+    assert_eq!(
+        ssh_list_key_rows(&duplicated),
+        2,
+        "the staged duplicates must both be listed"
+    );
+    let ambiguous_all = verify_all("ssh-verify all stores with duplicated stored passphrases");
+    assert_eq!(
+        exit_code(&ambiguous_all),
+        Some(1),
+        "an ambiguous store must fail verify-all"
+    );
+    let ambiguous_line = format!(
+        "ERROR {} (2 stored passphrase items claim SSH key {}; \
+         gmellon ssh-list shows them; nothing was changed)",
+        key_canonical.display(),
+        key_canonical.display()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ambiguous_all.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![ambiguous_line.as_str(), ambiguous_line.as_str()],
+        "verify-all must report the ambiguity once per staged item and change nothing"
+    );
+    let ambiguous_one = verify_one("ssh-verify the duplicated key directly");
+    assert_eq!(
+        exit_code(&ambiguous_one),
+        Some(1),
+        "an ambiguous store must fail single-key verify"
+    );
+    assert!(
+        String::from_utf8_lossy(&ambiguous_one.stderr)
+            .contains("2 stored passphrase items claim SSH key"),
+        "single-key verify must report the ambiguity as a house service error"
+    );
+    assert!(
+        ambiguous_one.stdout.is_empty(),
+        "single-key verify must not write a verdict line for an ambiguous store"
+    );
+    let refused_removal = run_gmellon(
+        &["ssh-remove", key_canonical.to_str().unwrap()],
+        CliStdin::FailIfRead,
+        secrets,
+        "ssh-remove refuses ambiguous duplicates",
+    );
+    assert_eq!(
+        exit_code(&refused_removal),
+        Some(1),
+        "removing an ambiguous store must exit 1"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused_removal.stderr).contains("nothing was changed"),
+        "the refused removal must say nothing was changed"
+    );
+    let unchanged = ssh_list("ssh-list after the refused removal");
+    assert_eq!(
+        ssh_list_key_rows(&unchanged),
+        2,
+        "the refused removal must leave both duplicates in place"
+    );
+    fixture
+        .delete_item(&duplicate_staged)
+        .expect("fixture deletes the first staged duplicate");
+    fixture
+        .delete_item(&duplicate_extra)
+        .expect("fixture deletes the second staged duplicate");
+    assert_eq!(
+        ssh_list_key_rows(&ssh_list("ssh-list after duplicate cleanup")),
+        0,
+        "the duplicate stage must clean up completely"
+    );
+
     // --- missing collection: actionable exit 1 before any password use ----
     let missing = run_gmellon(
         &["unlock", MISSING_ID, "--stdin"],
@@ -1503,16 +1605,18 @@ fn run_proof(secrets: &ProofSecrets) {
         );
     }
 
-    // The CreateItem wire evidence: exactly the three legitimate stores (the
-    // verified store, the replacing store, and the granted re-store) reached
-    // the daemon, every one with an encrypted Secret. The finish call itself
-    // fails closed on any leak of the key passphrase into a captured body,
-    // and the refused and unencrypted attempts never got here to be counted.
+    // The CreateItem wire evidence: exactly the three product stores (the
+    // verified store, the replacing store, and the granted re-store) plus
+    // the two fixture-staged duplicate items reached the daemon, every one
+    // with an encrypted Secret. The finish call itself fails closed on any
+    // leak of the key passphrase into a captured body, and the refused and
+    // unencrypted attempts never got here to be counted.
     let created = create_item_monitor.finish(secrets);
     assert_eq!(
         created.messages.len(),
-        3,
-        "exactly the verified store, the replacing store, and the granted re-store may create items"
+        5,
+        "exactly the verified store, the replacing store, the granted re-store, \
+         and the two staged duplicates may create items"
     );
     assert!(
         created
@@ -1526,9 +1630,9 @@ fn run_proof(secrets: &ProofSecrets) {
     // key before ever connecting, and two askpass refusals (the permission
     // hint and the unparseable prompt) are refused before any bus use, so
     // those invocations negotiate nothing. Every ssh-verify invocation
-    // connects: the verdict needs the stored secret read under the
-    // encrypted session, even for MISSING-KEY (the item lookup runs
-    // before the file check).
+    // connects: even the MISSING-KEY and ambiguous-duplicate verdicts are
+    // decided from metadata, but the lookup itself needs the client with
+    // its negotiated encrypted session.
     let never_connecting_invocations = 4_usize;
 
     let negotiations = negotiation_monitor.finish(secrets);
