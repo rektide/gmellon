@@ -127,6 +127,13 @@ gmellon ssh-add ~/.ssh/deck --stdin < /dev/shm/pw
 # (metadata only: the passphrases are never read)
 gmellon ssh-list
 
+# re-verify stored passphrases against their keys: one MATCH/STALE/
+# MISSING-KEY line per key, the passphrases never printed
+gmellon ssh-verify ~/.ssh/deck
+
+# or verify every stored key across all collections
+gmellon ssh-verify
+
 # remove a stored passphrase (the key file itself may be long gone)
 gmellon ssh-remove ~/.ssh/deck
 
@@ -158,6 +165,18 @@ The `ssh-add` contract, in order:
 
 `ssh-remove` deletes the single exactly-matching item; duplicates (which
 gcr cannot disambiguate either) are reported without changing anything.
+
+`ssh-verify` is the audit for this whole group: it decrypts each stored
+passphrase — under the encrypted session, through the same read path
+the askpass helper uses — and checks it against the key with the same
+ssh-keygen verification `ssh-add` performs. One deterministic verdict
+line per key: `MATCH` (still good), `STALE` (the key was regenerated
+under a different passphrase — re-run `ssh-add`), `MISSING-KEY` (the
+key file is gone — `ssh-remove` cleans up), `NOT-ENCRYPTED` (the key
+was regenerated without a passphrase), `LOCKED` (unlock the keyring
+first). The passphrase itself is never printed, and the command exits 0
+only when every checked key matched. Running it after rotating keys
+catches the stale stored secret a regeneration leaves behind.
 
 #### The askpass helper
 
@@ -433,8 +452,8 @@ the current verification matrix in [`doc/status.md`](/doc/status.md).
 Ordinary checks:
 
 ```sh
-cargo nextest run                            # 98 passed, 2 skipped
-cargo nextest run --features login-control   # 125 passed, 4 skipped
+cargo nextest run                            # 115 passed, 2 skipped
+cargo nextest run --features login-control   # 142 passed, 4 skipped
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 zimfw/test.zsh                               # 68 assertions

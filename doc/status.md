@@ -32,10 +32,10 @@ sources:
 
 ## Snapshot
 
-As of 2026-09-17, `gmellon` is a working Rust CLI for headless GNOME Keyring
+As of 2026-09-18, `gmellon` is a working Rust CLI for headless GNOME Keyring
 collection discovery, unlock, password change, and gcr-compatible SSH key
-passphrase management — storage, listing, removal, and a default-deny
-askpass answer path. The default product backend
+passphrase management — storage, listing, re-verification, removal, and a
+default-deny askpass answer path. The default product backend
 uses zbus to combine the standard Secret Service discovery API with GNOME's
 private `org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface` password
 methods, and every connection negotiates the standard encrypted Secret
@@ -73,6 +73,7 @@ gmellon items [COLLECTION]
 gmellon ssh-list
 gmellon ssh-add KEY [--stdin] [--askpass]
 gmellon ssh-remove KEY
+gmellon ssh-verify [KEY]
 gmellon ssh-allow KEY
 gmellon ssh-deny KEY
 gmellon change [COLLECTION]
@@ -102,6 +103,17 @@ gmellon -v [COMMAND]   # redacted diagnostics on stderr
   explanation.
 - `ssh-remove KEY` deletes the exactly-matching stored item; duplicates
   are reported without changes, and the key file itself need not exist.
+- `ssh-verify [KEY]` re-verifies stored passphrases against their keys:
+  with KEY, that key's stored item; without it, every ssh-store item
+  across all collections. It reads each secret back through the askpass
+  read path (`GetSecret` under the encrypted session — the one place
+  gmellon decrypts) and checks it with the same ssh-keygen verification
+  `ssh-add` performs, printing one deterministic verdict line per key —
+  `MATCH`, `STALE`, `MISSING-KEY` (decided before any secret is read),
+  `NOT-ENCRYPTED`, `LOCKED` (names the collection to unlock), or an
+  `UNAVAILABLE`/`ERROR` line — and never the passphrase. Exit 0 only
+  when every checked key matched; any other verdict or error exits 1
+  through the existing table.
 - `ssh-list` renders `KEY`, `COLLECTION`, `LOCKED`, and `ASKPASS` columns;
   `ASKPASS` is yes only for items carrying the per-key opt-in.
 - The askpass helper answers OpenSSH passphrase prompts (`SSH_ASKPASS`)
@@ -265,6 +277,12 @@ The Rust proof invokes `env!("CARGO_BIN_EXE_gmellon")` inside the private
 broker harness. It establishes deterministic listing, default and explicit
 collection selection, stdin contracts, output text, exits 0/1/2, missing-ID
 rejection before input, and already-unlocked success with `/dev/null` stdin.
+The SSH group is proven end to end: verified storage where gcr reads it, the
+askpass grant/answer/revoke lifecycle, and `ssh-verify` verdicts — MATCH,
+STALE after the proof key is regenerated at the same path under a different
+generated passphrase (stale detection by rotation), and MISSING-KEY after
+the key file is removed — each exit-checked, reproduced exactly by
+verify-all, and scanned so no verdict line can carry a passphrase.
 Exits 3/4 are covered by pure error-mapping tests because killing the owned
 daemon or broker is a harness failure.
 
@@ -323,9 +341,9 @@ Ordinary development checks currently report:
 
 ```text
 cargo nextest run
-98 passed, 2 skipped
+115 passed, 2 skipped
 cargo nextest run --features login-control
-125 passed, 4 skipped
+142 passed, 4 skipped
 ```
 
 The zsh module suite reports independently:
@@ -343,13 +361,13 @@ discovery, no `--source` needed).
 
 The login control backend is omitted entirely from default builds (its
 unit tests and the `real_daemon` target compile only with the feature), so
-the default baseline dropped from the earlier 106 passed / 4 skipped; the
-two remaining skips are the private-broker proofs. The full historical set
-returns with the feature:
+the default baseline counts grew with the askpass and ssh-verify suites;
+the two remaining skips are the private-broker proofs. The full historical
+set returns with the feature:
 
 ```text
 cargo nextest run --features login-control
-125 passed, 4 skipped
+142 passed, 4 skipped
 ```
 
 The four ignored tests are explicit external-daemon proofs rather than silent
@@ -399,15 +417,13 @@ rustdoc.
 No release blocker remains open. The original epic's boundary — release
 security plus packaging/polish — plus its stretch items landed. The item
 and SSH key management layer (`gmell-key-mgmt`) has landed its P2/P3
-items: item listing, gcr-compatible verified `ssh-add`, `ssh-list`, and
-`ssh-remove`, all with CreateItem body-monitor and fixture-readback
-proofs.
+items: item listing, gcr-compatible verified `ssh-add`, `ssh-list`,
+`ssh-remove`, stored-passphrase re-verification (`ssh-verify`, with the
+stale-by-rotation broker proof), all with CreateItem body-monitor and
+fixture-readback proofs.
 
 ### Product follow-ups
 
-- **`gmell-ssh-verify` (P4):** re-verify stored passphrases against their
-  keys; reuses the askpass read path (`ssh_key_secret`) rather than
-  introducing a new one.
 - **askpass packaging:** nothing installs the `gmellon-askpass` multicall
   name yet; the `__askpass` interception works without it meanwhile.
 - **`gmell-firmament-config` (P4, deferred):** Firmament is under active
