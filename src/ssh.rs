@@ -19,6 +19,25 @@ use std::process::{Command, Stdio};
 
 use zeroize::Zeroizing;
 
+/// The lenient path discipline for matching a stored SSH key passphrase
+/// attribute — the storage join key shared by the `ssh-*` commands and the
+/// askpass provider: resolve symlinks and relative paths when the key file
+/// is present, and otherwise fall back to the path made absolute verbatim
+/// (`std::path::absolute`). A missing file is never an error here — stale
+/// stored passphrases are exactly what ssh-remove and ssh-verify exist to
+/// address, so the attribute must still match what was stored.
+///
+/// This is the lenient flavor only. `ssh-add` deliberately keeps its own
+/// strict `canonicalize` with a hard error on a missing key: there the
+/// canonical path is the storage key *and* the passphrase must be verified
+/// against a real file. The asymmetry is policy, not duplication.
+pub fn canonical_or_absolute(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(_) => std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+    }
+}
+
 /// The deliberately wrong passphrase used to detect unencrypted keys.
 const WRONG_PROBE: &[u8] = b"gmellon-deliberately-wrong-passphrase-probe";
 
@@ -247,10 +266,9 @@ pub fn askpass_provider(prompt: &std::ffi::OsStr) -> std::process::ExitCode {
     let Some(path) = parse_askpass_prompt(prompt) else {
         return askpass_refuse("unrecognized prompt (expected an OpenSSH key passphrase prompt)");
     };
-    // Same path discipline as ssh-remove: canonicalize when the key file
-    // exists, otherwise keep the verbatim absolute path — the stored
-    // attribute is what must match.
-    let absolute = std::fs::canonicalize(&path).unwrap_or(path);
+    // The lenient join-key discipline ([`canonical_or_absolute`]), shared
+    // with the ssh-* commands: the stored attribute is what must match.
+    let absolute = canonical_or_absolute(&path);
     let key_path = absolute.display().to_string();
 
     // 3. Connect; any service failure is a plain refusal.
@@ -300,6 +318,37 @@ mod tests {
     #[test]
     fn wrong_probe_is_not_empty() {
         assert!(!WRONG_PROBE.is_empty());
+    }
+
+    #[test]
+    fn canonical_or_absolute_resolves_symlinks_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real.key");
+        std::fs::write(&real, b"key material").expect("write key");
+        let link = dir.path().join("link.key");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        assert_eq!(
+            canonical_or_absolute(&link),
+            std::fs::canonicalize(&real).expect("real key canonicalizes")
+        );
+    }
+
+    #[test]
+    fn canonical_or_absolute_keeps_a_missing_absolute_path_verbatim() {
+        // The stale-storage case: the stored attribute must still match
+        // what was stored even though the file is gone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("gone.key");
+        assert_eq!(canonical_or_absolute(&missing), missing);
+    }
+
+    #[test]
+    fn canonical_or_absolute_makes_a_missing_relative_path_absolute() {
+        let relative = std::path::Path::new("gmellon-missing-relative.key");
+        let resolved = canonical_or_absolute(relative);
+        assert!(resolved.is_absolute(), "relative paths must absolutize");
+        assert_eq!(resolved, std::env::current_dir().unwrap().join(relative));
     }
 
     #[test]

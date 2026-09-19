@@ -36,7 +36,10 @@ pub(crate) fn ssh_add(key: &Path, stdin: bool, askpass: bool) -> u8 {
     let span = tracing::info_span!("operation", operation = "ssh-add", key = %key.display());
     span.in_scope(|| {
         // The absolute path is the storage key (the unique attribute), so
-        // resolve symlinks and relative paths once, up front.
+        // resolve symlinks and relative paths once, up front. This is the
+        // strict flavor, deliberately unlike the lenient
+        // canonical_or_absolute sites: ssh-add needs the real file to
+        // verify the passphrase, so a missing key is a hard error.
         let canonical = match std::fs::canonicalize(key) {
             Ok(canonical) => canonical,
             Err(error) => {
@@ -134,12 +137,10 @@ pub(crate) fn ssh_allow(key: &Path, allowed: bool) -> u8 {
         key = %key.display()
     );
     span.in_scope(|| {
-        // Same path discipline as ssh-remove: canonicalize when present,
-        // verbatim-absolute otherwise, so the unique attribute matches.
-        let absolute = match std::fs::canonicalize(key) {
-            Ok(canonical) => canonical,
-            Err(_) => std::path::absolute(key).unwrap_or_else(|_| key.to_path_buf()),
-        };
+        // The lenient join-key discipline ([gmellon::ssh::
+        // canonical_or_absolute]), shared with the askpass provider: the
+        // unique attribute must match even when the key file is gone.
+        let absolute = ssh::canonical_or_absolute(key);
         let client = match BlockingClient::session() {
             Ok(client) => client,
             Err(error) => return report_service_error(error),
@@ -171,10 +172,10 @@ pub(crate) fn ssh_allow(key: &Path, allowed: bool) -> u8 {
 pub(crate) fn ssh_remove(key: &Path) -> u8 {
     let span = tracing::info_span!("operation", operation = "ssh-remove", key = %key.display());
     span.in_scope(|| {
-        let absolute = match std::fs::canonicalize(key) {
-            Ok(canonical) => canonical,
-            Err(_) => std::path::absolute(key).unwrap_or_else(|_| key.to_path_buf()),
-        };
+        // The lenient join-key discipline ([gmellon::ssh::
+        // canonical_or_absolute]): stale stored passphrases are the point,
+        // so a missing key file is not an error.
+        let absolute = ssh::canonical_or_absolute(key);
         let client = match BlockingClient::session() {
             Ok(client) => client,
             Err(error) => return report_service_error(error),
@@ -314,13 +315,10 @@ fn verify_stored_passphrase(
 pub(crate) fn ssh_verify(key: Option<&Path>) -> u8 {
     let span = tracing::info_span!("operation", operation = "ssh-verify");
     span.in_scope(|| {
-        // Same path discipline as ssh-remove: canonicalize when the key
-        // file exists, verbatim-absolute otherwise — the stored unique
-        // attribute is the join key.
-        let requested = key.map(|key| match std::fs::canonicalize(key) {
-            Ok(canonical) => canonical,
-            Err(_) => std::path::absolute(key).unwrap_or_else(|_| key.to_path_buf()),
-        });
+        // The lenient join-key discipline ([gmellon::ssh::
+        // canonical_or_absolute]): the stored unique attribute is the join
+        // key, so resolve when present, verbatim-absolute otherwise.
+        let requested = key.map(ssh::canonical_or_absolute);
         let client = match BlockingClient::session() {
             Ok(client) => client,
             Err(error) => return report_service_error(error),
