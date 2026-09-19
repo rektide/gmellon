@@ -280,7 +280,11 @@ pub fn askpass_provider(prompt: &std::ffi::OsStr) -> std::process::ExitCode {
         Err(error) => return askpass_refuse(&error.to_string()),
     };
     let mut stdout = std::io::stdout().lock();
-    if stdout.write_all(secret.as_slice()).and_then(|()| stdout.write_all(b"\n")).is_err() {
+    if stdout
+        .write_all(secret.as_slice())
+        .and_then(|()| stdout.write_all(b"\n"))
+        .is_err()
+    {
         return askpass_refuse("writing the answer to stdout failed");
     }
     if stdout.flush().is_err() {
@@ -338,7 +342,10 @@ mod tests {
             parse_askpass_prompt("Enter new passphrase (empty for no passphrase): "),
             None
         );
-        assert_eq!(parse_askpass_prompt("Enter passphrase for id_ed25519: "), None);
+        assert_eq!(
+            parse_askpass_prompt("Enter passphrase for id_ed25519: "),
+            None
+        );
         assert_eq!(parse_askpass_prompt("Enter passphrase for key '': "), None);
         assert_eq!(parse_askpass_prompt("unlock"), None);
         assert_eq!(parse_askpass_prompt(""), None);

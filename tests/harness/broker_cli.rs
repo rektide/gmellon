@@ -706,10 +706,7 @@ fn run_proof(secrets: &ProofSecrets) {
     // a successful answer IS the passphrase on stdout, exactly as the
     // OpenSSH askpass contract requires; stderr must stay clean either
     // way, and retained artifacts stay under the full scan.
-    let key_prompt = format!(
-        "Enter passphrase for {}: ",
-        key_canonical.display()
-    );
+    let key_prompt = format!("Enter passphrase for {}: ", key_canonical.display());
     let refused_no_grant = run_askpass(
         &["__askpass", &key_prompt],
         None,
@@ -787,17 +784,13 @@ fn run_proof(secrets: &ProofSecrets) {
     let mut expected_answer = secrets.key_pass.as_slice().to_vec();
     expected_answer.push(b'\n');
     assert_eq!(
-        answered.stdout,
-        expected_answer,
+        answered.stdout, expected_answer,
         "the answer must be the stored passphrase, newline-terminated, and nothing else"
     );
 
     // ssh (the client) asks with the path single-quoted; that shape must
     // answer too.
-    let quoted_prompt = format!(
-        "Enter passphrase for key '{}': ",
-        key_canonical.display()
-    );
+    let quoted_prompt = format!("Enter passphrase for key '{}': ", key_canonical.display());
     let answered_quoted = run_askpass(
         &["__askpass", &quoted_prompt],
         None,
@@ -825,8 +818,7 @@ fn run_proof(secrets: &ProofSecrets) {
         .expect("wait for the multicall askpass binary");
     assert_eq!(exit_code(&multicall_output), Some(0));
     assert_eq!(
-        multicall_output.stdout,
-        expected_answer,
+        multicall_output.stdout, expected_answer,
         "the multicall entry must answer exactly like the hidden subcommand"
     );
     for (name, secret) in secrets.named() {
@@ -860,8 +852,10 @@ fn run_proof(secrets: &ProofSecrets) {
     assert!(
         String::from_utf8_lossy(&items_granted.stdout)
             .lines()
-            .any(|line| line.starts_with("Unlock password for: proof-ssh-key\tno\t")
-                && line.ends_with(&granted_attributes)),
+            .any(
+                |line| line.starts_with("Unlock password for: proof-ssh-key\tno\t")
+                    && line.ends_with(&granted_attributes)
+            ),
         "the granted item must carry the opt-in alongside the gcr attributes"
     );
     // The gcr-side read still finds the item by its unique attribute and
@@ -930,8 +924,7 @@ fn run_proof(secrets: &ProofSecrets) {
         "storing with the askpass grant must exit 0"
     );
     assert!(
-        String::from_utf8_lossy(&stored_with_grant.stdout)
-            .contains("; askpass will answer for it"),
+        String::from_utf8_lossy(&stored_with_grant.stdout).contains("; askpass will answer for it"),
         "the granted store must say the helper will answer"
     );
     let answered_after_regrant = run_askpass(
@@ -942,8 +935,7 @@ fn run_proof(secrets: &ProofSecrets) {
     );
     assert_eq!(exit_code(&answered_after_regrant), Some(0));
     assert_eq!(
-        answered_after_regrant.stdout,
-        expected_answer,
+        answered_after_regrant.stdout, expected_answer,
         "the one-shot granted store must be answerable immediately"
     );
     // The granted re-store must still be exactly one item — the
@@ -978,7 +970,8 @@ fn run_proof(secrets: &ProofSecrets) {
             stage,
         )
     };
-    let verify_all = |stage: &str| run_gmellon(&["ssh-verify"], CliStdin::FailIfRead, secrets, stage);
+    let verify_all =
+        |stage: &str| run_gmellon(&["ssh-verify"], CliStdin::FailIfRead, secrets, stage);
 
     // The stored passphrase still unlocks the key: MATCH and exit 0, both
     // for the one key and across the whole store (exactly one item exists

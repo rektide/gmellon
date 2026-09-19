@@ -239,7 +239,11 @@ pub fn run(cli: Cli) -> ExitCode {
         Command::Status => status(),
         Command::Items { collection } => items(&collection),
         Command::SshList => ssh_list(),
-        Command::SshAdd { key, stdin, askpass } => ssh_add(&key, stdin, askpass),
+        Command::SshAdd {
+            key,
+            stdin,
+            askpass,
+        } => ssh_add(&key, stdin, askpass),
         Command::SshAllow { key } => ssh_allow(&key, true),
         Command::SshDeny { key } => ssh_allow(&key, false),
         Command::SshRemove { key } => ssh_remove(&key),
@@ -877,11 +881,7 @@ fn render_ssh_items(entries: &[(CollectionId, Item)]) -> String {
     let mut output = String::from("KEY\tCOLLECTION\tLOCKED\tASKPASS\n");
     for (collection, item) in entries {
         let locked = if item.locked { "yes" } else { "no" };
-        let askpass = if item.askpass_allowed() {
-            "yes"
-        } else {
-            "no"
-        };
+        let askpass = if item.askpass_allowed() { "yes" } else { "no" };
         output.extend(item.ssh_key_path().unwrap_or_default().escape_debug());
         output.push('\t');
         output.push_str(collection.as_str());
@@ -1077,7 +1077,8 @@ mod tests {
     }
 
     #[test]
-    fn completions_parse_every_advertised_shell_and_reject_others() {        for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+    fn completions_parse_every_advertised_shell_and_reject_others() {
+        for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
             let cli = Cli::try_parse_from(["gmellon", "completions", shell]).unwrap();
             assert!(
                 matches!(cli.command, Command::Completions { .. }),
@@ -1267,7 +1268,9 @@ mod tests {
     #[test]
     fn ssh_allow_and_deny_parse_a_key() {
         let allowed = Cli::try_parse_from(["gmellon", "ssh-allow", "/tmp/k"]).unwrap();
-        assert!(matches!(&allowed.command, Command::SshAllow { key } if *key == Path::new("/tmp/k")));
+        assert!(
+            matches!(&allowed.command, Command::SshAllow { key } if *key == Path::new("/tmp/k"))
+        );
 
         let denied = Cli::try_parse_from(["gmellon", "ssh-deny", "/tmp/k"]).unwrap();
         assert!(matches!(&denied.command, Command::SshDeny { key } if *key == Path::new("/tmp/k")));

@@ -193,7 +193,11 @@ fn askpass_refuses_unparseable_prompts_with_empty_stdout() {
     // no daemon: the parse happens before any bus connection.
     for prompt in ["Enter old passphrase: ", "just some words"] {
         let output = run_askpass(prompt, None);
-        assert_eq!(output.status.code(), Some(1), "prompt {prompt:?} must refuse");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "prompt {prompt:?} must refuse"
+        );
         assert!(
             output.stdout.is_empty(),
             "a refusal must write nothing to stdout"
@@ -211,7 +215,10 @@ fn askpass_refuses_permission_and_notification_hints() {
     // notifications — never passphrase prompts — and must be refused
     // before any keyring interaction.
     for hint in ["confirm", "none"] {
-        let output = run_askpass("Enter passphrase for /home/me/.ssh/id_ed25519: ", Some(hint));
+        let output = run_askpass(
+            "Enter passphrase for /home/me/.ssh/id_ed25519: ",
+            Some(hint),
+        );
         assert_eq!(output.status.code(), Some(1), "hint {hint:?} must refuse");
         assert!(output.stdout.is_empty());
         assert!(

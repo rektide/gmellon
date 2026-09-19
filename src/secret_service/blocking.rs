@@ -251,9 +251,8 @@ impl Display for Error {
                      the askpass helper refuses rather than prompt"
                 )
             }
-            Self::SecretSessionMismatch => formatter.write_str(
-                "the Secret Service returned a secret sealed for a different session",
-            ),
+            Self::SecretSessionMismatch => formatter
+                .write_str("the Secret Service returned a secret sealed for a different session"),
             Self::NoDefaultCollection => formatter.write_str(
                 "the Secret Service has no default collection alias; gcr-ssh-agent \
                  looks there for stored key passphrases, so gmellon refuses to \
@@ -730,9 +729,8 @@ impl BlockingClient {
         }
         let proxy = self.item_proxy(item.path)?;
         let session: ObjectPath<'_> = self.session_path.as_ref();
-        let (answered_session, iv, value, _content_type) = proxy
-            .get_secret(&session)
-            .map_err(classify_service_error)?;
+        let (answered_session, iv, value, _content_type) =
+            proxy.get_secret(&session).map_err(classify_service_error)?;
         if answered_session.as_str() != session.as_str() {
             return Err(Error::SecretSessionMismatch);
         }
