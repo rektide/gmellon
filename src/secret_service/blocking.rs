@@ -522,24 +522,35 @@ impl BlockingClient {
         Ok(items)
     }
 
-    /// Every stored SSH key passphrase item across all collections: items
-    /// whose `unique` attribute carries the gcr-ssh-agent `ssh-store:`
-    /// prefix, paired with the owning collection's ID.
-    pub fn ssh_key_items(&self) -> Result<Vec<(CollectionId, Item)>, Error> {
-        let mut found = Vec::new();
+    /// One full-store walk: every item of every collection, paired with its
+    /// owning collection's ID, in collection × service-item order. The
+    /// SSH item queries are filters over this single walk, so the store is
+    /// enumerated once per operation rather than once per query.
+    fn walk_all_items(&self) -> Result<Vec<(CollectionId, Item)>, Error> {
+        let mut all = Vec::new();
         for collection in self.collections()? {
             let proxy = self.collection_proxy(&collection.path)?;
             for path in proxy.items().map_err(classify_service_error)? {
                 let item = self.inspect_item(path)?;
-                if item
-                    .attributes
-                    .get(UNIQUE_ATTRIBUTE)
-                    .is_some_and(|value| value.starts_with(SSH_STORE_PREFIX))
-                {
-                    found.push((collection.id.clone(), item));
-                }
+                all.push((collection.id.clone(), item));
             }
         }
+        Ok(all)
+    }
+
+    /// Every stored SSH key passphrase item across all collections: items
+    /// whose `unique` attribute carries the gcr-ssh-agent `ssh-store:`
+    /// prefix, paired with the owning collection's ID.
+    pub fn ssh_key_items(&self) -> Result<Vec<(CollectionId, Item)>, Error> {
+        let mut found: Vec<_> = self
+            .walk_all_items()?
+            .into_iter()
+            .filter(|(_collection, item)| {
+                item.attributes
+                    .get(UNIQUE_ATTRIBUTE)
+                    .is_some_and(|value| value.starts_with(SSH_STORE_PREFIX))
+            })
+            .collect();
         found.sort_by(|left, right| {
             let left_key = left.1.ssh_key_path().unwrap_or_default();
             let right_key = right.1.ssh_key_path().unwrap_or_default();
@@ -676,17 +687,11 @@ impl BlockingClient {
     /// either, so callers require exactly one match.
     fn find_exact_ssh_key_items(&self, key_path: &str) -> Result<Vec<(CollectionId, Item)>, Error> {
         let wanted = format!("{SSH_STORE_PREFIX}{key_path}");
-        let mut matches = Vec::new();
-        for collection in self.collections()? {
-            let proxy = self.collection_proxy(&collection.path)?;
-            for path in proxy.items().map_err(classify_service_error)? {
-                let item = self.inspect_item(path)?;
-                if item.attributes.get(UNIQUE_ATTRIBUTE) == Some(&wanted) {
-                    matches.push((collection.id.clone(), item));
-                }
-            }
-        }
-        Ok(matches)
+        Ok(self
+            .walk_all_items()?
+            .into_iter()
+            .filter(|(_collection, item)| item.attributes.get(UNIQUE_ATTRIBUTE) == Some(&wanted))
+            .collect())
     }
 
     /// The exactly-one match for a key's stored passphrase item with its
@@ -717,12 +722,27 @@ impl BlockingClient {
     /// their own policy before reading.
     pub fn ssh_key_secret(&self, key_path: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, Error> {
         let (_collection_id, item) = self.ssh_key_item(key_path)?;
+        self.ssh_key_item_secret(key_path, &item)
+    }
+
+    /// Read back the secret of one item already in hand — the read half of
+    /// [`BlockingClient::ssh_key_secret`] for callers that enumerated the
+    /// store themselves (the single-walk verify path) and must not re-walk
+    /// per key. Same discipline: a locked item is refused without any read,
+    /// the secret crosses the bus only as ciphertext under this client's
+    /// encrypted session, and it is returned zeroized-on-drop. The opt-in
+    /// askpass grant is not consulted here.
+    pub fn ssh_key_item_secret(
+        &self,
+        key_path: &str,
+        item: &Item,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Error> {
         if item.locked {
             return Err(Error::SshKeyItemLocked {
                 key: key_path.to_owned(),
             });
         }
-        let proxy = self.item_proxy(item.path)?;
+        let proxy = self.item_proxy(item.path.clone())?;
         let session: ObjectPath<'_> = self.session_path.as_ref();
         let (answered_session, iv, value, _content_type) =
             proxy.get_secret(&session).map_err(classify_service_error)?;

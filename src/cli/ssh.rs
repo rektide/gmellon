@@ -2,11 +2,12 @@
 //! ssh-deny, ssh-remove, and ssh-verify, plus the per-key `VerifyOutcome`
 //! machinery the verify paths share.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
 use gmellon::secret_input;
-use gmellon::secret_service::{BlockingClient, Error as ServiceError};
+use gmellon::secret_service::{BlockingClient, CollectionId, Error as ServiceError, Item};
 use gmellon::ssh::{self, Verdict};
 
 use super::render::render_ssh_items;
@@ -309,6 +310,57 @@ fn verify_stored_passphrase(
     )
 }
 
+/// Verify one enumerated item already in hand — the single-walk verify-all
+/// path. Duplicate ambiguity derives from the enumerated set (the count of
+/// entries claiming one `ssh_key_path`) instead of the per-key re-walk
+/// `ssh_key_item` performed, so the store is walked once for the whole
+/// run; the produced error string is exactly the re-walk's
+/// [`ServiceError::SshKeyItemsAmbiguous`]. The gate order matches
+/// [`verify_stored_passphrase`] exactly: metadata and lock state first,
+/// then file existence, and only then the one decrypting read.
+fn verify_enumerated_item(
+    client: &BlockingClient,
+    collection: &CollectionId,
+    key_path: &str,
+    item: &Item,
+    claims: usize,
+) -> VerifyOutcome {
+    if claims > 1 {
+        return VerifyOutcome::Failed {
+            reason: ServiceError::SshKeyItemsAmbiguous {
+                key: key_path.to_owned(),
+                count: claims,
+            }
+            .to_string(),
+        };
+    }
+    if item.locked {
+        return VerifyOutcome::Locked {
+            collection: collection.to_string(),
+        };
+    }
+    // A missing key file is decided without reading any secret: the stored
+    // passphrase can no longer be checked, and nothing at that path could
+    // be unlocked either.
+    if !Path::new(key_path).exists() {
+        return VerifyOutcome::MissingKey;
+    }
+    let secret = match client.ssh_key_item_secret(key_path, item) {
+        Ok(secret) => secret,
+        Err(error) => {
+            return VerifyOutcome::Failed {
+                reason: error.to_string(),
+            };
+        }
+    };
+    match ssh::verify_passphrase(Path::new(key_path), secret.as_slice()) {
+        Verdict::Verified => VerifyOutcome::Match,
+        Verdict::Rejected => VerifyOutcome::Stale,
+        Verdict::NotEncrypted => VerifyOutcome::NotEncrypted,
+        Verdict::Unavailable(reason) => VerifyOutcome::Unavailable { reason },
+    }
+}
+
 /// Re-verify stored passphrases against their keys: the one given key,
 /// or every stored ssh-store item across all collections. One verdict
 /// line per key on stdout; exit 0 only when every checked key matched.
@@ -344,6 +396,10 @@ pub(crate) fn ssh_verify(key: Option<&Path>) -> u8 {
             // Verify-all mode: every stored item in the client's stable
             // order, one line each; per-key storage failures become ERROR
             // lines and fail the run without stopping the remaining keys.
+            // The store is walked once here: ambiguity comes from counting
+            // equal ssh_key_path entries in the enumerated set, and
+            // secrets are read from the items already in hand — no
+            // per-key re-walk.
             None => {
                 let entries = match client.ssh_key_items() {
                     Ok(entries) => entries,
@@ -353,19 +409,26 @@ pub(crate) fn ssh_verify(key: Option<&Path>) -> u8 {
                     println!("no stored SSH key passphrases");
                     return EXIT_OK;
                 }
+                let mut claims: HashMap<&str, usize> = HashMap::new();
                 for (_collection, item) in &entries {
+                    if let Some(key_path) = item.ssh_key_path() {
+                        *claims.entry(key_path).or_default() += 1;
+                    }
+                }
+                for (collection, item) in &entries {
                     // ssh_key_items only returns items whose unique
                     // attribute carries the ssh-store: prefix, so the key
                     // path is always present.
                     let Some(key_path) = item.ssh_key_path() else {
                         continue;
                     };
-                    let outcome =
-                        verify_stored_passphrase(&client, key_path).unwrap_or_else(|error| {
-                            VerifyOutcome::Failed {
-                                reason: error.to_string(),
-                            }
-                        });
+                    let outcome = verify_enumerated_item(
+                        &client,
+                        collection,
+                        key_path,
+                        item,
+                        claims.get(key_path).copied().unwrap_or_default(),
+                    );
                     print!("{}", render_verify_line(key_path, &outcome));
                     tracing::info!(
                         outcome = verify_outcome_word(&outcome),
