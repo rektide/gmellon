@@ -13,3 +13,7 @@ pub use blocking::{
     BlockingClient, Collection, CollectionId, Error, InterfaceProbe, Item, LockOutcome,
     UnlockOutcome, decode_open_session_output,
 };
+// The negotiated session's algorithm is client capability surface: the CLI
+// reports it through this re-export rather than reaching into the sans-I/O
+// crypto module below the client.
+pub use session::ALGORITHM;
